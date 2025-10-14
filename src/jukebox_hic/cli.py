@@ -13,7 +13,7 @@ def _comma_ints(value: str) -> List[int]:
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="jukebox-hic",
-        description="Lightweight Hi-C noise analysis toolkit (hicstraw only)",
+        description="Lightweight Hi-C noise analysis toolkit for .hic/.cool matrices",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -22,8 +22,17 @@ def main() -> None:
     sp_sample.add_argument("--res", required=True, type=int, help="Resolution in bp")
     sp_sample.add_argument("--sample_fraction", type=float, default=1.0, help="Fraction of rows to evaluate (0-1)")
     sp_sample.add_argument("--window_bp", type=int, default=None, help="Half-window size around diagonal in bp")
-    sp_sample.add_argument("--chrom_sizes", help="Chrom sizes TSV (chr\\tsize); default: read from .hic")
+    sp_sample.add_argument("--chrom_sizes", help="Chrom sizes TSV (chr\\tsize); default: read from input")
     sp_sample.add_argument("--out_dir", required=True, help="Directory for outputs")
+    sp_sample.add_argument(
+        "--norm",
+        default="none",
+        help="Normalization to apply: none | balance | path/to/bedgraph",
+    )
+    sp_sample.add_argument(
+        "--cooler_path",
+        help="Internal group path for .cool/.mcool/.scool URIs (e.g. /resolutions/10000 or cell name)",
+    )
     sp_sample.add_argument(
         "--subsample_ratios",
         help="Comma-separated ratios (<=1.0) to simulate (e.g. 1.0,0.5,0.25); defaults to 1.0 only",
@@ -53,6 +62,8 @@ def main() -> None:
             window_bp=args.window_bp,
             chrom_sizes_path=args.chrom_sizes,
             out_dir=args.out_dir,
+            norm=args.norm,
+            cooler_selection=args.cooler_path,
             subsample_ratios=[float(x) for x in args.subsample_ratios.split(",")] if args.subsample_ratios else None,
             seed=args.seed,
         )
