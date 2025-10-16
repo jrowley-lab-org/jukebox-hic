@@ -5,3 +5,6 @@ statsmodels>=0.13
 matplotlib>=3.5
 cooler>=0.9.3
 scipy>=1.8
+
+[profile]
+psutil>=5.9

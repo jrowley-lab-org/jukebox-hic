@@ -1,31 +1,11 @@
 #!/usr/bin/env python
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-import hicstraw
 import numpy as np
-import pandas as pd
 from statsmodels.tsa.stattools import acovf
 
-
-def _read_chrom_sizes(hic_path: str, chrom_sizes_path: Optional[str]) -> Dict[str, int]:
-    if chrom_sizes_path and os.path.exists(chrom_sizes_path):
-        df = pd.read_csv(
-            chrom_sizes_path,
-            sep="\t",
-            header=None,
-            names=["chr", "size"],
-            dtype={"chr": str, "size": int},
-        )
-        return dict(zip(df["chr"], df["size"]))
-
-    hic = hicstraw.HiCFile(hic_path)
-    sizes: Dict[str, int] = {}
-    for chrom in hic.getChromosomes():
-        if chrom.name == "ALL":
-            continue
-        sizes[str(chrom.name)] = int(chrom.length)
-    return sizes
+from .backends import ChromMatrix, read_chrom_sizes, select_provider
 
 
 def _default_bindist_bp(resolution: int) -> int:
@@ -38,53 +18,63 @@ def _default_bindist_bp(resolution: int) -> int:
     return 1_000_000
 
 
-def _distance_normalize(df_obs: pd.DataFrame, res: int) -> pd.DataFrame:
-    """
-    Normalize observed counts using distance-based expected values derived from hicstraw counts.
-    """
-    lags = ((df_obs["binY"] - df_obs["binX"]).abs()).astype(int)
-    with_lag = df_obs.copy()
-    with_lag["lag"] = lags
-    expected = with_lag.groupby("lag")["count"].mean()
-
-    # Use the overall mean if a lag is missing from expected (rare for sparse data)
-    overall = float(expected.mean())
-    expected_vec = expected.to_dict()
-    exp_vals = np.array([expected_vec.get(int(lag), overall) for lag in with_lag["lag"]], dtype=float)
-    norm = (with_lag["count"].to_numpy() + 1.0) / (exp_vals + 1.0)
-
-    out = with_lag.copy()
-    out["distnorm"] = norm
-    return out[["binX", "binY", "distnorm"]]
+def _precompute_expectation(coo) -> Tuple[np.ndarray, float]:
+    if coo.data.size == 0:
+        return np.zeros(1, dtype=float), 0.0
+    rows = coo.row.astype(np.int64)
+    cols = coo.col.astype(np.int64)
+    data = coo.data.astype(float)
+    lags = np.abs(cols - rows)
+    max_lag = int(lags.max())
+    sums = np.bincount(lags, weights=data, minlength=max_lag + 1)
+    counts = np.bincount(lags, minlength=max_lag + 1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        means = np.divide(sums, counts, out=np.zeros_like(sums), where=counts > 0)
+    default = float(means[counts > 0].mean()) if np.count_nonzero(counts) else 0.0
+    return means, default
 
 
-def _row_window_noise(df_dn: pd.DataFrame, rowbins: int, bindist_bins: int) -> np.ndarray:
-    by_x = df_dn.groupby("binX")
-    by_y = df_dn.groupby("binY")
+def _expected_for_lag(expected_lookup: np.ndarray, default: float, lag: int) -> float:
+    if lag < len(expected_lookup):
+        val = expected_lookup[lag]
+        return float(val) if val > 0 else default
+    return default
+
+
+def _row_window_noise(matrix: ChromMatrix, rowbins: int, bindist_bins: int, expected_lookup: np.ndarray, default_expected: float) -> np.ndarray:
     noise_vals = np.zeros(rowbins, dtype=float)
-
     for idx in range(rowbins):
-        left = by_y.get_group(idx) if idx in by_y.groups else pd.DataFrame(columns=df_dn.columns)
-        left = left[(left["binX"] >= idx - bindist_bins) & (left["binX"] < idx)]
+        window = bindist_bins * 2
+        observed = np.zeros(window, dtype=float)
+        expected = np.full(window, default_expected, dtype=float)
 
-        right = by_x.get_group(idx) if idx in by_x.groups else pd.DataFrame(columns=df_dn.columns)
-        right = right[(right["binY"] > idx) & (right["binY"] <= idx + bindist_bins)]
+        col_vec = matrix.csc.getcol(idx)
+        for src_idx, value in zip(col_vec.indices, col_vec.data):
+            if src_idx >= idx:
+                continue
+            lag = idx - int(src_idx)
+            if lag > bindist_bins:
+                continue
+            pos = bindist_bins - lag
+            observed[pos] = float(value)
+            expected[pos] = _expected_for_lag(expected_lookup, default_expected, lag)
 
-        filled = np.zeros(bindist_bins * 2, dtype=float)
-        for _, rec in left.iterrows():
-            pos = int(bindist_bins - (idx - int(rec["binX"])))
-            if 0 <= pos < len(filled):
-                filled[pos] = float(rec["distnorm"])
-        for _, rec in right.iterrows():
-            pos = int(bindist_bins + (int(rec["binY"]) - idx))
-            if 0 <= pos < len(filled):
-                filled[pos] = float(rec["distnorm"])
+        row_vec = matrix.csr.getrow(idx)
+        for dst_idx, value in zip(row_vec.indices, row_vec.data):
+            if dst_idx <= idx:
+                continue
+            lag = int(dst_idx) - idx
+            if lag > bindist_bins:
+                continue
+            pos = bindist_bins - 1 + lag
+            observed[pos] = float(value)
+            expected[pos] = _expected_for_lag(expected_lookup, default_expected, lag)
 
         try:
-            ac = acovf(filled, nlag=1, fft=True)[1]
-            noise_vals[idx] = 10000.0 if ac == 0 else 1.0 / abs(ac)
+            ac = acovf(observed, nlag=1, fft=True)[1]
+            noise_vals[idx] = float("nan") if ac == 0 else 1.0 / abs(ac)
         except Exception:
-            noise_vals[idx] = 10000.0
+            noise_vals[idx] = float("nan")
 
     return noise_vals
 
@@ -101,37 +91,38 @@ def compute_full_noise(
     hic_path: str,
     res_list: List[int],
     chrom_sizes_path: Optional[str] = None,
-    norm: str = "NONE",
+    norm: str = "none",
     bindist_bp: Optional[int] = None,
     out_dir: str = ".",
+    cooler_selection: Optional[str] = None,
 ) -> None:
     """
     Compute noise values for every row/bin across the genome at the requested resolutions.
     All calculations rely solely on hicstraw outputs.
     """
     os.makedirs(out_dir, exist_ok=True)
-    chrom_sizes = _read_chrom_sizes(hic_path, chrom_sizes_path)
 
     for res in res_list:
+        provider, _ = select_provider(hic_path, int(res), norm, cooler_selection)
+        chrom_sizes = read_chrom_sizes(provider, chrom_sizes_path)
         window_bp = bindist_bp or _default_bindist_bp(int(res))
         bindist_bins = max(1, window_bp // int(res))
         per_chrom_paths: List[str] = []
 
         for chrom, chrom_len in chrom_sizes.items():
-            records = hicstraw.straw("observed", norm, hic_path, chrom, chrom, "BP", int(res))
-            if not records:
+            matrix = provider.fetch_chrom(chrom)
+            if matrix is None or matrix.coo.nnz == 0:
                 continue
-            df_obs = pd.DataFrame(
-                {
-                    "binX": [(r.binX // res) for r in records],
-                    "binY": [(r.binY // res) for r in records],
-                    "count": [r.counts for r in records],
-                }
-            )
 
-            df_dn = _distance_normalize(df_obs, int(res))
-            rowbins = chrom_len // int(res) + 1
-            noise_vals = _row_window_noise(df_dn, rowbins=rowbins, bindist_bins=bindist_bins)
+            expected_lookup, default_expected = _precompute_expectation(matrix.coo)
+            rowbins = matrix.coo.shape[0]
+            noise_vals = _row_window_noise(
+                matrix,
+                rowbins=rowbins,
+                bindist_bins=bindist_bins,
+                expected_lookup=expected_lookup,
+                default_expected=default_expected,
+            )
 
             out_path = os.path.join(out_dir, f"{chrom}_{res}.bedgraph")
             _write_bedgraph(chrom, int(res), chrom_len, noise_vals, out_path)

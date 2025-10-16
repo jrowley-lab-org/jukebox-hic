@@ -14,6 +14,8 @@ Requires-Dist: statsmodels>=0.13
 Requires-Dist: matplotlib>=3.5
 Requires-Dist: cooler>=0.9.3
 Requires-Dist: scipy>=1.8
+Provides-Extra: profile
+Requires-Dist: psutil>=5.9; extra == "profile"
 
 # jukebox-hic
 
@@ -21,6 +23,7 @@ Lightweight Hi-C noise analysis toolkit that depends only on the Python [`hicstr
 
 ## Features
 - Per-row noise estimates with optional subsampling simulations to gauge robustness.
+- Configurable row filtering based on distance-normalized signal and window occupancy.
 - Works with `.hic`, `.cool`, `.mcool`, and `.scool` input matrices (SciPy-backed pipeline for cooler formats).
 - Whole-genome noise tracks at requested resolutions.
 - Simple plotting helpers for comparing noise distributions (log-scaled histograms).
@@ -32,6 +35,8 @@ pip install jukebox-hic
 Or clone the repository and install the package in editable mode:
 ```bash
 pip install -e .
+# For optional runtime/memory profiling support
+pip install -e .[profile]
 ```
 
 ## Command Line Usage
@@ -40,10 +45,13 @@ pip install -e .
 jukebox-hic sample-noise \
   --hic sample.cool \
   --res 10000 \
+  --min_mean_score 0.9 \
+  --min_nonzero_frac 0.05 \
   --subsample_ratios 1.0,0.75,0.5,0.25 \
   --norm balance \
   --out_dir outputs/10kb \
-  --seed 42
+  --seed 42 \
+  --profile outputs/10kb/profile.csv
 ```
 Produces one `<chrom>_<res>.bedgraph` for the original map and a `subsample_summary.tsv`
 table with mean/median/log noise, ACF, variability, and empty-bin ratios at each subsample.
@@ -54,6 +62,7 @@ jukebox-hic full-noise \
   --hic sample.hic \
   --res 5000,10000 \
   --out_dir outputs/
+# For .mcool/.scool inputs you can add: --cooler_path /resolutions/10000
 ```
 
 ### Plotting
@@ -63,6 +72,17 @@ jukebox-hic plot \
   --out_png noise_density.png
 ```
 
+### Build a blacklist from bedgraphs
+```bash
+jukebox-hic blacklist \
+  --input outputs/10kb/*.bedgraph \
+  --out blacklist.bed \
+  --top_quantile 0.95
+```
+This command removes any rows with `NaN` noise values and blacklists the top 5% most
+noisy intervals by default. Provide `--zscore_cutoff` to supply an explicit z-score
+threshold instead of using the percentile.
+
 ## Python API
 ```python
 from jukebox_hic import noise_sampling
@@ -71,6 +91,8 @@ noise_sampling.compute_sampled_noise(
     hic_path="sample.cool",
     res=10_000,
     sample_fraction=1.0,
+    min_mean_score=0.9,
+    min_nonzero_frac=0.05,
     subsample_ratios=[1.0, 0.5, 0.25],
     norm="balance",
     out_dir="outputs",
@@ -81,3 +103,5 @@ noise_sampling.compute_sampled_noise(
 ### Notes
 - For `.mcool`, the CLI selects the group matching `--res` (e.g. `/resolutions/10000`). Provide `--cooler_path` for `.scool` cell groups or custom URIs.
 - `--norm` accepts `none`, `balance` (cooler weights / KR for `.hic`), or a path to a bedgraph/vector defining custom bin weights.
+- All commands print a summary line with wall-clock time and memory usage; install the optional `profile` extra for psutil-backed RSS reporting.
+- `--profile` writes per-chromosome runtime and memory metrics to a CSV for downstream plotting.

@@ -1,8 +1,11 @@
 README.md
 pyproject.toml
 src/jukebox_hic/__init__.py
+src/jukebox_hic/backends.py
 src/jukebox_hic/cli.py
 src/jukebox_hic/figures.py
+src/jukebox_hic/filters.py
+src/jukebox_hic/metrics.py
 src/jukebox_hic/noise_fullmap.py
 src/jukebox_hic/noise_sampling.py
 src/jukebox_hic.egg-info/PKG-INFO
