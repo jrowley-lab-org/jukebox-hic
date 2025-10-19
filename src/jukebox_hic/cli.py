@@ -2,9 +2,17 @@
 import argparse
 import os
 import time
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from . import figures, noise_fullmap, noise_sampling, filters
+from .backends import (
+    cooler_resolutions,
+    hic_resolutions,
+    is_cooler_path,
+    read_chrom_sizes,
+    select_provider,
+    total_contacts,
+)
 from .metrics import collect_memory_usage_mb
 
 
@@ -26,6 +34,39 @@ def _profile_command(name: str, func: Callable[[], Optional[int]]) -> Optional[i
             f"[PROFILE] cmd={name} elapsed={elapsed:.2f}s rss_now={end_rss:.1f}MB "
             f"ru_max={end_ru:.1f}MB delta_rss={delta_rss:.1f}MB delta_ru={delta_ru:.1f}MB"
         )
+
+
+def _available_resolutions(path: str, cooler_selection: Optional[str]) -> List[int]:
+    if is_cooler_path(path):
+        return cooler_resolutions(path, cooler_selection)
+    return hic_resolutions(path)
+
+
+def _coarsest_resolution(path: str, cooler_selection: Optional[str]) -> Optional[int]:
+    resolutions = _available_resolutions(path, cooler_selection)
+    if not resolutions:
+        return None
+    return max(resolutions)
+
+
+def _dump_contacts_once(
+    hic_path: str,
+    norm: str,
+    cooler_selection: Optional[str],
+    chrom_sizes_path: Optional[str],
+) -> Dict[str, float]:
+    res = _coarsest_resolution(hic_path, cooler_selection)
+    if res is None:
+        return {}
+    provider, _ = select_provider(hic_path, res, norm, cooler_selection)
+    chrom_sizes = read_chrom_sizes(provider, chrom_sizes_path)
+    contacts: Dict[str, float] = {}
+    for chrom in chrom_sizes:
+        matrices = provider.fetch_chrom(chrom)
+        if matrices is None or matrices.coo.nnz == 0:
+            continue
+        contacts[chrom] = total_contacts(matrices)
+    return contacts
 
 
 def main() -> None:
@@ -88,6 +129,12 @@ def main() -> None:
         "--cooler_path",
         help="Internal group path for .cool/.mcool/.scool URIs (e.g. /resolutions/10000 or cell name)",
     )
+    sp_full.add_argument(
+        "--cpu",
+        type=int,
+        default=1,
+        help="Number of worker processes to use for full-noise (default: 1)",
+    )
 
     sp_plot = sub.add_parser("plot", help="Plot density of noise values from a bedgraph")
     sp_plot.add_argument("--noise_bed", required=True, help="Noise bedgraph path")
@@ -117,6 +164,15 @@ def main() -> None:
 
     if args.cmd == "sample-noise":
         os.makedirs(args.out_dir, exist_ok=True)
+        contacts = _dump_contacts_once(args.hic, args.norm, args.cooler_path, args.chrom_sizes)
+        if contacts:
+            out_path = os.path.join(args.out_dir, "contacts_overview.tsv")
+            total_value = sum(contacts.values())
+            with open(out_path, "w") as handle:
+                handle.write("chrom\tcontacts\n")
+                for chrom in sorted(contacts):
+                    handle.write(f"{chrom}\t{contacts[chrom]:.6f}\n")
+                handle.write(f"TOTAL\t{total_value:.6f}\n")
 
         def run() -> None:
             noise_sampling.compute_sampled_noise(
@@ -138,6 +194,15 @@ def main() -> None:
         _profile_command("sample-noise", run)
     elif args.cmd == "full-noise":
         os.makedirs(args.out_dir, exist_ok=True)
+        contacts = _dump_contacts_once(args.hic, args.norm, args.cooler_path, args.chrom_sizes)
+        if contacts:
+            out_path = os.path.join(args.out_dir, "contacts_overview.tsv")
+            total_value = sum(contacts.values())
+            with open(out_path, "w") as handle:
+                handle.write("chrom\tcontacts\n")
+                for chrom in sorted(contacts):
+                    handle.write(f"{chrom}\t{contacts[chrom]:.6f}\n")
+                handle.write(f"TOTAL\t{total_value:.6f}\n")
 
         def run() -> None:
             noise_fullmap.compute_full_noise(
@@ -148,6 +213,7 @@ def main() -> None:
                 bindist_bp=args.bindist_bp,
                 out_dir=args.out_dir,
                 cooler_selection=args.cooler_path,
+                cpu=args.cpu,
             )
 
         _profile_command("full-noise", run)

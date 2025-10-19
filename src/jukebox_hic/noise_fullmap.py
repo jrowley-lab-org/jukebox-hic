@@ -1,5 +1,7 @@
 #!/usr/bin/env python
+import multiprocessing as mp
 import os
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -87,6 +89,46 @@ def _write_bedgraph(chrom: str, res: int, chrom_len: int, noise_vals: np.ndarray
             handle.write(f"{chrom} {start} {stop} {val}\n")
 
 
+@dataclass(frozen=True)
+class _FullNoiseTask:
+    hic_path: str
+    chrom: str
+    chrom_len: int
+    res: int
+    norm: str
+    cooler_selection: Optional[str]
+    bindist_bp: Optional[int]
+    out_dir: str
+    out_path: str
+
+
+def _full_noise_worker(task: _FullNoiseTask) -> Tuple[str, int, str, bool]:
+    provider, _ = select_provider(task.hic_path, task.res, task.norm, task.cooler_selection)
+    matrix = provider.fetch_chrom(task.chrom)
+    if matrix is None or matrix.coo.nnz == 0:
+        if os.path.exists(task.out_path):
+            try:
+                os.remove(task.out_path)
+            except OSError:
+                pass
+        return task.chrom, task.res, task.out_path, False
+
+    window_bp = task.bindist_bp or _default_bindist_bp(int(task.res))
+    bindist_bins = max(1, window_bp // int(task.res))
+    expected_lookup, default_expected = _precompute_expectation(matrix.coo)
+    rowbins = matrix.coo.shape[0]
+    noise_vals = _row_window_noise(
+        matrix,
+        rowbins=rowbins,
+        bindist_bins=bindist_bins,
+        expected_lookup=expected_lookup,
+        default_expected=default_expected,
+    )
+
+    _write_bedgraph(task.chrom, int(task.res), task.chrom_len, noise_vals, task.out_path)
+    return task.chrom, task.res, task.out_path, True
+
+
 def compute_full_noise(
     hic_path: str,
     res_list: List[int],
@@ -95,6 +137,7 @@ def compute_full_noise(
     bindist_bp: Optional[int] = None,
     out_dir: str = ".",
     cooler_selection: Optional[str] = None,
+    cpu: int = 1,
 ) -> None:
     """
     Compute noise values for every row/bin across the genome at the requested resolutions.
@@ -102,36 +145,118 @@ def compute_full_noise(
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    for res in res_list:
-        provider, _ = select_provider(hic_path, int(res), norm, cooler_selection)
+    cpu_count = os.cpu_count() or 1
+    requested_cpu = int(cpu) if isinstance(cpu, int) else 1
+    if requested_cpu < 1:
+        requested_cpu = 1
+    workers = min(requested_cpu, cpu_count)
+
+    tasks: List[_FullNoiseTask] = []
+    for res_raw in res_list:
+        res = int(res_raw)
+        provider, _ = select_provider(hic_path, res, norm, cooler_selection)
         chrom_sizes = read_chrom_sizes(provider, chrom_sizes_path)
-        window_bp = bindist_bp or _default_bindist_bp(int(res))
-        bindist_bins = max(1, window_bp // int(res))
-        per_chrom_paths: List[str] = []
-
         for chrom, chrom_len in chrom_sizes.items():
-            matrix = provider.fetch_chrom(chrom)
-            if matrix is None or matrix.coo.nnz == 0:
-                continue
-
-            expected_lookup, default_expected = _precompute_expectation(matrix.coo)
-            rowbins = matrix.coo.shape[0]
-            noise_vals = _row_window_noise(
-                matrix,
-                rowbins=rowbins,
-                bindist_bins=bindist_bins,
-                expected_lookup=expected_lookup,
-                default_expected=default_expected,
-            )
-
             out_path = os.path.join(out_dir, f"{chrom}_{res}.bedgraph")
-            _write_bedgraph(chrom, int(res), chrom_len, noise_vals, out_path)
-            per_chrom_paths.append(out_path)
+            tasks.append(
+                _FullNoiseTask(
+                    hic_path=hic_path,
+                    chrom=chrom,
+                    chrom_len=chrom_len,
+                    res=res,
+                    norm=norm,
+                    cooler_selection=cooler_selection,
+                    bindist_bp=bindist_bp,
+                    out_dir=out_dir,
+                    out_path=out_path,
+                )
+            )
+        del provider
 
+    for task in tasks:
+        if os.path.exists(task.out_path):
+            try:
+                os.remove(task.out_path)
+            except OSError:
+                pass
+
+    results: List[Tuple[str, int, str, bool]] = []
+    errors: List[Tuple[_FullNoiseTask, Exception, Exception]] = []
+
+    def _run_with_retry(task: _FullNoiseTask) -> Tuple[str, int, str, bool]:
+        try:
+            return _full_noise_worker(task)
+        except Exception as first_exc:
+            if os.path.exists(task.out_path):
+                try:
+                    os.remove(task.out_path)
+                except OSError:
+                    pass
+            try:
+                return _full_noise_worker(task)
+            except Exception as second_exc:
+                errors.append((task, first_exc, second_exc))
+                raise
+
+    if not tasks:
+        return
+
+    if workers == 1:
+        for task in tasks:
+            try:
+                results.append(_run_with_retry(task))
+            except Exception:
+                continue
+    else:
+        ctx = mp.get_context()
+        with ctx.Pool(processes=workers, maxtasksperchild=10) as pool:
+            async_results = [(task, pool.apply_async(_full_noise_worker, (task,))) for task in tasks]
+            for task, async_res in async_results:
+                try:
+                    results.append(async_res.get())
+                except Exception as first_exc:
+                    if os.path.exists(task.out_path):
+                        try:
+                            os.remove(task.out_path)
+                        except OSError:
+                            pass
+                    try:
+                        results.append(_full_noise_worker(task))
+                    except Exception as second_exc:
+                        errors.append((task, first_exc, second_exc))
+
+    per_res_outputs: Dict[int, List[str]] = {}
+    for chrom, res, path, generated in results:
+        if not generated:
+            continue
+        per_res_outputs.setdefault(res, []).append(path)
+
+    for res_raw in res_list:
+        res = int(res_raw)
         merged = os.path.join(out_dir, f"{res}.bedgraph")
+        if os.path.exists(merged):
+            try:
+                os.remove(merged)
+            except OSError:
+                pass
+        paths = sorted(per_res_outputs.get(res, []))
+        if not paths:
+            continue
         with open(merged, "wb") as merged_handle:
-            for path in per_chrom_paths:
+            for path in paths:
                 if not os.path.exists(path):
                     continue
                 with open(path, "rb") as part:
                     merged_handle.write(part.read())
+
+    if errors:
+        error_path = os.path.join(out_dir, "full_noise_errors.tsv")
+        with open(error_path, "w") as handle:
+            handle.write("chrom\tres\tmessage\n")
+            for task, first_exc, second_exc in errors:
+                handle.write(
+                    f"{task.chrom}\t{task.res}\tinitial: {repr(first_exc)}; retry: {repr(second_exc)}\n"
+                )
+        raise RuntimeError(
+            f"{len(errors)} full-noise task(s) failed. See {error_path} for details."
+        )

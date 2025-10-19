@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -29,6 +29,59 @@ COOLER_SUFFIXES: Tuple[str, ...] = (".cool", ".mcool", ".scool")
 
 def is_cooler_path(path: str) -> bool:
     return "::" in path or any(path.lower().endswith(ext) for ext in COOLER_SUFFIXES)
+
+
+def hic_resolutions(path: str) -> List[int]:
+    try:
+        hic = hicstraw.HiCFile(path)
+    except Exception:
+        return []
+    try:
+        resolutions = hic.getResolutions()
+    except Exception:
+        return []
+    try:
+        return sorted(int(res) for res in resolutions)
+    except Exception:
+        return []
+
+
+def cooler_resolutions(path: str, selection: Optional[str]) -> List[int]:
+    if cooler is None:
+        return []
+    try:
+        if "::" in path:
+            obj = cooler.Cooler(path)
+            bin_size = obj.info.get("bin-size")
+            return [int(bin_size)] if bin_size is not None else []
+        lower = path.lower()
+        if lower.endswith(".cool"):
+            obj = cooler.Cooler(path)
+            bin_size = obj.info.get("bin-size")
+            return [int(bin_size)] if bin_size is not None else []
+        if lower.endswith(".mcool"):
+            if list_coolers is None:
+                return []
+            resolutions: set[int] = set()
+            for uri in list(list_coolers(path)):
+                full_uri = uri if "::" in uri else f"{path}::{uri}"
+                try:
+                    obj = cooler.Cooler(full_uri)
+                    bin_size = obj.info.get("bin-size")
+                    if bin_size is not None:
+                        resolutions.add(int(bin_size))
+                except Exception:
+                    continue
+            return sorted(resolutions)
+        if lower.endswith(".scool"):
+            if not selection:
+                return []
+            obj = cooler.Cooler(f"{path}::{selection}")
+            bin_size = obj.info.get("bin-size")
+            return [int(bin_size)] if bin_size is not None else []
+    except Exception:
+        return []
+    return []
 
 
 def normalize_hic_norm(norm: str) -> str:
@@ -99,6 +152,25 @@ class ChromMatrix:
     csc: sparse.csc_matrix
 
 
+def total_contacts(matrix: ChromMatrix) -> float:
+    coo = matrix.coo
+    if coo.nnz == 0:
+        return 0.0
+    row = coo.row
+    col = coo.col
+    data = coo.data
+    lo = np.minimum(row, col).astype(np.uint64, copy=False)
+    hi = np.maximum(row, col).astype(np.uint64, copy=False)
+    keys = (lo << np.uint64(32)) | hi
+    order = np.argsort(keys, kind="mergesort")
+    keys_sorted = keys[order]
+    data_sorted = data[order]
+    _, idx, counts = np.unique(keys_sorted, return_index=True, return_counts=True)
+    summed = np.add.reduceat(data_sorted, idx)
+    averages = summed / counts
+    return float(averages.sum())
+
+
 class BaseProvider:
     def chrom_sizes(self) -> Dict[str, int]:
         raise NotImplementedError
@@ -153,7 +225,10 @@ class HiCProvider(BaseProvider):
         col_sym = np.concatenate([col_arr, row_arr[mask]])
         data_sym = np.concatenate([data_arr, data_arr[mask]])
 
-        rowbins = chrom_len // self.res + 1
+        rowbins = (chrom_len + self.res - 1) // self.res
+        if row_sym.size:
+            max_idx = int(max(row_sym.max(), col_sym.max()))
+            rowbins = max(rowbins, max_idx + 1)
         coo = sparse.coo_matrix((data_sym, (row_sym, col_sym)), shape=(rowbins, rowbins))
         coo.sum_duplicates()
         csr = coo.tocsr()
@@ -216,12 +291,17 @@ class CoolerProvider(BaseProvider):
         else:
             sub = self._raw_matrix.fetch(chrom)
         coo = sub.tocoo()
+        finite_mask = np.isfinite(coo.data)
+        if not np.all(finite_mask):
+            coo = sparse.coo_matrix(
+                (coo.data[finite_mask], (coo.row[finite_mask], coo.col[finite_mask])),
+                shape=coo.shape,
+            )
 
         if self._norm_mode == "custom":
             weights = self._custom_weights[start:end]
-            denom = weights[coo.row] * weights[coo.col]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                data = np.divide(coo.data, denom, out=np.zeros_like(coo.data), where=denom != 0)
+            factor = weights[coo.row] * weights[coo.col]
+            data = coo.data * factor
             coo = sparse.coo_matrix((data, (coo.row, coo.col)), shape=coo.shape)
 
         coo.sum_duplicates()
