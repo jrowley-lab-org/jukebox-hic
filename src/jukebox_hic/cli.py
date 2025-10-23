@@ -4,7 +4,7 @@ import os
 import time
 from typing import Callable, Dict, List, Optional
 
-from . import figures, noise_fullmap, noise_sampling, filters
+from . import figures, noise_fullmap, noise_sampling, filters, noise_to_weights
 from .backends import (
     cooler_resolutions,
     hic_resolutions,
@@ -136,6 +136,90 @@ def main() -> None:
         help="Number of worker processes to use for full-noise (default: 1)",
     )
 
+    sp_weights = sub.add_parser(
+        "noise-to-weights",
+        help="Convert noise bedGraphs into normalization vectors",
+    )
+    sp_weights.add_argument(
+        "--scores_dir",
+        required=True,
+        help="Directory containing resolution-named bedGraphs or a single bedGraph file",
+    )
+    sp_weights.add_argument(
+        "--res",
+        required=True,
+        type=int,
+        help="Resolution in bp matching the target bedGraph file",
+    )
+    sp_weights.add_argument(
+        "--out_dir",
+        required=True,
+        help="Directory for output weight bedGraphs and QC summaries",
+    )
+    sp_weights.add_argument(
+        "--coverage",
+        help="Optional coverage bedGraph file or directory with resolution-named files",
+    )
+    sp_weights.add_argument(
+        "--chrom_sizes",
+        help="Optional chrom sizes TSV (chr\\tsize) for validation and clipping",
+    )
+    sp_weights.add_argument(
+        "--chroms",
+        help="Comma-separated list of chromosomes to include",
+    )
+    sp_weights.add_argument("--tau", type=float, help="Override tau hyperparameter")
+    sp_weights.add_argument("--kappa", type=float, help="Override kappa hyperparameter")
+    sp_weights.add_argument("--gain", type=float, help="Override gain hyperparameter")
+    sp_weights.add_argument("--lambda_", type=float, help="Override shrinkage lambda")
+    sp_weights.add_argument("--sigma_target", type=float, help="Target dispersion (omit for default)")
+    sp_weights.add_argument("--eps_floor", type=float, help="Minimum epsilon for NaN rows")
+    sp_weights.add_argument("--eps_scale", type=float, help="Scaling factor for epsilon computation")
+    sp_weights.add_argument("--w_min", type=float, help="Lower clip bound for weights")
+    sp_weights.add_argument("--w_max", type=float, help="Upper clip bound for weights")
+    sp_weights.add_argument("--max_clip_rate", type=float, help="Maximum tolerated clip rate before relaxation")
+    sp_weights.add_argument("--min_neg_spearman", type=float, help="Expected upper bound on Spearman (negative)")
+    sp_weights.add_argument("--target_cv_reduction", type=float, help="Target CV reduction for QC expectations")
+    sp_weights.add_argument(
+        "--stability_ratios",
+        help="Comma-separated ratios (0-1) for stability downsampling checks (default: 0.9,0.7,0.5)",
+    )
+    sp_weights.add_argument(
+        "--disable_stability",
+        action="store_true",
+        help="Disable stability downsampling QC",
+    )
+    sp_weights.add_argument(
+        "--use_depth_heuristics",
+        action="store_true",
+        help="Enable depth-aware heuristics for lambda and sigma_target",
+    )
+    sp_weights.add_argument(
+        "--depth_reference",
+        type=float,
+        help="Reference depth constant D0 for heuristic adjustments",
+    )
+    sp_weights.add_argument(
+        "--include_decoys",
+        action="store_true",
+        help="Include decoy/unplaced chromosomes (default: skip)",
+    )
+    sp_weights.add_argument(
+        "--nan_fraction_threshold",
+        type=float,
+        help="NaN fraction threshold that triggers epsilon inflation (default: 0.5)",
+    )
+    sp_weights.add_argument(
+        "--high_nan_eps_multiplier",
+        type=float,
+        help="Multiplier applied to epsilon when NaN fraction exceeds threshold (default: 2.0)",
+    )
+    sp_weights.add_argument(
+        "--rng_seed",
+        type=int,
+        help="Optional seed for stability downsampling random generator",
+    )
+
     sp_plot = sub.add_parser("plot", help="Plot density of noise values from a bedgraph")
     sp_plot.add_argument("--noise_bed", required=True, help="Noise bedgraph path")
     sp_plot.add_argument("--out_png", required=True, help="Output PNG path")
@@ -217,6 +301,63 @@ def main() -> None:
             )
 
         _profile_command("full-noise", run)
+    elif args.cmd == "noise-to-weights":
+        os.makedirs(args.out_dir, exist_ok=True)
+        cfg = noise_to_weights.NoiseWeightConfig()
+        if args.tau is not None:
+            cfg.tau = float(args.tau)
+        if args.kappa is not None:
+            cfg.kappa = float(args.kappa)
+        if args.gain is not None:
+            cfg.gain = float(args.gain)
+        if args.lambda_ is not None:
+            cfg.shrink_lambda = float(args.lambda_)
+        if args.sigma_target is not None:
+            cfg.sigma_target = float(args.sigma_target)
+        if args.eps_floor is not None:
+            cfg.eps_floor = float(args.eps_floor)
+        if args.eps_scale is not None:
+            cfg.eps_scale = float(args.eps_scale)
+        if args.w_min is not None:
+            cfg.w_min = float(args.w_min)
+        if args.w_max is not None:
+            cfg.w_max = float(args.w_max)
+        if args.max_clip_rate is not None:
+            cfg.max_clip_rate = float(args.max_clip_rate)
+        if args.min_neg_spearman is not None:
+            cfg.min_neg_spearman = float(args.min_neg_spearman)
+        if args.target_cv_reduction is not None:
+            cfg.target_cv_reduction = float(args.target_cv_reduction)
+        if args.stability_ratios:
+            ratios = [float(x) for x in args.stability_ratios.split(",") if x]
+            cfg.stability_ratios = tuple(ratios)
+        if args.disable_stability:
+            cfg.stability_ratios = tuple()
+        cfg.use_depth_heuristics = bool(args.use_depth_heuristics)
+        if args.depth_reference is not None:
+            cfg.depth_reference = float(args.depth_reference)
+        cfg.skip_decoys = not bool(args.include_decoys)
+        if args.nan_fraction_threshold is not None:
+            cfg.nan_fraction_threshold = float(args.nan_fraction_threshold)
+        if args.high_nan_eps_multiplier is not None:
+            cfg.high_nan_eps_multiplier = float(args.high_nan_eps_multiplier)
+        if args.rng_seed is not None:
+            cfg.random_seed = int(args.rng_seed)
+
+        chroms = [chrom.strip() for chrom in args.chroms.split(",")] if args.chroms else None
+
+        def run() -> None:
+            noise_to_weights.build_weights_from_bedgraphs(
+                scores_dir=args.scores_dir,
+                res=int(args.res),
+                out_dir=args.out_dir,
+                config=cfg,
+                coverage_path=args.coverage,
+                chrom_sizes_path=args.chrom_sizes,
+                chrom_allowlist=chroms,
+            )
+
+        _profile_command("noise-to-weights", run)
     elif args.cmd == "plot":
 
         def run() -> None:
