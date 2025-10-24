@@ -5,16 +5,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy import sparse
-
-try:
-    import hicstraw  # type: ignore
-except ImportError as exc:  # pragma: no cover - surfaced at runtime
-    raise RuntimeError("hicstraw is required for .hic inputs") from exc
 
 try:
     import cooler  # type: ignore
@@ -25,6 +20,10 @@ except ImportError:
 
 
 COOLER_SUFFIXES: Tuple[str, ...] = (".cool", ".mcool", ".scool")
+HICSTRAW_HELP = (
+    "hicstraw is required for .hic inputs. Install it with "
+    'pip install "jukebox-hic[straw]" or convert the .hic file to .mcool using hic2cool.'
+)
 
 
 def is_cooler_path(path: str) -> bool:
@@ -32,6 +31,10 @@ def is_cooler_path(path: str) -> bool:
 
 
 def hic_resolutions(path: str) -> List[int]:
+    try:
+        import hicstraw  # type: ignore
+    except ImportError:
+        return []
     try:
         hic = hicstraw.HiCFile(path)
     except Exception:
@@ -181,10 +184,15 @@ class BaseProvider:
 
 class HiCProvider(BaseProvider):
     def __init__(self, path: str, res: int, norm: str) -> None:
+        try:
+            import hicstraw  # type: ignore
+        except ImportError as exc:  # pragma: no cover - surfaced at runtime
+            raise RuntimeError(HICSTRAW_HELP) from exc
         self.path = path
         self.res = int(res)
         self.norm = normalize_hic_norm(norm)
-        self._hic = hicstraw.HiCFile(path)
+        self._hicstraw: Any = hicstraw
+        self._hic = self._hicstraw.HiCFile(path)
         self._chrom_sizes = {
             str(chrom.name): int(chrom.length)
             for chrom in self._hic.getChromosomes()
@@ -198,7 +206,7 @@ class HiCProvider(BaseProvider):
         chrom_len = self._chrom_sizes.get(chrom)
         if chrom_len is None:
             return None
-        records = hicstraw.straw(
+        records = self._hicstraw.straw(
             "observed",
             self.norm,
             self.path,

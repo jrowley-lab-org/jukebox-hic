@@ -1,6 +1,6 @@
 # jukebox-hic
 
-Lightweight Hi-C noise analysis toolkit that depends only on the Python [`hicstraw`](https://github.com/aidenlab/straw) bindings.
+Lightweight Hi-C noise analysis toolkit for `.hic` (via optional [`hicstraw`](https://github.com/aidenlab/straw)) and cooler formats.
 
 ## Features
 - Per-row noise estimates with optional subsampling simulations to gauge robustness.
@@ -12,6 +12,10 @@ Lightweight Hi-C noise analysis toolkit that depends only on the Python [`hicstr
 ## Installation
 ```bash
 pip install jukebox-hic
+```
+To enable `.hic` inputs, install the optional extra that pulls in `hicstraw`:
+```bash
+pip install "jukebox-hic[straw]"
 ```
 Or clone the repository and install the package in editable mode:
 ```bash
@@ -94,3 +98,16 @@ noise_sampling.compute_sampled_noise(
 - `--profile` writes per-chromosome runtime and memory metrics to a CSV for downstream plotting.
 - `--cpu <N>` parallelizes `full-noise` by `(chromosome, resolution)` tasks (default 1, capped at available cores).
 - Every CLI invocation now emits a `contacts_overview.tsv` summarizing per-chromosome totals at the coarsest resolution.
+
+### If hic-straw fails to install
+If `pip install "jukebox-hic[straw]"` fails (e.g. due to missing prebuilt wheels), convert the `.hic` file to a `.mcool` archive and use the cooler backend:
+```bash
+pip install hic2cool
+hic2cool convert sample.hic sample.mcool --resolutions 10000
+jukebox-hic sample-noise \
+  --hic sample.mcool \
+  --cooler_path /resolutions/10000 \
+  --res 10000 \
+  --out_dir outputs/10kb
+```
+The same `--cooler_path` argument selects groups inside `.scool` files.

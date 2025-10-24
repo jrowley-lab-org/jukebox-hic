@@ -141,7 +141,7 @@ def compute_full_noise(
 ) -> None:
     """
     Compute noise values for every row/bin across the genome at the requested resolutions.
-    All calculations rely solely on hicstraw outputs.
+    All calculations rely on the selected backend for the input format.
     """
     os.makedirs(out_dir, exist_ok=True)
 

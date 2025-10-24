@@ -114,7 +114,7 @@ def main() -> None:
         help="Write per-chromosome profiling metrics (runtime, memory) to the specified CSV",
     )
 
-    sp_full = sub.add_parser("full-noise", help="Compute noise genome-wide using hicstraw expected vectors")
+    sp_full = sub.add_parser("full-noise", help="Compute noise genome-wide using Hi-C expected vectors")
     sp_full.add_argument("--hic", required=True, help="Input .hic file path")
     sp_full.add_argument("--res", required=True, help="Comma-separated resolutions in bp")
     sp_full.add_argument("--chrom_sizes", help="Chrom sizes TSV (chr\\tsize); default: read from .hic")
