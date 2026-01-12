@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-import math
 import os
 import statistics
 import time
@@ -10,7 +9,7 @@ import pandas as pd
 from scipy import sparse
 from statsmodels.tsa.stattools import acf, acovf
 
-from .backends import ChromMatrix, read_chrom_sizes, select_provider
+from .backends import ChromMatrix, read_chrom_sizes, select_provider, total_contacts
 from .metrics import collect_memory_usage_mb
 
 
@@ -121,11 +120,8 @@ def _compute_row_metrics(
         except Exception:
             ac_val = 0.0
 
-    noise_log = float("nan") if math.isnan(noise_raw) else math.log10(noise_raw + 1.0)
-
     return {
         "noise_raw": noise_raw,
-        "noise_log": noise_log,
         "row_mean": mean_val,
         "row_std": std_val,
         "acf": ac_val,
@@ -166,6 +162,8 @@ def compute_sampled_noise(
     bindist_bins = max(1, window // int(res))
 
     summary_records: List[Dict[str, Any]] = []
+    contacts_by_chrom: Dict[str, float] = {}
+    chrom_bp_sizes: Dict[str, int] = {}
     profile_rows: List[Dict[str, Any]] = []
     os.makedirs(out_dir, exist_ok=True)
 
@@ -182,6 +180,9 @@ def compute_sampled_noise(
         matrices = provider.fetch_chrom(chrom)
         if matrices is None or matrices.coo.nnz == 0:
             continue
+        chrom_bp_sizes[chrom] = chrom_len
+        chrom_contacts = total_contacts(matrices)
+        contacts_by_chrom[chrom] = chrom_contacts
 
         expected_lookup, default_expected = _precompute_expectation(matrices.coo)
 
@@ -209,7 +210,7 @@ def compute_sampled_noise(
         chrom_bed: List[Tuple[int, float]] = []
         ratio_stats = {
             ratio: {
-                "noise_log": [],
+                "noise_raw": [],
                 "row_mean": [],
                 "row_std": [],
                 "acf": [],
@@ -261,7 +262,7 @@ def compute_sampled_noise(
                 expected_scaled = expected_vec * ratio
                 metrics = _compute_row_metrics(counts.astype(float), expected_scaled.astype(float))
 
-                ratio_stats[ratio]["noise_log"].append(metrics["noise_log"])
+                ratio_stats[ratio]["noise_raw"].append(metrics["noise_raw"])
                 ratio_stats[ratio]["row_mean"].append(metrics["row_mean"])
                 ratio_stats[ratio]["row_std"].append(metrics["row_std"])
                 ratio_stats[ratio]["acf"].append(metrics["acf"])
@@ -285,20 +286,23 @@ def compute_sampled_noise(
                     handle.write(f"{chrom} {start_bp} {stop_bp} {value}\n")
 
         for ratio, stats_dict in ratio_stats.items():
-            if not stats_dict["noise_log"]:
+            noise_values = stats_dict["noise_raw"]
+            if not noise_values:
                 continue
+            chrom_contacts = contacts_by_chrom.get(chrom, float("nan"))
             summary_records.append(
                 {
                     "chrom": chrom,
                     "ratio": ratio,
-                    "rows_evaluated": len(stats_dict["noise_log"]),
-                    "mean_noise_log10": float(np.nanmean(stats_dict["noise_log"])),
-                    "median_noise_log10": float(np.nanmedian(stats_dict["noise_log"])),
-                    "std_noise_log10": float(np.nanstd(stats_dict["noise_log"], ddof=0)),
+                    "rows_evaluated": len(noise_values),
+                    "mean_noise": float(np.nanmean(noise_values)),
+                    "median_noise": float(np.nanmedian(noise_values)),
+                    "std_noise": float(np.nanstd(noise_values, ddof=0)),
                     "mean_row_mean": float(np.nanmean(stats_dict["row_mean"])),
                     "mean_row_std": float(np.nanmean(stats_dict["row_std"])),
                     "mean_acf": float(np.nanmean(stats_dict["acf"])),
                     "mean_empty_bin_ratio": float(np.nanmean(stats_dict["empty_ratio"])),
+                    "estimated_contacts": float(chrom_contacts * float(ratio)),
                 }
             )
 
@@ -343,7 +347,13 @@ def compute_sampled_noise(
         summary_df = pd.DataFrame(summary_records)
         summary_df.sort_values(["chrom", "ratio"], inplace=True)
         summary_path = os.path.join(out_dir, "subsample_summary.tsv")
-        summary_df.to_csv(summary_path, sep="\t", index=False)
+        with open(summary_path, "w") as handle:
+            for chrom in sorted(contacts_by_chrom):
+                handle.write(
+                    f"# chrom_info\t{chrom}\tcontacts={contacts_by_chrom[chrom]:.6f}\t"
+                    f"size_bp={chrom_bp_sizes.get(chrom, 'NA')}\n"
+                )
+            summary_df.to_csv(handle, sep="\t", index=False)
 
     if profile_path and profile_rows:
         profile_abs = os.path.abspath(profile_path)
