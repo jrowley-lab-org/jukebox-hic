@@ -75,6 +75,7 @@ def main() -> None:
         description="Lightweight Hi-C noise analysis toolkit for .hic/.cool matrices",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
+    parser.epilog = "Note: Base install includes \"cooler\" only. For .hic support, install extras: pip install \"jukebox-hic[straw]\" or \"jukebox-hic[all]\"."
 
     sp_sample = sub.add_parser("sample-noise", help="Compute noise on a sampled set of rows")
     sp_sample.add_argument("--hic", required=True, help="Input .hic file path")

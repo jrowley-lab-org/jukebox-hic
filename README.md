@@ -10,20 +10,23 @@ Lightweight Hi-C noise analysis toolkit for `.hic` (via optional [`hicstraw`](ht
 - Simple plotting helpers for comparing noise distributions (log-scaled histograms).
 
 ## Installation
+
+Recommended (both backends):
+
+```bash
+pip install "jukebox-hic[all]"
+```
+
+Base install (cooler only):
+
 ```bash
 pip install jukebox-hic
 ```
-To enable `.hic` inputs, install the optional extra that pulls in `hicstraw`:
-```bash
-pip install "jukebox-hic[straw]"
-```
-Or clone the repository and install the package in editable mode:
-```bash
-pip install -e .
-# For optional runtime/memory profiling support
-pip install -e .[profile]
-```
 
+- The base install includes the `cooler` backend for `.cool/.mcool/.scool` files.
+- To process `.hic` files, install the straw extra or the all-in-one extra:
+  - `pip install "jukebox-hic[straw]"`
+  - or `pip install "jukebox-hic[all]"`
 ## Command Line Usage
 ### Sampled noise with subsampling summaries
 ```bash
@@ -111,3 +114,17 @@ jukebox-hic sample-noise \
   --out_dir outputs/10kb
 ```
 The same `--cooler_path` argument selects groups inside `.scool` files.
+
+
+## Backends
+
+This project supports two I/O backends:
+
+- cooler (default; installed by base package): `.cool`, `.mcool`, `.scool`
+- hicstraw (optional): `.hic`
+
+Runtime guidance:
+- If you pass a `.hic` file without hicstraw installed, the tool will print a clear message suggesting:
+  `pip install "jukebox-hic[straw]"` (or `"jukebox-hic[all]"`).
+- If you pass a cooler-format file without `cooler` available (e.g., stripped environment), the tool will suggest installing the base package or `"jukebox-hic[all]"`.
+

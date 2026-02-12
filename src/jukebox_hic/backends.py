@@ -22,7 +22,11 @@ except ImportError:
 COOLER_SUFFIXES: Tuple[str, ...] = (".cool", ".mcool", ".scool")
 HICSTRAW_HELP = (
     "hicstraw is required for .hic inputs. Install it with "
-    'pip install "jukebox-hic[straw]" or convert the .hic file to .mcool using hic2cool.'
+    'pip install "jukebox-hic[straw]" (or "jukebox-hic[all]") or convert the .hic file to .mcool using hic2cool.'
+)
+
+COOLER_HELP = (
+    'cooler is required for .cool/.mcool/.scool inputs. Install it with pip install "jukebox-hic" or "jukebox-hic[all]".'
 )
 
 
@@ -106,7 +110,7 @@ def resolve_cooler_uri(path: str, res: int, selection: Optional[str]) -> str:
         return path
     if lower.endswith(".mcool"):
         if list_coolers is None:
-            raise RuntimeError("cooler is required for .mcool handling")
+            raise RuntimeError(COOLER_HELP)
         target_group = f"/resolutions/{res}"
         candidate_full = f"{path}::{target_group}"
         available = list(list_coolers(path))
@@ -247,7 +251,7 @@ class HiCProvider(BaseProvider):
 class CoolerProvider(BaseProvider):
     def __init__(self, path: str, res: int, norm: str, selection: Optional[str]) -> None:
         if cooler is None:
-            raise RuntimeError("cooler is required for .cool/.mcool/.scool inputs")
+            raise RuntimeError(COOLER_HELP)
         self.res = int(res)
         self.uri = resolve_cooler_uri(path, self.res, selection)
         self._cooler = cooler.Cooler(self.uri)
@@ -347,3 +351,4 @@ def read_chrom_sizes(
         provider_sizes = provider.chrom_sizes()
         return {chrom: provider_sizes[chrom] for chrom in provider_sizes if chrom in sizes}
     return provider.chrom_sizes()
+
