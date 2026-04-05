@@ -75,8 +75,14 @@ def main() -> None:
         description="Lightweight Hi-C noise analysis toolkit for .hic/.cool matrices",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
-    parser.epilog = "Note: Base install includes \"cooler\" only. For .hic support, install extras: pip install \"jukebox-hic[straw]\" or \"jukebox-hic[all]\"."
+    parser.epilog = (
+        'Note: Base install includes "cooler" only. For .hic support, install extras: '
+        'pip install "jukebox-hic[straw]" or "jukebox-hic[all]".'
+    )
 
+    # ------------------------------------------------------------------ #
+    # sample-noise                                                         #
+    # ------------------------------------------------------------------ #
     sp_sample = sub.add_parser("sample-noise", help="Compute noise on a sampled set of rows")
     sp_sample.add_argument("--hic", required=True, help="Input .hic file path")
     sp_sample.add_argument("--res", required=True, type=int, help="Resolution in bp")
@@ -91,7 +97,7 @@ def main() -> None:
     )
     sp_sample.add_argument(
         "--cooler_path",
-        help="Internal group path for .cool/.mcool/.scool URIs (e.g. /resolutions/10000 or cell name)",
+        help="Internal group path for .cool/.mcool/.scool URIs",
     )
     sp_sample.add_argument(
         "--min_mean_score",
@@ -115,6 +121,9 @@ def main() -> None:
         help="Write per-chromosome profiling metrics (runtime, memory) to the specified CSV",
     )
 
+    # ------------------------------------------------------------------ #
+    # full-noise                                                           #
+    # ------------------------------------------------------------------ #
     sp_full = sub.add_parser("full-noise", help="Compute noise genome-wide using Hi-C expected vectors")
     sp_full.add_argument("--hic", required=True, help="Input .hic file path")
     sp_full.add_argument("--res", required=True, help="Comma-separated resolutions in bp")
@@ -128,7 +137,7 @@ def main() -> None:
     sp_full.add_argument("--out_dir", required=True, help="Directory for outputs")
     sp_full.add_argument(
         "--cooler_path",
-        help="Internal group path for .cool/.mcool/.scool URIs (e.g. /resolutions/10000 or cell name)",
+        help="Internal group path for .cool/.mcool/.scool URIs",
     )
     sp_full.add_argument(
         "--cpu",
@@ -137,94 +146,55 @@ def main() -> None:
         help="Number of worker processes to use for full-noise (default: 1)",
     )
 
-    sp_weights = sub.add_parser(
-        "noise-to-weights",
-        help="Convert noise bedGraphs into normalization vectors",
+    # ------------------------------------------------------------------ #
+    # bias-vectors                                                         #
+    # ------------------------------------------------------------------ #
+    sp_bias = sub.add_parser(
+        "bias-vectors",
+        help="Transform full-noise bedGraphs into Juicer normalization vectors",
     )
-    sp_weights.add_argument(
-        "--scores_dir",
+    sp_bias.add_argument(
+        "--noise_dir",
         required=True,
-        help="Directory containing resolution-named bedGraphs or a single bedGraph file",
+        help="Directory containing {res}.bedgraph (from full-noise) or a single bedGraph file",
     )
-    sp_weights.add_argument(
-        "--res",
+    sp_bias.add_argument("--res", required=True, type=int, help="Resolution in bp")
+    sp_bias.add_argument("--out", required=True, help="Output Juicer vector file path")
+    sp_bias.add_argument(
+        "--sample_name",
         required=True,
-        type=int,
-        help="Resolution in bp matching the target bedGraph file",
+        help="Label used in vector headers (e.g. JukeBox)",
     )
-    sp_weights.add_argument(
-        "--out_dir",
-        required=True,
-        help="Directory for output weight bedGraphs and QC summaries",
+    sp_bias.add_argument(
+        "--zmap_summary",
+        help="Path to subsample_summary.tsv from sample-noise; provides per-chrom gamma and EBR",
     )
-    sp_weights.add_argument(
-        "--coverage",
-        help="Optional coverage bedGraph file or directory with resolution-named files",
-    )
-    sp_weights.add_argument(
+    sp_bias.add_argument(
         "--chrom_sizes",
-        help="Optional chrom sizes TSV (chr\\tsize) for validation and clipping",
+        help="Chrom sizes TSV for grid validation (optional)",
     )
-    sp_weights.add_argument(
-        "--chroms",
-        help="Comma-separated list of chromosomes to include",
+    sp_bias.add_argument(
+        "--nan_fill",
+        default="nan",
+        choices=["nan", "0"],
+        help="Value written for NaN/masked bins (default: nan; use 0 for engines that reject NaN)",
     )
-    sp_weights.add_argument("--tau", type=float, help="Override tau hyperparameter")
-    sp_weights.add_argument("--kappa", type=float, help="Override kappa hyperparameter")
-    sp_weights.add_argument("--gain", type=float, help="Override gain hyperparameter")
-    sp_weights.add_argument("--lambda_", type=float, help="Override shrinkage lambda")
-    sp_weights.add_argument("--sigma_target", type=float, help="Target dispersion (omit for default)")
-    sp_weights.add_argument("--eps_floor", type=float, help="Minimum epsilon for NaN rows")
-    sp_weights.add_argument("--eps_scale", type=float, help="Scaling factor for epsilon computation")
-    sp_weights.add_argument("--w_min", type=float, help="Lower clip bound for weights")
-    sp_weights.add_argument("--w_max", type=float, help="Upper clip bound for weights")
-    sp_weights.add_argument("--max_clip_rate", type=float, help="Maximum tolerated clip rate before relaxation")
-    sp_weights.add_argument("--min_neg_spearman", type=float, help="Expected upper bound on Spearman (negative)")
-    sp_weights.add_argument("--target_cv_reduction", type=float, help="Target CV reduction for QC expectations")
-    sp_weights.add_argument(
-        "--stability_ratios",
-        help="Comma-separated ratios (0-1) for stability downsampling checks (default: 0.9,0.7,0.5)",
-    )
-    sp_weights.add_argument(
-        "--disable_stability",
-        action="store_true",
-        help="Disable stability downsampling QC",
-    )
-    sp_weights.add_argument(
-        "--use_depth_heuristics",
-        action="store_true",
-        help="Enable depth-aware heuristics for lambda and sigma_target",
-    )
-    sp_weights.add_argument(
-        "--depth_reference",
-        type=float,
-        help="Reference depth constant D0 for heuristic adjustments",
-    )
-    sp_weights.add_argument(
+    sp_bias.add_argument(
         "--include_decoys",
         action="store_true",
         help="Include decoy/unplaced chromosomes (default: skip)",
     )
-    sp_weights.add_argument(
-        "--nan_fraction_threshold",
-        type=float,
-        help="NaN fraction threshold that triggers epsilon inflation (default: 0.5)",
-    )
-    sp_weights.add_argument(
-        "--high_nan_eps_multiplier",
-        type=float,
-        help="Multiplier applied to epsilon when NaN fraction exceeds threshold (default: 2.0)",
-    )
-    sp_weights.add_argument(
-        "--rng_seed",
-        type=int,
-        help="Optional seed for stability downsampling random generator",
-    )
 
+    # ------------------------------------------------------------------ #
+    # plot                                                                 #
+    # ------------------------------------------------------------------ #
     sp_plot = sub.add_parser("plot", help="Plot density of noise values from a bedgraph")
     sp_plot.add_argument("--noise_bed", required=True, help="Noise bedgraph path")
     sp_plot.add_argument("--out_png", required=True, help="Output PNG path")
 
+    # ------------------------------------------------------------------ #
+    # blacklist                                                            #
+    # ------------------------------------------------------------------ #
     sp_mask = sub.add_parser("blacklist", help="Build a blacklist from per-chrom bedgraphs")
     sp_mask.add_argument(
         "--input",
@@ -245,6 +215,45 @@ def main() -> None:
         help="Quantile threshold for blacklisting when z-score cutoff is not provided (default: 0.95)",
     )
 
+    # ------------------------------------------------------------------ #
+    # default-run                                                          #
+    # ------------------------------------------------------------------ #
+    sp_run = sub.add_parser(
+        "default-run",
+        help=(
+            "Full JUKEBOX pipeline: sample noise → full noise → bias vectors → blacklist. "
+            "Runs at no normalization using 4DN reference benchmarking."
+        ),
+    )
+    sp_run.add_argument("--hic", required=True, help="Input .hic or cooler file path")
+    sp_run.add_argument("--res", required=True, help="Comma-separated resolutions in bp")
+    sp_run.add_argument("--out_dir", required=True, help="Root output directory")
+    sp_run.add_argument(
+        "--sample_name",
+        required=True,
+        help="Sample label used in vector headers and output file names",
+    )
+    sp_run.add_argument("--chrom_sizes", help="Chrom sizes TSV (chr\\tsize)")
+    sp_run.add_argument(
+        "--cpu",
+        type=int,
+        default=1,
+        help="Worker processes for full-noise (default: 1)",
+    )
+    sp_run.add_argument(
+        "--cooler_path",
+        help="Internal group path for .cool/.mcool/.scool URIs",
+    )
+    sp_run.add_argument(
+        "--nan_fill",
+        default="nan",
+        choices=["nan", "0"],
+        help="Value for masked NaN bins in output vectors (default: nan)",
+    )
+
+    # ------------------------------------------------------------------ #
+    # Dispatch                                                             #
+    # ------------------------------------------------------------------ #
     args = parser.parse_args()
 
     if args.cmd == "sample-noise":
@@ -277,6 +286,7 @@ def main() -> None:
             )
 
         _profile_command("sample-noise", run)
+
     elif args.cmd == "full-noise":
         os.makedirs(args.out_dir, exist_ok=True)
         contacts = _dump_contacts_once(args.hic, args.norm, args.cooler_path, args.chrom_sizes)
@@ -302,69 +312,32 @@ def main() -> None:
             )
 
         _profile_command("full-noise", run)
-    elif args.cmd == "noise-to-weights":
-        os.makedirs(args.out_dir, exist_ok=True)
-        cfg = noise_to_weights.NoiseWeightConfig()
-        if args.tau is not None:
-            cfg.tau = float(args.tau)
-        if args.kappa is not None:
-            cfg.kappa = float(args.kappa)
-        if args.gain is not None:
-            cfg.gain = float(args.gain)
-        if args.lambda_ is not None:
-            cfg.shrink_lambda = float(args.lambda_)
-        if args.sigma_target is not None:
-            cfg.sigma_target = float(args.sigma_target)
-        if args.eps_floor is not None:
-            cfg.eps_floor = float(args.eps_floor)
-        if args.eps_scale is not None:
-            cfg.eps_scale = float(args.eps_scale)
-        if args.w_min is not None:
-            cfg.w_min = float(args.w_min)
-        if args.w_max is not None:
-            cfg.w_max = float(args.w_max)
-        if args.max_clip_rate is not None:
-            cfg.max_clip_rate = float(args.max_clip_rate)
-        if args.min_neg_spearman is not None:
-            cfg.min_neg_spearman = float(args.min_neg_spearman)
-        if args.target_cv_reduction is not None:
-            cfg.target_cv_reduction = float(args.target_cv_reduction)
-        if args.stability_ratios:
-            ratios = [float(x) for x in args.stability_ratios.split(",") if x]
-            cfg.stability_ratios = tuple(ratios)
-        if args.disable_stability:
-            cfg.stability_ratios = tuple()
-        cfg.use_depth_heuristics = bool(args.use_depth_heuristics)
-        if args.depth_reference is not None:
-            cfg.depth_reference = float(args.depth_reference)
-        cfg.skip_decoys = not bool(args.include_decoys)
-        if args.nan_fraction_threshold is not None:
-            cfg.nan_fraction_threshold = float(args.nan_fraction_threshold)
-        if args.high_nan_eps_multiplier is not None:
-            cfg.high_nan_eps_multiplier = float(args.high_nan_eps_multiplier)
-        if args.rng_seed is not None:
-            cfg.random_seed = int(args.rng_seed)
 
-        chroms = [chrom.strip() for chrom in args.chroms.split(",")] if args.chroms else None
+    elif args.cmd == "bias-vectors":
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        nan_fill = float("nan") if args.nan_fill == "nan" else 0.0
 
         def run() -> None:
-            noise_to_weights.build_weights_from_bedgraphs(
-                scores_dir=args.scores_dir,
+            noise_to_weights.build_bias_vectors_from_bedgraphs(
+                noise_path_or_dir=args.noise_dir,
                 res=int(args.res),
-                out_dir=args.out_dir,
-                config=cfg,
-                coverage_path=args.coverage,
+                out_path=args.out,
+                sample_name=args.sample_name,
+                zmap_summary_path=args.zmap_summary,
                 chrom_sizes_path=args.chrom_sizes,
-                chrom_allowlist=chroms,
+                nan_fill_value=nan_fill,
+                skip_decoys=not bool(args.include_decoys),
             )
 
-        _profile_command("noise-to-weights", run)
+        _profile_command("bias-vectors", run)
+
     elif args.cmd == "plot":
 
         def run() -> None:
             figures.plot_noise_density_from_bed(args.noise_bed, args.out_png)
 
         _profile_command("plot", run)
+
     elif args.cmd == "blacklist":
 
         def run() -> None:
@@ -376,6 +349,91 @@ def main() -> None:
             )
 
         _profile_command("blacklist", run)
+
+    elif args.cmd == "default-run":
+        resolutions = _comma_ints(args.res)
+        cooler_sel = getattr(args, "cooler_path", None)
+        nan_fill = float("nan") if args.nan_fill == "nan" else 0.0
+
+        sample_root = os.path.join(args.out_dir, "sample")
+        full_dir = os.path.join(args.out_dir, "full")
+        os.makedirs(sample_root, exist_ok=True)
+        os.makedirs(full_dir, exist_ok=True)
+
+        # Dump contacts once (resolution-independent)
+        contacts = _dump_contacts_once(args.hic, "none", cooler_sel, args.chrom_sizes)
+
+        # Phase 1: Sample noise per resolution
+        for res in resolutions:
+            print(f"\n[Phase 1] Sampling noise at {res} bp ...")
+            res_sample_dir = os.path.join(sample_root, str(res))
+            os.makedirs(res_sample_dir, exist_ok=True)
+
+            if contacts:
+                contacts_path = os.path.join(res_sample_dir, "contacts_overview.tsv")
+                total_value = sum(contacts.values())
+                with open(contacts_path, "w") as handle:
+                    handle.write("chrom\tcontacts\n")
+                    for chrom in sorted(contacts):
+                        handle.write(f"{chrom}\t{contacts[chrom]:.6f}\n")
+                    handle.write(f"TOTAL\t{total_value:.6f}\n")
+
+            noise_sampling.compute_sampled_noise(
+                hic_path=args.hic,
+                res=res,
+                out_dir=res_sample_dir,
+                norm="none",
+                chrom_sizes_path=args.chrom_sizes,
+                cooler_selection=cooler_sel,
+            )
+
+        # Phase 2: Full noise for all resolutions at once
+        print(f"\n[Phase 2] Computing full noise at {resolutions} bp ...")
+        noise_fullmap.compute_full_noise(
+            hic_path=args.hic,
+            res_list=resolutions,
+            norm="none",
+            out_dir=full_dir,
+            chrom_sizes_path=args.chrom_sizes,
+            cooler_selection=cooler_sel,
+            cpu=args.cpu,
+        )
+
+        # Phase 3 & 4: Per resolution
+        for res in resolutions:
+            res_sample_dir = os.path.join(sample_root, str(res))
+            zmap_summary = os.path.join(res_sample_dir, "subsample_summary.tsv")
+
+            print(f"\n[Phase 3] Building bias vectors at {res} bp ...")
+            out_vec = os.path.join(args.out_dir, f"{args.sample_name}_{res}.juicervector")
+            noise_to_weights.build_bias_vectors_from_bedgraphs(
+                noise_path_or_dir=full_dir,
+                res=res,
+                out_path=out_vec,
+                sample_name=args.sample_name,
+                zmap_summary_path=zmap_summary if os.path.isfile(zmap_summary) else None,
+                chrom_sizes_path=args.chrom_sizes,
+                nan_fill_value=nan_fill,
+            )
+            print(f"  → {out_vec}")
+
+            print(f"\n[Phase 4] Building blacklist (P99 + NaN) at {res} bp ...")
+            full_noise_bed = os.path.join(full_dir, f"{res}.bedgraph")
+            if os.path.isfile(full_noise_bed):
+                out_blacklist = os.path.join(
+                    args.out_dir, f"{args.sample_name}_{res}_noise_blacklist.bed"
+                )
+                filters.build_blacklist_from_bedgraphs(
+                    inputs=[full_noise_bed],
+                    output_path=out_blacklist,
+                    top_quantile=0.99,
+                )
+                print(f"  → {out_blacklist}")
+            else:
+                print(f"  [WARN] Full-noise bedgraph not found: {full_noise_bed}")
+
+        print("\n[default-run] Complete.")
+
     else:
         parser.error("Unknown command")
 

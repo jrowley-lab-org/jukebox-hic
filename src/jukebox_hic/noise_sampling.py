@@ -11,6 +11,7 @@ from statsmodels.tsa.stattools import acf, acovf
 
 from .backends import ChromMatrix, read_chrom_sizes, select_provider, total_contacts
 from .metrics import collect_memory_usage_mb
+from . import reference
 
 
 def _default_window_bp(resolution: int) -> int:
@@ -290,21 +291,49 @@ def compute_sampled_noise(
             if not noise_values:
                 continue
             chrom_contacts = contacts_by_chrom.get(chrom, float("nan"))
-            summary_records.append(
-                {
-                    "chrom": chrom,
-                    "ratio": ratio,
-                    "rows_evaluated": len(noise_values),
-                    "mean_noise": float(np.nanmean(noise_values)),
-                    "median_noise": float(np.nanmedian(noise_values)),
-                    "std_noise": float(np.nanstd(noise_values, ddof=0)),
-                    "mean_row_mean": float(np.nanmean(stats_dict["row_mean"])),
-                    "mean_row_std": float(np.nanmean(stats_dict["row_std"])),
-                    "mean_acf": float(np.nanmean(stats_dict["acf"])),
-                    "mean_empty_bin_ratio": float(np.nanmean(stats_dict["empty_ratio"])),
-                    "estimated_contacts": float(chrom_contacts * float(ratio)),
-                }
-            )
+            median_noise = float(np.nanmedian(noise_values))
+            mean_ebr = float(np.nanmean(stats_dict["empty_ratio"]))
+            record = {
+                "chrom": chrom,
+                "ratio": ratio,
+                "rows_evaluated": len(noise_values),
+                "mean_noise": float(np.nanmean(noise_values)),
+                "median_noise": median_noise,
+                "std_noise": float(np.nanstd(noise_values, ddof=0)),
+                "mean_row_mean": float(np.nanmean(stats_dict["row_mean"])),
+                "mean_row_std": float(np.nanmean(stats_dict["row_std"])),
+                "mean_acf": float(np.nanmean(stats_dict["acf"])),
+                "mean_empty_bin_ratio": mean_ebr,
+                "estimated_contacts": float(chrom_contacts * float(ratio)),
+                "z_map": float("nan"),
+                "gamma": float("nan"),
+                "pred_log_N": float("nan"),
+                "residual": float("nan"),
+            }
+            if (
+                ratio == 1.0
+                and np.isfinite(median_noise)
+                and median_noise > 0
+                and np.isfinite(chrom_contacts)
+                and chrom_contacts > 0
+            ):
+                c_len = chrom_bp_sizes.get(chrom, 0)
+                if c_len > 0:
+                    try:
+                        zmap_result = reference.compute_zmap(
+                            contacts=chrom_contacts,
+                            chrom_len=c_len,
+                            resolution=int(res),
+                            median_noise=median_noise,
+                            ebr=mean_ebr,
+                        )
+                        record["z_map"] = zmap_result["z_map"]
+                        record["gamma"] = zmap_result["gamma"]
+                        record["pred_log_N"] = zmap_result["pred_log_N"]
+                        record["residual"] = zmap_result["residual"]
+                    except Exception:
+                        pass
+            summary_records.append(record)
 
         total_considered = len(selected_rows) + failed_rows
         if total_considered:

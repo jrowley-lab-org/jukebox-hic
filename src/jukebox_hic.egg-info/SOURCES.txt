@@ -9,6 +9,7 @@ src/jukebox_hic/metrics.py
 src/jukebox_hic/noise_fullmap.py
 src/jukebox_hic/noise_sampling.py
 src/jukebox_hic/noise_to_weights.py
+src/jukebox_hic/reference.py
 src/jukebox_hic.egg-info/PKG-INFO
 src/jukebox_hic.egg-info/SOURCES.txt
 src/jukebox_hic.egg-info/dependency_links.txt

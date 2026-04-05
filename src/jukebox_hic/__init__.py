@@ -5,7 +5,7 @@ jukebox_hic
 Lightweight Hi-C noise analysis library for .hic (via optional hicstraw) and .cool contact maps.
 """
 
-from . import backends, cli, figures, noise_fullmap, noise_sampling, filters
+from . import backends, cli, figures, noise_fullmap, noise_sampling, filters, reference
 
 __all__ = [
     "backends",
@@ -14,4 +14,5 @@ __all__ = [
     "noise_fullmap",
     "noise_sampling",
     "filters",
+    "reference",
 ]
