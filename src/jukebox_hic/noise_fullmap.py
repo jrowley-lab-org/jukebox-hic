@@ -138,6 +138,7 @@ def compute_full_noise(
     out_dir: str = ".",
     cooler_selection: Optional[str] = None,
     cpu: int = 1,
+    chroms: Optional[List[str]] = None,
 ) -> None:
     """
     Compute noise values for every row/bin across the genome at the requested resolutions.
@@ -156,6 +157,12 @@ def compute_full_noise(
         res = int(res_raw)
         provider, _ = select_provider(hic_path, res, norm, cooler_selection)
         chrom_sizes = read_chrom_sizes(provider, chrom_sizes_path)
+        if chroms is not None:
+            requested = set(chroms)
+            missing = requested - set(chrom_sizes.keys())
+            if missing:
+                print(f"[WARN] Requested chromosomes not found at {res} bp: {sorted(missing)}")
+            chrom_sizes = {c: chrom_sizes[c] for c in chroms if c in chrom_sizes}
         for chrom, chrom_len in chrom_sizes.items():
             out_path = os.path.join(out_dir, f"{chrom}_{res}.bedgraph")
             tasks.append(

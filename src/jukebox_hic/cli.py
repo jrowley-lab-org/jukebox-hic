@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 import argparse
+import glob
 import os
 import time
 from typing import Callable, Dict, List, Optional
 
-from . import figures, noise_fullmap, noise_sampling, filters, noise_to_weights
+from . import figures, noise_fullmap, noise_sampling, filters, noise_to_weights, reference
 from .backends import (
     cooler_resolutions,
     hic_resolutions,
@@ -18,6 +19,22 @@ from .metrics import collect_memory_usage_mb
 
 def _comma_ints(value: str) -> List[int]:
     return list(map(int, value.split(",")))
+
+
+def _comma_strs(value: str) -> List[str]:
+    return [s.strip() for s in value.split(",") if s.strip()]
+
+
+def _detect_resolutions_in_dir(noise_dir: str) -> List[int]:
+    """Return sorted list of resolutions found as {integer}.bedgraph in noise_dir."""
+    resolutions = []
+    if not os.path.isdir(noise_dir):
+        return resolutions
+    for path in glob.glob(os.path.join(noise_dir, "*.bedgraph")):
+        name = os.path.splitext(os.path.basename(path))[0]
+        if name.isdigit():
+            resolutions.append(int(name))
+    return sorted(resolutions)
 
 
 def _profile_command(name: str, func: Callable[[], Optional[int]]) -> Optional[int]:
@@ -120,6 +137,10 @@ def main() -> None:
         "--profile",
         help="Write per-chromosome profiling metrics (runtime, memory) to the specified CSV",
     )
+    sp_sample.add_argument(
+        "--chroms",
+        help="Comma-separated list of chromosomes to process (default: all)",
+    )
 
     # ------------------------------------------------------------------ #
     # full-noise                                                           #
@@ -145,6 +166,10 @@ def main() -> None:
         default=1,
         help="Number of worker processes to use for full-noise (default: 1)",
     )
+    sp_full.add_argument(
+        "--chroms",
+        help="Comma-separated list of chromosomes to process (default: all)",
+    )
 
     # ------------------------------------------------------------------ #
     # bias-vectors                                                         #
@@ -156,14 +181,20 @@ def main() -> None:
     sp_bias.add_argument(
         "--noise_dir",
         required=True,
-        help="Directory containing {res}.bedgraph (from full-noise) or a single bedGraph file",
+        help="Directory containing {res}.bedgraph files (from full-noise)",
     )
-    sp_bias.add_argument("--res", required=True, type=int, help="Resolution in bp")
-    sp_bias.add_argument("--out", required=True, help="Output Juicer vector file path")
     sp_bias.add_argument(
-        "--sample_name",
+        "--out_dir",
         required=True,
-        help="Label used in vector headers (e.g. JukeBox)",
+        help="Output directory; vectors written as {res}.juicervector",
+    )
+    sp_bias.add_argument(
+        "--res",
+        default=None,
+        help=(
+            "Comma-separated resolutions in bp to process "
+            "(default: auto-detect from {res}.bedgraph files in --noise_dir)"
+        ),
     )
     sp_bias.add_argument(
         "--zmap_summary",
@@ -216,6 +247,32 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------ #
+    # sequencing-advisor                                                   #
+    # ------------------------------------------------------------------ #
+    sp_adv = sub.add_parser(
+        "sequencing-advisor",
+        help="Predict sequencing depth needed to reach a target noise z-score",
+    )
+    sp_adv.add_argument(
+        "--summary",
+        required=True,
+        help="Path to subsample_summary.tsv produced by sample-noise",
+    )
+    sp_adv.add_argument("--out", required=True, help="Output TSV path for the advisor report")
+    sp_adv.add_argument(
+        "--z_target",
+        type=float,
+        default=0.0,
+        help="Target z-score to reach (default: 0.0 = 4DN reference level)",
+    )
+    sp_adv.add_argument(
+        "--fold_threshold",
+        type=float,
+        default=10.0,
+        help='Fold-increase above which recommendation is "Stop" (default: 10.0)',
+    )
+
+    # ------------------------------------------------------------------ #
     # default-run                                                          #
     # ------------------------------------------------------------------ #
     sp_run = sub.add_parser(
@@ -250,6 +307,10 @@ def main() -> None:
         choices=["nan", "0"],
         help="Value for masked NaN bins in output vectors (default: nan)",
     )
+    sp_run.add_argument(
+        "--chroms",
+        help="Comma-separated list of chromosomes to process (default: all)",
+    )
 
     # ------------------------------------------------------------------ #
     # Dispatch                                                             #
@@ -283,6 +344,7 @@ def main() -> None:
                 subsample_ratios=[float(x) for x in args.subsample_ratios.split(",")] if args.subsample_ratios else None,
                 seed=args.seed,
                 profile_path=args.profile,
+                chroms=_comma_strs(args.chroms) if args.chroms else None,
             )
 
         _profile_command("sample-noise", run)
@@ -309,25 +371,36 @@ def main() -> None:
                 out_dir=args.out_dir,
                 cooler_selection=args.cooler_path,
                 cpu=args.cpu,
+                chroms=_comma_strs(args.chroms) if args.chroms else None,
             )
 
         _profile_command("full-noise", run)
 
     elif args.cmd == "bias-vectors":
-        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        if args.res:
+            resolutions = _comma_ints(args.res)
+        else:
+            resolutions = _detect_resolutions_in_dir(args.noise_dir)
+            if not resolutions:
+                parser.error(
+                    f"No {{res}}.bedgraph files found in {args.noise_dir}. "
+                    "Use --res to specify resolutions explicitly."
+                )
+        os.makedirs(args.out_dir, exist_ok=True)
         nan_fill = float("nan") if args.nan_fill == "nan" else 0.0
 
         def run() -> None:
-            noise_to_weights.build_bias_vectors_from_bedgraphs(
-                noise_path_or_dir=args.noise_dir,
-                res=int(args.res),
-                out_path=args.out,
-                sample_name=args.sample_name,
-                zmap_summary_path=args.zmap_summary,
-                chrom_sizes_path=args.chrom_sizes,
-                nan_fill_value=nan_fill,
-                skip_decoys=not bool(args.include_decoys),
-            )
+            for res in resolutions:
+                noise_to_weights.build_bias_vectors_from_bedgraphs(
+                    noise_dir=args.noise_dir,
+                    res=res,
+                    out_dir=args.out_dir,
+                    zmap_summary_path=args.zmap_summary,
+                    chrom_sizes_path=args.chrom_sizes,
+                    nan_fill_value=nan_fill,
+                    skip_decoys=not bool(args.include_decoys),
+                )
+                print(f"  → {os.path.join(args.out_dir, f'{res}.juicervector')}")
 
         _profile_command("bias-vectors", run)
 
@@ -350,15 +423,120 @@ def main() -> None:
 
         _profile_command("blacklist", run)
 
+    elif args.cmd == "sequencing-advisor":
+        import io
+        import pandas as pd
+
+        if not os.path.isfile(args.summary):
+            parser.error(f"Summary file not found: {args.summary}")
+
+        # Parse header comments: # resolution=N and # chrom_info lines
+        summary_res: Optional[int] = None
+        chrom_sizes_adv: Dict[str, int] = {}
+        data_lines: List[str] = []
+        with open(args.summary) as fh:
+            for line in fh:
+                if line.startswith("# resolution="):
+                    try:
+                        summary_res = int(line.strip().split("=", 1)[1])
+                    except ValueError:
+                        pass
+                elif line.startswith("# chrom_info"):
+                    parts = line.strip().split("\t")
+                    chrom_name = parts[1] if len(parts) > 1 else None
+                    for part in parts[2:]:
+                        if part.startswith("size_bp="):
+                            try:
+                                size = int(part.split("=", 1)[1])
+                                if chrom_name:
+                                    chrom_sizes_adv[chrom_name] = size
+                            except ValueError:
+                                pass
+                elif not line.startswith("#"):
+                    data_lines.append(line)
+
+        if not data_lines:
+            parser.error(f"No data rows found in {args.summary}")
+        if summary_res is None:
+            parser.error(
+                "Could not read resolution from the summary file. "
+                "Ensure the file was produced by jukebox-hic sample-noise."
+            )
+        if not chrom_sizes_adv:
+            parser.error(
+                "Could not recover chromosome sizes from the summary file. "
+                "Ensure the file was produced by jukebox-hic sample-noise."
+            )
+
+        df = pd.read_csv(io.StringIO("".join(data_lines)), sep="\t")
+        if "ratio" in df.columns:
+            df = df[df["ratio"] == 1.0].copy()
+        if df.empty:
+            parser.error("No ratio=1.0 rows found in the summary file")
+
+        required_cols = {"chrom", "median_noise", "mean_empty_bin_ratio", "estimated_contacts"}
+        missing_cols = required_cols - set(df.columns)
+        if missing_cols:
+            parser.error(f"Summary file is missing columns: {sorted(missing_cols)}")
+
+        def run() -> None:
+            records = []
+            for _, row in df.iterrows():
+                chrom = str(row["chrom"])
+                median_noise = float(row["median_noise"])
+                ebr = float(row["mean_empty_bin_ratio"])
+                est_contacts = float(row["estimated_contacts"])
+                z_map_val = float(row["z_map"]) if "z_map" in df.columns else float("nan")
+                c_len = chrom_sizes_adv.get(chrom, 0)
+
+                if c_len > 0:
+                    current_rho = est_contacts / (c_len / summary_res)
+                    adv = reference.sequencing_advisor(
+                        obs_noise=median_noise,
+                        current_rho=current_rho,
+                        ebr=ebr,
+                        z_target=args.z_target,
+                        fold_threshold=args.fold_threshold,
+                    )
+                else:
+                    adv = {
+                        "target_density": float("nan"),
+                        "fold_increase": float("nan"),
+                        "efficiency_index": float("nan"),
+                        "recommendation": "Insufficient data",
+                    }
+
+                records.append({
+                    "chrom": chrom,
+                    "median_noise": median_noise,
+                    "mean_empty_bin_ratio": ebr,
+                    "estimated_contacts": est_contacts,
+                    "z_map": z_map_val,
+                    "advisor_target_density": adv["target_density"],
+                    "advisor_fold_increase": adv["fold_increase"],
+                    "advisor_efficiency_index": adv["efficiency_index"],
+                    "advisor_recommendation": adv["recommendation"],
+                })
+
+            out_df = pd.DataFrame(records)
+            os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
+            out_df.to_csv(args.out, sep="\t", index=False)
+            print(f"[sequencing-advisor] Report written to {args.out}")
+
+        _profile_command("sequencing-advisor", run)
+
     elif args.cmd == "default-run":
         resolutions = _comma_ints(args.res)
         cooler_sel = getattr(args, "cooler_path", None)
         nan_fill = float("nan") if args.nan_fill == "nan" else 0.0
+        chroms = _comma_strs(args.chroms) if args.chroms else None
 
         sample_root = os.path.join(args.out_dir, "sample")
         full_dir = os.path.join(args.out_dir, "full")
+        vectors_dir = os.path.join(args.out_dir, "vectors")
         os.makedirs(sample_root, exist_ok=True)
         os.makedirs(full_dir, exist_ok=True)
+        os.makedirs(vectors_dir, exist_ok=True)
 
         # Dump contacts once (resolution-independent)
         contacts = _dump_contacts_once(args.hic, "none", cooler_sel, args.chrom_sizes)
@@ -385,6 +563,7 @@ def main() -> None:
                 norm="none",
                 chrom_sizes_path=args.chrom_sizes,
                 cooler_selection=cooler_sel,
+                chroms=chroms,
             )
 
         # Phase 2: Full noise for all resolutions at once
@@ -397,6 +576,7 @@ def main() -> None:
             chrom_sizes_path=args.chrom_sizes,
             cooler_selection=cooler_sel,
             cpu=args.cpu,
+            chroms=chroms,
         )
 
         # Phase 3 & 4: Per resolution
@@ -405,17 +585,15 @@ def main() -> None:
             zmap_summary = os.path.join(res_sample_dir, "subsample_summary.tsv")
 
             print(f"\n[Phase 3] Building bias vectors at {res} bp ...")
-            out_vec = os.path.join(args.out_dir, f"{args.sample_name}_{res}.juicervector")
             noise_to_weights.build_bias_vectors_from_bedgraphs(
-                noise_path_or_dir=full_dir,
+                noise_dir=full_dir,
                 res=res,
-                out_path=out_vec,
-                sample_name=args.sample_name,
+                out_dir=vectors_dir,
                 zmap_summary_path=zmap_summary if os.path.isfile(zmap_summary) else None,
                 chrom_sizes_path=args.chrom_sizes,
                 nan_fill_value=nan_fill,
             )
-            print(f"  → {out_vec}")
+            print(f"  → {os.path.join(vectors_dir, f'{res}.juicervector')}")
 
             print(f"\n[Phase 4] Building blacklist (P99 + NaN) at {res} bp ...")
             full_noise_bed = os.path.join(full_dir, f"{res}.bedgraph")

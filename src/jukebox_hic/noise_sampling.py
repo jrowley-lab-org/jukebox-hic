@@ -144,6 +144,7 @@ def compute_sampled_noise(
     subsample_ratios: Optional[Sequence[float]] = None,
     seed: Optional[int] = None,
     profile_path: Optional[str] = None,
+    chroms: Optional[List[str]] = None,
 ) -> None:
     """Sample a subset of rows, compute noise metrics, and optionally profile usage."""
 
@@ -151,6 +152,15 @@ def compute_sampled_noise(
     chrom_sizes = read_chrom_sizes(provider, chrom_sizes_path)
     if not chrom_sizes:
         raise ValueError("No chromosomes available for analysis")
+
+    if chroms is not None:
+        requested = set(chroms)
+        missing = requested - set(chrom_sizes.keys())
+        if missing:
+            print(f"[WARN] Requested chromosomes not found: {sorted(missing)}")
+        chrom_sizes = {c: chrom_sizes[c] for c in chroms if c in chrom_sizes}
+        if not chrom_sizes:
+            raise ValueError("None of the requested chromosomes are available")
 
     rng = np.random.default_rng(seed)
 
@@ -309,6 +319,10 @@ def compute_sampled_noise(
                 "gamma": float("nan"),
                 "pred_log_N": float("nan"),
                 "residual": float("nan"),
+                "advisor_target_density": float("nan"),
+                "advisor_fold_increase": float("nan"),
+                "advisor_efficiency_index": float("nan"),
+                "advisor_recommendation": "",
             }
             if (
                 ratio == 1.0
@@ -331,6 +345,17 @@ def compute_sampled_noise(
                         record["gamma"] = zmap_result["gamma"]
                         record["pred_log_N"] = zmap_result["pred_log_N"]
                         record["residual"] = zmap_result["residual"]
+
+                        current_rho = chrom_contacts / (c_len / int(res))
+                        advisor_result = reference.sequencing_advisor(
+                            obs_noise=median_noise,
+                            current_rho=current_rho,
+                            ebr=mean_ebr,
+                        )
+                        record["advisor_target_density"] = advisor_result["target_density"]
+                        record["advisor_fold_increase"] = advisor_result["fold_increase"]
+                        record["advisor_efficiency_index"] = advisor_result["efficiency_index"]
+                        record["advisor_recommendation"] = advisor_result["recommendation"]
                     except Exception:
                         pass
             summary_records.append(record)
@@ -377,6 +402,7 @@ def compute_sampled_noise(
         summary_df.sort_values(["chrom", "ratio"], inplace=True)
         summary_path = os.path.join(out_dir, "subsample_summary.tsv")
         with open(summary_path, "w") as handle:
+            handle.write(f"# resolution={int(res)}\n")
             for chrom in sorted(contacts_by_chrom):
                 handle.write(
                     f"# chrom_info\t{chrom}\tcontacts={contacts_by_chrom[chrom]:.6f}\t"

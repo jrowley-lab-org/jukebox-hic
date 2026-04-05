@@ -62,6 +62,74 @@ def compute_zmap(
     }
 
 
+def sequencing_advisor(
+    obs_noise: float,
+    current_rho: float,
+    ebr: float,
+    z_target: float = 0.0,
+    fold_threshold: float = 10.0,
+) -> Dict[str, object]:
+    """
+    Predict the sequencing density required to reach a target z-score and assess
+    whether further sequencing is worthwhile.
+
+    Inverts the 3-term reference model to solve for the density (contacts/bin)
+    at which the predicted noise would equal z_target standard deviations from
+    the reference.
+
+    Parameters
+    ----------
+    obs_noise       : observed median noise (from sampling phase)
+    current_rho     : current sequencing density in contacts/bin
+                      (= total_contacts / (chrom_len / resolution))
+    ebr             : mean empty bin ratio from the sampling phase
+    z_target        : desired z-score target (default: 0.0 = reference level)
+    fold_threshold  : fold-increase above which recommendation is "Stop"
+                      (default: 10.0)
+
+    Returns
+    -------
+    dict with keys:
+        target_density     : contacts/bin needed to reach z_target
+        fold_increase      : target_density / current_rho
+        efficiency_index   : abs(BETA_1) — log-linear sensitivity of noise
+                             to sequencing depth (constant)
+        recommendation     : "Proceed" or "Stop"
+    """
+    nan_result: Dict[str, object] = {
+        "target_density": float("nan"),
+        "fold_increase": float("nan"),
+        "efficiency_index": float("nan"),
+        "recommendation": "Insufficient data",
+    }
+
+    if (
+        not np.isfinite(obs_noise)
+        or obs_noise <= 0.0
+        or not np.isfinite(current_rho)
+        or current_rho <= 0.0
+        or not np.isfinite(ebr)
+    ):
+        return nan_result
+
+    try:
+        log_target_rho = (
+            np.log10(obs_noise) - BETA_0 - BETA_2 * float(ebr) - z_target * SIGMA_REF
+        ) / BETA_1
+        target_rho = float(10.0 ** log_target_rho)
+        fold_increase = target_rho / float(current_rho)
+        recommendation = "Stop" if fold_increase > float(fold_threshold) else "Proceed"
+    except Exception:
+        return nan_result
+
+    return {
+        "target_density": target_rho,
+        "fold_increase": fold_increase,
+        "efficiency_index": abs(BETA_1),
+        "recommendation": recommendation,
+    }
+
+
 def process_normalization_vectors(
     noise_track: np.ndarray,
     gamma: float,

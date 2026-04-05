@@ -13,21 +13,19 @@ import pandas as pd
 from . import reference
 
 
-def _resolve_bedgraph_path(path_or_dir: str, res: int) -> str:
-    if os.path.isfile(path_or_dir):
-        return path_or_dir
-    if not os.path.isdir(path_or_dir):
-        raise FileNotFoundError(f"No such file or directory: {path_or_dir}")
+def _resolve_bedgraph_path(noise_dir: str, res: int) -> str:
+    if not os.path.isdir(noise_dir):
+        raise FileNotFoundError(f"Not a directory: {noise_dir}")
     candidates = [
-        os.path.join(path_or_dir, f"{res}.bedgraph"),
-        os.path.join(path_or_dir, f"{res}.bedGraph"),
-        os.path.join(path_or_dir, f"{res}.bg"),
+        os.path.join(noise_dir, f"{res}.bedgraph"),
+        os.path.join(noise_dir, f"{res}.bedGraph"),
+        os.path.join(noise_dir, f"{res}.bg"),
     ]
     for candidate in candidates:
         if os.path.isfile(candidate):
             return candidate
     raise FileNotFoundError(
-        f"Could not locate bedGraph for resolution {res} in directory {path_or_dir}"
+        f"Could not locate bedGraph for resolution {res} in directory {noise_dir}"
     )
 
 
@@ -146,10 +144,9 @@ def _write_juicer_vector_block(
     chrom: str,
     res: int,
     bias_vector: np.ndarray,
-    sample_name: str,
     nan_fill_value: float,
 ) -> None:
-    handle.write(f"vector {sample_name} {chrom} {res} BP\n")
+    handle.write(f"vector JUKEBOX {chrom} {res} BP\n")
     for val in bias_vector:
         if np.isnan(val):
             if np.isnan(nan_fill_value):
@@ -161,10 +158,9 @@ def _write_juicer_vector_block(
 
 
 def build_bias_vectors_from_bedgraphs(
-    noise_path_or_dir: str,
+    noise_dir: str,
     res: int,
-    out_path: str,
-    sample_name: str,
+    out_dir: str,
     zmap_summary_path: Optional[str] = None,
     chrom_sizes_path: Optional[str] = None,
     nan_fill_value: float = float("nan"),
@@ -172,6 +168,9 @@ def build_bias_vectors_from_bedgraphs(
 ) -> None:
     """
     Transform a full-noise bedGraph into a Juicer-format normalization vector file.
+
+    Reads ``{noise_dir}/{res}.bedgraph`` and writes ``{out_dir}/{res}.juicervector``.
+    The vector name in the output file is always "JUKEBOX".
 
     For each chromosome, applies the 4DN-reference adaptive bias pipeline:
       1. Gaussian smoothing (sigma = 1 + EBR)
@@ -181,11 +180,9 @@ def build_bias_vectors_from_bedgraphs(
 
     Parameters
     ----------
-    noise_path_or_dir : path to merged full-noise bedGraph or a directory
-                        containing ``{res}.bedgraph``
+    noise_dir         : directory containing ``{res}.bedgraph`` (from full-noise)
     res               : resolution in bp
-    out_path          : output Juicer vector file path
-    sample_name       : label used in vector headers (e.g. ``"JukeBox"``)
+    out_dir           : output directory; file will be written as ``{res}.juicervector``
     zmap_summary_path : path to ``subsample_summary.tsv`` from the sampling
                         phase; provides per-chrom gamma and EBR (optional;
                         defaults to gamma=1.0, EBR=0.0)
@@ -194,7 +191,7 @@ def build_bias_vectors_from_bedgraphs(
                         for matrix balancing engines that do not accept NaN)
     skip_decoys       : skip unplaced/decoy chromosomes (default: True)
     """
-    noise_bed_path = _resolve_bedgraph_path(noise_path_or_dir, res)
+    noise_bed_path = _resolve_bedgraph_path(noise_dir, res)
     noise_df = _load_bedgraph(noise_bed_path)
     chrom_sizes = _load_chrom_sizes(chrom_sizes_path)
 
@@ -202,8 +199,8 @@ def build_bias_vectors_from_bedgraphs(
     if zmap_summary_path and os.path.isfile(zmap_summary_path):
         zmap_data = _load_zmap_summary(zmap_summary_path)
 
-    out_dir = os.path.dirname(os.path.abspath(out_path))
     os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{res}.juicervector")
 
     with open(out_path, "w") as out_handle:
         for chrom, group in noise_df.groupby("chrom", sort=True):
@@ -224,5 +221,5 @@ def build_bias_vectors_from_bedgraphs(
             bias_vector = reference.process_normalization_vectors(noise_track, gamma, ebr)
 
             _write_juicer_vector_block(
-                out_handle, chrom, res, bias_vector, sample_name, nan_fill_value
+                out_handle, chrom, res, bias_vector, nan_fill_value
             )
