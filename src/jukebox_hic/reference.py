@@ -130,6 +130,123 @@ def sequencing_advisor(
     }
 
 
+def _preprocess_noise_track(
+    noise_track: np.ndarray,
+    ebr: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Shared pre-processing for all normalization modes.
+
+    Steps:
+      1. Identify NaN/Inf bins.
+      2. Fill masked bins with nanmedian.
+      3. Apply Gaussian smoothing (sigma = 1 + EBR).
+      4. Log10-transform with floor at 1e-12.
+
+    Returns
+    -------
+    is_nan   : boolean mask of originally invalid bins
+    log_N    : log10 of smoothed noise (all bins, including formerly masked)
+    smoothed : smoothed noise values before log transform
+    """
+    is_nan = np.isnan(noise_track) | np.isinf(noise_track)
+
+    clean_track = np.copy(noise_track).astype(float)
+    median_val = float(np.nanmedian(noise_track))
+    if np.isnan(median_val):
+        median_val = 0.0
+    clean_track[is_nan] = median_val
+
+    sigma = 1.0 + float(ebr)
+    smoothed = gaussian_filter1d(clean_track, sigma=sigma)
+    log_N = np.log10(np.clip(smoothed, 1e-12, None))
+
+    return is_nan, log_N, smoothed
+
+
+def process_normalization_vectors_baseline(
+    noise_track: np.ndarray,
+    pred_log_N: float,
+    ebr: float,
+) -> np.ndarray:
+    """
+    JUKEBOX-BASELINE normalization.
+
+    Forces every bin to conform to the 4DN universal baseline by computing
+    the exact distance between each bin's noise and the predicted log-noise
+    for this chromosome (L̂_target).
+
+    Math
+    ----
+    log10(B_i) = 0.5 * (log10(N_i) - pred_log_N)
+    B_i        = 10 ^ log10(B_i)
+
+    Parameters
+    ----------
+    noise_track : per-bin raw noise values (may contain NaN/Inf)
+    pred_log_N  : predicted log10 noise for this chromosome from compute_zmap()
+                  (= BETA_0 + BETA_1*log10(rho) + BETA_2*ebr)
+    ebr         : mean empty bin ratio (used as Gaussian sigma offset)
+
+    Returns
+    -------
+    bias_vector : same shape as noise_track; NaN where original was NaN/Inf
+    """
+    is_nan, log_N, _ = _preprocess_noise_track(noise_track, ebr)
+
+    log_bias = 0.5 * (log_N - float(pred_log_N))
+    bias_vector = np.power(10.0, log_bias)
+    bias_vector[is_nan] = np.nan
+
+    return bias_vector
+
+
+def process_normalization_vectors_adaptive(
+    noise_track: np.ndarray,
+    pred_log_N: float,
+    ebr: float,
+    alpha: float = 0.7,
+) -> np.ndarray:
+    """
+    JUKEBOX-ADAPTIVE normalization.
+
+    Better suited for sparse or palaeogenomic data. Uses the global Z-score
+    to determine the intensity of the correction while dampening local bin
+    variance to prevent blow-outs in stochastically noisy regions.
+
+    Math
+    ----
+    z_map  = (median(log10(N)) - pred_log_N) / SIGMA_REF
+    D_i    = log10(N_i) - median(log10(N))          # local deviation
+    log10(B_i) = 0.5 * (z_map * SIGMA_REF + alpha * D_i)
+    B_i        = 10 ^ log10(B_i)
+
+    Parameters
+    ----------
+    noise_track : per-bin raw noise values (may contain NaN/Inf)
+    pred_log_N  : predicted log10 noise for this chromosome from compute_zmap()
+    ebr         : mean empty bin ratio (used as Gaussian sigma offset)
+    alpha       : damping factor for local variance (default 0.7; range 0.5–0.8)
+
+    Returns
+    -------
+    bias_vector : same shape as noise_track; NaN where original was NaN/Inf
+    """
+    is_nan, log_N, _ = _preprocess_noise_track(noise_track, ebr)
+
+    valid = ~is_nan
+    median_obs = float(np.median(log_N[valid])) if valid.any() else float(pred_log_N)
+
+    z_map = (median_obs - float(pred_log_N)) / SIGMA_REF
+    D_i = log_N - median_obs
+
+    log_bias = 0.5 * (z_map * SIGMA_REF + float(alpha) * D_i)
+    bias_vector = np.power(10.0, log_bias)
+    bias_vector[is_nan] = np.nan
+
+    return bias_vector
+
+
 def process_normalization_vectors(
     noise_track: np.ndarray,
     gamma: float,
@@ -155,18 +272,8 @@ def process_normalization_vectors(
     -------
     bias_vector : same shape as noise_track; NaN where original was NaN/Inf
     """
-    is_nan = np.isnan(noise_track) | np.isinf(noise_track)
+    is_nan, log_N, _ = _preprocess_noise_track(noise_track, ebr)
 
-    clean_track = np.copy(noise_track).astype(float)
-    median_val = float(np.nanmedian(noise_track))
-    if np.isnan(median_val):
-        median_val = 0.0
-    clean_track[is_nan] = median_val
-
-    sigma = 1.0 + float(ebr)
-    smoothed = gaussian_filter1d(clean_track, sigma=sigma)
-
-    log_N = np.log10(np.clip(smoothed, 1e-12, None))
     valid = ~is_nan
     centre = float(np.median(log_N[valid])) if valid.any() else 0.0
     centred = log_N - centre

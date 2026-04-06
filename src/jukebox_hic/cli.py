@@ -215,6 +215,23 @@ def main() -> None:
         action="store_true",
         help="Include decoy/unplaced chromosomes (default: skip)",
     )
+    sp_bias.add_argument(
+        "--mode",
+        default="baseline",
+        choices=["baseline", "adaptive"],
+        help=(
+            "Normalization mode: "
+            "baseline = JUKEBOX-BASELINE (precise per-bin alignment to 4DN reference); "
+            "adaptive = JUKEBOX-ADAPTIVE (global z-shift + dampened local variance, "
+            "recommended for sparse/palaeogenomic data). Default: baseline"
+        ),
+    )
+    sp_bias.add_argument(
+        "--alpha",
+        type=float,
+        default=0.7,
+        help="Damping factor for adaptive mode (default: 0.7; valid range 0.5–0.8)",
+    )
 
     # ------------------------------------------------------------------ #
     # plot                                                                 #
@@ -311,6 +328,21 @@ def main() -> None:
         "--chroms",
         help="Comma-separated list of chromosomes to process (default: all)",
     )
+    sp_run.add_argument(
+        "--mode",
+        default="baseline",
+        choices=["baseline", "adaptive"],
+        help=(
+            "Normalization mode for bias vectors: baseline (default) or adaptive. "
+            "See bias-vectors --help for details."
+        ),
+    )
+    sp_run.add_argument(
+        "--alpha",
+        type=float,
+        default=0.7,
+        help="Damping factor for adaptive mode (default: 0.7; valid range 0.5–0.8)",
+    )
 
     # ------------------------------------------------------------------ #
     # Dispatch                                                             #
@@ -386,6 +418,13 @@ def main() -> None:
                     f"No {{res}}.bedgraph files found in {args.noise_dir}. "
                     "Use --res to specify resolutions explicitly."
                 )
+        if not args.zmap_summary:
+            parser.error(
+                "--zmap_summary is required. "
+                "Run sample-noise first and pass the resulting subsample_summary.tsv."
+            )
+        if not os.path.isfile(args.zmap_summary):
+            parser.error(f"--zmap_summary file not found: {args.zmap_summary}")
         os.makedirs(args.out_dir, exist_ok=True)
         nan_fill = float("nan") if args.nan_fill == "nan" else 0.0
 
@@ -399,6 +438,8 @@ def main() -> None:
                     chrom_sizes_path=args.chrom_sizes,
                     nan_fill_value=nan_fill,
                     skip_decoys=not bool(args.include_decoys),
+                    mode=args.mode,
+                    alpha=args.alpha,
                 )
                 print(f"  → {os.path.join(args.out_dir, f'{res}.juicervector')}")
 
@@ -584,16 +625,21 @@ def main() -> None:
             res_sample_dir = os.path.join(sample_root, str(res))
             zmap_summary = os.path.join(res_sample_dir, "subsample_summary.tsv")
 
-            print(f"\n[Phase 3] Building bias vectors at {res} bp ...")
-            noise_to_weights.build_bias_vectors_from_bedgraphs(
-                noise_dir=full_dir,
-                res=res,
-                out_dir=vectors_dir,
-                zmap_summary_path=zmap_summary if os.path.isfile(zmap_summary) else None,
-                chrom_sizes_path=args.chrom_sizes,
-                nan_fill_value=nan_fill,
-            )
-            print(f"  → {os.path.join(vectors_dir, f'{res}.juicervector')}")
+            print(f"\n[Phase 3] Building bias vectors at {res} bp (mode={args.mode}) ...")
+            if not os.path.isfile(zmap_summary):
+                print(f"  [WARN] subsample_summary.tsv not found for res={res} — skipping bias vectors")
+            else:
+                noise_to_weights.build_bias_vectors_from_bedgraphs(
+                    noise_dir=full_dir,
+                    res=res,
+                    out_dir=vectors_dir,
+                    zmap_summary_path=zmap_summary,
+                    chrom_sizes_path=args.chrom_sizes,
+                    nan_fill_value=nan_fill,
+                    mode=args.mode,
+                    alpha=args.alpha,
+                )
+                print(f"  → {os.path.join(vectors_dir, f'{res}.juicervector')}")
 
             print(f"\n[Phase 4] Building blacklist (P99 + NaN) at {res} bp ...")
             full_noise_bed = os.path.join(full_dir, f"{res}.bedgraph")
