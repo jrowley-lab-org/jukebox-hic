@@ -102,7 +102,7 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     sp_sample = sub.add_parser("sample-noise", help="Compute noise on a sampled set of rows")
     sp_sample.add_argument("--hic", required=True, help="Input .hic file path")
-    sp_sample.add_argument("--res", required=True, type=int, help="Resolution in bp")
+    sp_sample.add_argument("--res", required=True, help="Comma-separated resolutions in bp")
     sp_sample.add_argument("--sample_fraction", type=float, default=1.0, help="Fraction of rows to evaluate (0-1)")
     sp_sample.add_argument("--window_bp", type=int, default=None, help="Half-window size around diagonal in bp")
     sp_sample.add_argument("--chrom_sizes", help="Chrom sizes TSV (chr\\tsize); default: read from input")
@@ -350,34 +350,40 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.cmd == "sample-noise":
-        os.makedirs(args.out_dir, exist_ok=True)
+        resolutions = _comma_ints(args.res)
+        chroms = _comma_strs(args.chroms) if args.chroms else None
         contacts = _dump_contacts_once(args.hic, args.norm, args.cooler_path, args.chrom_sizes)
-        if contacts:
-            out_path = os.path.join(args.out_dir, "contacts_overview.tsv")
-            total_value = sum(contacts.values())
-            with open(out_path, "w") as handle:
-                handle.write("chrom\tcontacts\n")
-                for chrom in sorted(contacts):
-                    handle.write(f"{chrom}\t{contacts[chrom]:.6f}\n")
-                handle.write(f"TOTAL\t{total_value:.6f}\n")
 
         def run() -> None:
-            noise_sampling.compute_sampled_noise(
-                hic_path=args.hic,
-                res=args.res,
-                sample_fraction=args.sample_fraction,
-                window_bp=args.window_bp,
-                chrom_sizes_path=args.chrom_sizes,
-                out_dir=args.out_dir,
-                norm=args.norm,
-                cooler_selection=args.cooler_path,
-                min_mean_score=args.min_mean_score,
-                min_nonzero_frac=args.min_nonzero_frac,
-                subsample_ratios=[float(x) for x in args.subsample_ratios.split(",")] if args.subsample_ratios else None,
-                seed=args.seed,
-                profile_path=args.profile,
-                chroms=_comma_strs(args.chroms) if args.chroms else None,
-            )
+            for res in resolutions:
+                res_dir = os.path.join(args.out_dir, str(res))
+                os.makedirs(res_dir, exist_ok=True)
+
+                if contacts:
+                    contacts_path = os.path.join(res_dir, "contacts_overview.tsv")
+                    total_value = sum(contacts.values())
+                    with open(contacts_path, "w") as handle:
+                        handle.write("chrom\tcontacts\n")
+                        for chrom in sorted(contacts):
+                            handle.write(f"{chrom}\t{contacts[chrom]:.6f}\n")
+                        handle.write(f"TOTAL\t{total_value:.6f}\n")
+
+                noise_sampling.compute_sampled_noise(
+                    hic_path=args.hic,
+                    res=res,
+                    sample_fraction=args.sample_fraction,
+                    window_bp=args.window_bp,
+                    chrom_sizes_path=args.chrom_sizes,
+                    out_dir=res_dir,
+                    norm=args.norm,
+                    cooler_selection=args.cooler_path,
+                    min_mean_score=args.min_mean_score,
+                    min_nonzero_frac=args.min_nonzero_frac,
+                    subsample_ratios=[float(x) for x in args.subsample_ratios.split(",")] if args.subsample_ratios else None,
+                    seed=args.seed,
+                    profile_path=args.profile,
+                    chroms=chroms,
+                )
 
         _profile_command("sample-noise", run)
 
