@@ -1,4 +1,24 @@
 #!/usr/bin/env python
+"""
+Sampled row-based Hi-C noise estimation.
+
+Instead of computing noise for every genomic bin (which ``noise_fullmap`` does),
+this module *samples* a fraction of rows from each chromosome's contact matrix,
+computes per-row noise metrics, and aggregates them into per-chromosome summaries.
+
+Why sampling?
+-------------
+Full-genome noise calculation at multiple resolutions is computationally intensive.
+Sampling a representative subset of rows (default: all rows, configurable via
+``sample_fraction``) gives a fast, robust estimate of the median noise level and
+autocorrelation structure, which is then used to:
+- Compute the z-map quality score (via ``reference.compute_zmap``).
+- Power the sequencing advisor (via ``reference.sequencing_advisor``).
+- Optionally simulate what noise would look like at lower sequencing depths
+  (via ``subsample_ratios``) to model sequencing depth effects.
+
+Main entry point: ``compute_sampled_noise()``.
+"""
 import os
 import statistics
 import time
@@ -15,6 +35,27 @@ from . import reference
 
 
 def _default_window_bp(resolution: int) -> int:
+    """
+    Choose a sensible default genomic window size (in bp) for noise estimation.
+
+    The window defines how far from the diagonal the noise calculation looks —
+    i.e. the maximum genomic distance between contact pairs included in the noise
+    metric for a given bin. Larger windows capture more long-range signal but are
+    slower; smaller windows focus on local structure.
+
+    The defaults are chosen empirically to capture enough contacts for a stable
+    autocorrelation estimate while staying close enough to the diagonal that the
+    expected contact model (distance-decay) is reliable:
+
+    - ≥100 kb resolution → 10 Mbp window  (~100 bins)
+    - ≥50 kb resolution  → 6 Mbp window   (~120 bins)
+    - ≥25 kb resolution  → 4 Mbp window   (~160 bins)
+    - <25 kb resolution  → 1 Mbp window   (still ~40 bins at 25 kb)
+
+    These correspond roughly to 100–160 bins on each side of the diagonal, which
+    is the range where the distance-decay signal is strong and autocorrelation can
+    be estimated reliably.
+    """
     if resolution >= 100_000:
         return 10_000_000
     if resolution >= 50_000:
@@ -25,15 +66,48 @@ def _default_window_bp(resolution: int) -> int:
 
 
 def _precompute_expectation(coo: sparse.coo_matrix) -> Tuple[np.ndarray, float]:
+    """
+    Build a lookup table of expected (average) contact counts by genomic distance.
+
+    In Hi-C, contacts between bins that are close on the linear genome are far more
+    frequent than contacts between distant bins — this is the well-known distance-decay
+    (or "expected") curve. Dividing observed counts by this expected value normalises
+    for the distance effect, making contact enrichment comparable across different
+    genomic distances.
+
+    This function computes the expected curve from the data itself:
+    - For every non-zero contact (i, j), the lag = |i - j| (bin offset = genomic distance
+      in bins).
+    - All contacts at the same lag are averaged to get ``expected[lag]``.
+
+    Parameters
+    ----------
+    coo : scipy.sparse.coo_matrix
+        Sparse contact matrix in COO format. The ``row``, ``col``, and ``data`` arrays
+        are iterated to compute per-lag averages.
+
+    Returns
+    -------
+    means : np.ndarray of shape (max_lag + 1,)
+        ``means[k]`` is the average contact count across all pairs separated by k bins.
+        Lags with zero observed contacts have ``means[k] == 0``.
+    default : float
+        Fallback expected value used when a lag has no observed data (i.e., ``means[k]``
+        would be zero). Computed as the mean of all non-zero lag means, so it represents
+        a "typical" contact density for the chromosome.
+    """
     if coo.data.size == 0:
         return np.zeros(1, dtype=float), 0.0
     rows = coo.row.astype(np.int64)
     cols = coo.col.astype(np.int64)
     data = coo.data.astype(float)
+    # lag = bin distance between the two interacting loci
     lags = np.abs(cols - rows)
     max_lag = int(lags.max())
+    # np.bincount counts occurrences; with weights= it sums values instead.
     sums = np.bincount(lags, weights=data, minlength=max_lag + 1)
     counts = np.bincount(lags, minlength=max_lag + 1)
+    # Divide sums by counts only where counts > 0 to avoid divide-by-zero.
     with np.errstate(divide="ignore", invalid="ignore"):
         means = np.divide(sums, counts, out=np.zeros_like(sums), where=counts > 0)
     default = float(means[counts > 0].mean()) if np.count_nonzero(counts) else 0.0
@@ -41,6 +115,26 @@ def _precompute_expectation(coo: sparse.coo_matrix) -> Tuple[np.ndarray, float]:
 
 
 def _expected_for_lag(expected_lookup: np.ndarray, default: float, lag: int) -> float:
+    """
+    Retrieve the expected contact count for a specific genomic distance (lag).
+
+    Parameters
+    ----------
+    expected_lookup : np.ndarray
+        The means array returned by ``_precompute_expectation()``.
+        ``expected_lookup[k]`` is the average contact count at lag k bins.
+    default : float
+        Fallback value used when the lag is beyond the array or has no data.
+    lag : int
+        Genomic distance in bins (|bin_i - bin_j|).
+
+    Returns
+    -------
+    float
+        Expected contact count at this lag. Falls back to ``default`` when the lag
+        exceeds the precomputed range or when the stored value is zero (which would
+        cause division-by-zero downstream).
+    """
     if lag < len(expected_lookup):
         val = expected_lookup[lag]
         return float(val) if val > 0 else default
@@ -54,29 +148,84 @@ def _row_window_vectors(
     expected_lookup: np.ndarray,
     default_expected: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Extract the observed and expected contact vectors for a single genomic bin (row).
+
+    For a given bin ``row_idx``, this function collects all contacts within
+    ``bindist_bins`` bins of the diagonal — i.e. contacts to all bins j where
+    |row_idx - j| ≤ bindist_bins. These are assembled into fixed-length vectors
+    centred on the diagonal, where position ``bindist_bins`` (the middle) corresponds
+    to the bin itself and positions further from centre correspond to larger genomic
+    distances.
+
+    The window vector has length ``bindist_bins * 2``:
+    - Positions 0 … bindist_bins−1  : contacts *upstream* (j < row_idx), i.e.
+      bins that come before row_idx on the chromosome. Fetched from the CSC matrix
+      (column slicing is efficient in CSC format).
+    - Positions bindist_bins … 2*bindist_bins−1 : contacts *downstream* (j > row_idx),
+      i.e. bins that come after row_idx. Fetched from the CSR matrix (row slicing).
+
+    The upstream and downstream halves share an asymmetric indexing scheme to keep
+    the diagonal at the boundary between them rather than at the centre:
+    - Upstream position: ``pos = bindist_bins - lag``   (lag 1 → pos bindist_bins-1)
+    - Downstream position: ``pos = bindist_bins - 1 + lag``  (lag 1 → pos bindist_bins)
+
+    Parameters
+    ----------
+    matrices : ChromMatrix
+        Contact matrix for the chromosome (CSR and CSC formats used).
+    row_idx : int
+        The bin index whose noise is being computed.
+    bindist_bins : int
+        Maximum number of bins from the diagonal to include (= window_bp // resolution).
+    expected_lookup : np.ndarray
+        Distance-decay expected values from ``_precompute_expectation()``.
+    default_expected : float
+        Fallback expected value for lags with no data.
+
+    Returns
+    -------
+    observed : np.ndarray of shape (bindist_bins * 2,)
+        Raw contact counts from the Hi-C matrix. Positions with no observed contact
+        remain 0.0.
+    expected : np.ndarray of shape (bindist_bins * 2,)
+        Expected (distance-decay) contact counts for each position. Initialised to
+        ``default_expected`` everywhere; updated with the actual expected value where
+        contacts exist.
+    """
     window = bindist_bins * 2
     observed = np.zeros(window, dtype=float)
+    # Initialise expected to the global default so positions with no contact still
+    # have a meaningful denominator when computing observed/expected ratios.
     expected = np.full(window, default_expected, dtype=float)
 
+    # --- Upstream contacts (j < row_idx): use CSC column slicing ---
+    # getcol(row_idx) returns all rows i that contact column row_idx.
+    # We only want entries where i < row_idx (upstream bins).
     col_vec = matrices.csc.getcol(row_idx)
     for src_idx, value in zip(col_vec.indices, col_vec.data):
         if src_idx >= row_idx:
+            # Skip downstream or diagonal entries (handled by CSR below).
             continue
         lag = row_idx - int(src_idx)
         if lag > bindist_bins:
             continue
-        pos = bindist_bins - lag
+        pos = bindist_bins - lag  # map lag to upstream window position
         observed[pos] = float(value)
         expected[pos] = _expected_for_lag(expected_lookup, default_expected, lag)
 
+    # --- Downstream contacts (j > row_idx): use CSR row slicing ---
+    # getrow(row_idx) returns all columns j that row_idx contacts.
+    # We only want entries where j > row_idx (downstream bins).
     row_vec = matrices.csr.getrow(row_idx)
     for dst_idx, value in zip(row_vec.indices, row_vec.data):
         if dst_idx <= row_idx:
+            # Skip upstream or diagonal entries (already handled above).
             continue
         lag = int(dst_idx) - row_idx
         if lag > bindist_bins:
             continue
-        pos = bindist_bins - 1 + lag
+        pos = bindist_bins - 1 + lag  # map lag to downstream window position
         observed[pos] = float(value)
         expected[pos] = _expected_for_lag(expected_lookup, default_expected, lag)
 
@@ -87,15 +236,67 @@ def _compute_row_metrics(
     observed_counts: np.ndarray,
     expected_counts: np.ndarray,
 ) -> Dict[str, float]:
+    """
+    Compute noise and signal quality metrics for a single bin's contact window.
+
+    The core noise measure is based on the **lag-1 autocovariance** of the
+    observed/expected ratio series. Here is the reasoning:
+
+    - We compute the ratio ``score[k] = (observed[k] + 1) / (expected[k] + 1)``
+      (pseudo-count +1 prevents division by zero and stabilises sparse windows).
+    - In a "noisy" bin, these scores fluctuate erratically — alternating between
+      high and low values with no smooth spatial trend. This erratic fluctuation
+      is captured by **low or negative lag-1 autocovariance**: adjacent positions
+      along the window have uncorrelated (or anti-correlated) scores.
+    - In a "clean" bin, scores vary smoothly with distance (following the expected
+      decay), producing **high positive lag-1 autocovariance**.
+    - The noise metric is therefore ``1 / |autocovariance_lag1|``:
+      high autocovariance (smooth signal) → small noise value;
+      low autocovariance (erratic signal) → large noise value.
+
+    This is **not** classical signal autocorrelation; it is the raw autocovariance
+    (``acovf``, not normalised), so the magnitude is in units of (score)².
+
+    Additionally, the normalised autocorrelation coefficient at lag 1 (``acf``) is
+    recorded for reporting, as well as basic statistics (mean, std, empty_ratio).
+
+    Degenerate cases
+    ----------------
+    - ``finite.size < 2`` — fewer than two finite ratio values; autocorrelation is
+      undefined. Returns NaN for noise_raw.
+    - ``np.allclose(finite, finite[0])`` — all ratios are identical (constant series);
+      variance is zero, so autocovariance is zero and the noise formula would divide
+      by zero. Returns NaN for noise_raw (the bin is too uniform to measure noise).
+
+    Parameters
+    ----------
+    observed_counts : np.ndarray
+        Raw contact counts in the window (from ``_row_window_vectors()``).
+    expected_counts : np.ndarray
+        Distance-decay expected values for each window position.
+
+    Returns
+    -------
+    dict with keys:
+        noise_raw   : float — the primary noise metric (1 / |acovf_lag1|); NaN if
+                      the window is too sparse or uniform to compute reliably.
+        row_mean    : float — mean of the finite observed/expected ratios.
+        row_std     : float — standard deviation of the finite ratios.
+        acf         : float — normalised autocorrelation coefficient at lag 1.
+        empty_ratio : float — fraction of window positions with zero observed count.
+    """
+    # --- Empty bin ratio: fraction of the window with no observed contacts ---
     empty_ratio = 1.0
     if observed_counts.size:
         non_empty = int(np.count_nonzero(observed_counts))
         empty_ratio = 1.0 - (non_empty / float(observed_counts.size))
 
+    # --- Compute observed/expected ratio (pseudo-count added to both sides) ---
     scores = (observed_counts + 1.0) / (expected_counts + 1.0)
     finite = np.asarray(scores, dtype=float)
-    finite = finite[np.isfinite(finite)]
+    finite = finite[np.isfinite(finite)]  # drop any Inf/NaN ratios
 
+    # --- Handle degenerate cases where autocovariance is undefined ---
     if finite.size < 2 or np.allclose(finite, finite[0]):
         mean_val = float(finite.mean()) if finite.size else 0.0
         std_val = 0.0
@@ -108,13 +309,19 @@ def _compute_row_metrics(
         except statistics.StatisticsError:
             std_val = 0.0
 
+        # --- Core noise metric: 1 / |lag-1 autocovariance| ---
+        # acovf returns the full autocovariance sequence: [var, cov_lag1, cov_lag2, ...]
+        # We only request nlag=1 so we get [variance, lag-1 autocovariance].
         try:
             ac_vals = acovf(finite, nlag=1, fft=True)
             ac1 = float(ac_vals[1]) if len(ac_vals) > 1 else 0.0
+            # ac1 == 0 means a perfectly alternating series; the noise formula would
+            # divide by zero, so we return NaN (treated as unmeasurable noise).
             noise_raw = float("nan") if ac1 == 0 else 1.0 / abs(ac1)
         except Exception:
             noise_raw = float("nan")
 
+        # --- Normalised ACF at lag 1 (for reporting, not used in noise_raw) ---
         try:
             ac_series = acf(finite, nlags=1, fft=True)
             ac_val = float(ac_series[1]) if len(ac_series) > 1 else 0.0
@@ -146,7 +353,71 @@ def compute_sampled_noise(
     profile_path: Optional[str] = None,
     chroms: Optional[List[str]] = None,
 ) -> None:
-    """Sample a subset of rows, compute noise metrics, and optionally profile usage."""
+    """
+    Sample a subset of rows, compute noise metrics, and optionally profile usage.
+
+    For each chromosome, this function:
+    1. Loads the contact matrix via the appropriate provider (hic or cooler).
+    2. Precomputes the distance-decay expected curve (``_precompute_expectation``).
+    3. Optionally samples a fraction of row bins (``sample_fraction < 1.0`` enables
+       random row sampling; default is all rows).
+    4. For each sampled row, extracts the contact window (``_row_window_vectors``)
+       and filters rows that are too sparse or too low-signal to be informative:
+       - ``min_mean_score``: minimum mean observed/expected ratio in the window.
+         Rows below this are considered "empty" and skipped (default 0.2).
+         This prevents noise calculation on bins that have essentially no contacts.
+       - ``min_nonzero_frac``: minimum fraction of window positions with any contact.
+         Rows below this threshold are also skipped (default 0.01 = 1% of positions).
+    5. Computes row metrics (``_compute_row_metrics``) for each valid row.
+    6. Optionally simulates lower sequencing depths by applying binomial downsampling:
+       For each ``ratio`` in ``subsample_ratios``, the observed integer counts are
+       subsampled using a binomial draw. Ratios are applied *incrementally* (from
+       highest to lowest) to avoid re-drawing from the original data each time:
+       ``counts_at_ratio = binomial(counts_at_prev_ratio, ratio / prev_ratio)``.
+    7. Aggregates per-row metrics into per-chromosome summaries, computes z-map and
+       sequencing advisor results, and writes outputs.
+
+    Outputs written to ``out_dir``:
+    - ``{chrom}_{res}.bedgraph`` — per-bin noise values for each chromosome
+      (NaN for rows that failed quality filters).
+    - ``subsample_summary.tsv`` — per-chromosome summary statistics (median noise,
+      z-map score, sequencing advisor output, etc.), one row per (chrom, ratio) pair.
+
+    Parameters
+    ----------
+    hic_path : str
+        Path to the input .hic or cooler file.
+    res : int
+        Bin size in base pairs.
+    sample_fraction : float
+        Fraction of eligible row bins to evaluate (0 < fraction ≤ 1.0). A value of
+        1.0 processes all rows; 0.5 randomly samples half.
+    window_bp : int or None
+        Genomic window size in bp (distance from diagonal). Defaults to
+        ``_default_window_bp(res)``.
+    chrom_sizes_path : str or None
+        Optional path to chrom sizes TSV to restrict or override chromosomes.
+    out_dir : str
+        Directory for output files (created if it does not exist).
+    norm : str
+        Normalisation: ``"none"``, ``"balance"``, or path to a custom weight file.
+    cooler_selection : str or None
+        HDF5 group path for .scool or specific .mcool URI selection.
+    min_mean_score : float
+        Minimum mean observed/expected ratio for a row to be kept (default 0.2).
+    min_nonzero_frac : float
+        Minimum fraction of non-zero bins in the window (default 0.01).
+    subsample_ratios : list of float or None
+        Sequencing depth ratios to simulate (e.g. [1.0, 0.5, 0.25]). 1.0 is always
+        included. Useful for modelling how noise changes with sequencing depth.
+    seed : int or None
+        Random seed for reproducible row sampling and subsampling.
+    profile_path : str or None
+        If provided, per-chromosome timing and memory usage is appended to a CSV
+        at this path (columns: chrom, resolution, elapsed_s, peak_rss_mb, ...).
+    chroms : list of str or None
+        If provided, restrict analysis to these chromosome names.
+    """
 
     provider, backend = select_provider(hic_path, int(res), norm, cooler_selection)
     chrom_sizes = read_chrom_sizes(provider, chrom_sizes_path)
@@ -164,12 +435,15 @@ def compute_sampled_noise(
 
     rng = np.random.default_rng(seed)
 
+    # Always include ratio 1.0 (full depth). Sort descending so we downsample
+    # incrementally from highest to lowest ratio (avoids resampling from full data).
     ratios = list(subsample_ratios) if subsample_ratios else [1.0]
     if 1.0 not in ratios:
         ratios.append(1.0)
     ratios = sorted(set(float(r) for r in ratios), reverse=True)
 
     window = window_bp or _default_window_bp(int(res))
+    # Convert window size from bp to number of bins on each side of the diagonal.
     bindist_bins = max(1, window // int(res))
 
     summary_records: List[Dict[str, Any]] = []
@@ -198,6 +472,9 @@ def compute_sampled_noise(
         expected_lookup, default_expected = _precompute_expectation(matrices.coo)
 
         rowbins = matrices.coo.shape[0]
+        # Skip the first and last ``bindist_bins`` rows: these edge bins have fewer
+        # than ``bindist_bins`` neighbours on one side, making their window incomplete
+        # and the noise estimate unreliable.
         start_idx = bindist_bins
         stop_idx = max(bindist_bins + 1, rowbins - bindist_bins)
         if stop_idx <= start_idx:
@@ -210,15 +487,19 @@ def compute_sampled_noise(
             requested_n = max(1, int(len(candidate_rows) * float(sample_fraction)))
             sample_all = False
 
+        # Shuffle row order for random sampling; use sequential order for full scan.
         if sample_all:
             row_order = candidate_rows
         else:
             row_order = rng.permutation(candidate_rows)
 
-        selected_rows: List[int] = []
-        failed_rows = 0
-        exhausted = False
+        selected_rows: List[int] = []   # rows that passed quality filters
+        failed_rows = 0                  # rows rejected by quality filters
+        exhausted = False               # True if we ran out of rows before reaching requested_n
+        # chrom_bed stores (bin_index, noise_value) pairs for writing the per-chromosome bedgraph.
         chrom_bed: List[Tuple[int, float]] = []
+        # ratio_stats accumulates per-row metrics for each downsampling ratio,
+        # to be aggregated into per-chromosome summary statistics.
         ratio_stats = {
             ratio: {
                 "noise_raw": [],
@@ -239,6 +520,11 @@ def compute_sampled_noise(
                 default_expected=default_expected,
             )
 
+            # --- Quality filter: skip rows that are too sparse or too weak ---
+            # mean_score < min_mean_score: the row's average observed/expected ratio
+            # is too low, meaning the bin has almost no contacts relative to expectation.
+            # nonzero_frac < min_nonzero_frac: fewer than 1% of the window positions
+            # have any contact at all — not enough data for a stable autocorrelation.
             scores = (observed_vec + 1.0) / (expected_vec + 1.0)
             finite_scores = scores[np.isfinite(scores)]
             mean_score = float(np.nanmean(finite_scores)) if finite_scores.size else 0.0
@@ -247,29 +533,43 @@ def compute_sampled_noise(
             if mean_score < float(min_mean_score) or nonzero_frac < float(min_nonzero_frac):
                 failed_rows += 1
                 if sample_all:
+                    # In full-scan mode, record the failed row as NaN in the bedgraph
+                    # to preserve the full-chromosome coordinate structure.
                     chrom_bed.append((row_idx, float("nan")))
                 continue
 
             selected_rows.append(row_idx)
 
+            # --- Subsampling simulation ---
+            # Round observed counts to nearest integer (contact counts should be integers,
+            # but floating-point normalisation may introduce fractional values).
             observed_int = np.clip(np.rint(observed_vec), 0, None).astype(int)
+            # current_counts tracks the downsampled state as we move from ratio to ratio.
             current_counts = observed_int.copy()
             prev_ratio = 1.0
 
             for ratio in ratios:
                 if ratio == 1.0:
+                    # Full-depth data — use the original counts unchanged.
                     counts = observed_int.copy()
                     prev_ratio = ratio
                 else:
                     if prev_ratio == 0:
                         counts = np.zeros_like(current_counts)
                     else:
+                        # Compute the *incremental* fraction relative to the previous step.
+                        # Example: going from ratio=0.5 to ratio=0.25 means keeping
+                        # 0.25/0.5 = 50% of the already-downsampled counts.
+                        # This avoids drawing new binomial samples from the full data
+                        # at each ratio, which would be inconsistent (different samples
+                        # at ratio 0.5 vs. using the ratio-0.5 sample as input for 0.25).
                         incremental = ratio / prev_ratio
                         incremental = float(np.clip(incremental, 0.0, 1.0))
                         counts = rng.binomial(current_counts, incremental)
                         prev_ratio = ratio
                         current_counts = counts
 
+                # Scale expected values proportionally to match the downsampled depth.
                 expected_scaled = expected_vec * ratio
                 metrics = _compute_row_metrics(counts.astype(float), expected_scaled.astype(float))
 
@@ -280,6 +580,7 @@ def compute_sampled_noise(
                 ratio_stats[ratio]["empty_ratio"].append(metrics["empty_ratio"])
 
                 if ratio == 1.0:
+                    # Record the full-depth noise value for this row in the bedgraph.
                     chrom_bed.append((row_idx, metrics["noise_raw"]))
 
             if len(selected_rows) >= requested_n:
@@ -288,6 +589,7 @@ def compute_sampled_noise(
         if len(selected_rows) < requested_n:
             exhausted = True
 
+        # --- Write per-chromosome bedgraph ---
         if chrom_bed:
             bed_path = os.path.join(out_dir, f"{chrom}_{res}.bedgraph")
             with open(bed_path, "w") as handle:
@@ -296,6 +598,7 @@ def compute_sampled_noise(
                     stop_bp = min((row_idx + 1) * int(res), chrom_len)
                     handle.write(f"{chrom} {start_bp} {stop_bp} {value}\n")
 
+        # --- Aggregate per-chromosome summary statistics ---
         for ratio, stats_dict in ratio_stats.items():
             noise_values = stats_dict["noise_raw"]
             if not noise_values:
@@ -314,7 +617,9 @@ def compute_sampled_noise(
                 "mean_row_std": float(np.nanmean(stats_dict["row_std"])),
                 "mean_acf": float(np.nanmean(stats_dict["acf"])),
                 "mean_empty_bin_ratio": mean_ebr,
+                # estimated_contacts at this ratio = actual contacts * downsampling ratio
                 "estimated_contacts": float(chrom_contacts * float(ratio)),
+                # Placeholder columns filled in below by compute_zmap / sequencing_advisor
                 "z_map": float("nan"),
                 "gamma": float("nan"),
                 "pred_log_N": float("nan"),
@@ -324,6 +629,8 @@ def compute_sampled_noise(
                 "advisor_efficiency_index": float("nan"),
                 "advisor_recommendation": "",
             }
+            # Only compute z-map and advisor for the full-depth (ratio == 1.0) run,
+            # since the reference model is calibrated against unsubsampled data.
             if (
                 ratio == 1.0
                 and np.isfinite(median_noise)
@@ -346,6 +653,7 @@ def compute_sampled_noise(
                         record["pred_log_N"] = zmap_result["pred_log_N"]
                         record["residual"] = zmap_result["residual"]
 
+                        # current_rho = contacts per bin = sequencing density at this chrom
                         current_rho = chrom_contacts / (c_len / int(res))
                         advisor_result = reference.sequencing_advisor(
                             obs_noise=median_noise,
@@ -357,6 +665,9 @@ def compute_sampled_noise(
                         record["advisor_efficiency_index"] = advisor_result["efficiency_index"]
                         record["advisor_recommendation"] = advisor_result["recommendation"]
                     except Exception:
+                        # Expected failure modes: chromosome too sparse for a meaningful
+                        # zmap (e.g. very short or unplaced chromosomes with near-zero
+                        # contacts). Leave the fields as NaN silently.
                         pass
             summary_records.append(record)
 
@@ -397,11 +708,17 @@ def compute_sampled_noise(
                 }
             )
 
+    # --- Write genome-wide summary TSV ---
     if summary_records:
         summary_df = pd.DataFrame(summary_records)
         summary_df.sort_values(["chrom", "ratio"], inplace=True)
         summary_path = os.path.join(out_dir, "subsample_summary.tsv")
         with open(summary_path, "w") as handle:
+            # Header comment lines encode metadata parsed by downstream tools:
+            # - "# resolution=N" is read by the sequencing-advisor CLI to determine
+            #   which resolution the summary applies to.
+            # - "# chrom_info" lines provide chromosome sizes (not stored in the TSV
+            #   body) so the advisor can compute contacts-per-bin (rho).
             handle.write(f"# resolution={int(res)}\n")
             for chrom in sorted(contacts_by_chrom):
                 handle.write(
@@ -410,6 +727,7 @@ def compute_sampled_noise(
                 )
             summary_df.to_csv(handle, sep="\t", index=False)
 
+    # --- Append profiling data ---
     if profile_path and profile_rows:
         profile_abs = os.path.abspath(profile_path)
         os.makedirs(os.path.dirname(profile_abs) or ".", exist_ok=True)
