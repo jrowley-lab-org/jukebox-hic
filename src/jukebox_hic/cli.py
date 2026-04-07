@@ -119,14 +119,14 @@ def main() -> None:
     sp_sample.add_argument(
         "--min_mean_score",
         type=float,
-        default=0.9,
-        help="Minimum distance-normalized mean score required to keep a row (default: 0.9)",
+        default=0.2,
+        help="Minimum distance-normalized mean score required to keep a row (default: 0.2)",
     )
     sp_sample.add_argument(
         "--min_nonzero_frac",
         type=float,
-        default=0.05,
-        help="Minimum fraction of non-zero bins in the window required to keep a row (default: 0.05)",
+        default=0.01,
+        help="Minimum fraction of non-zero bins in the window required to keep a row (default: 0.01)",
     )
     sp_sample.add_argument(
         "--subsample_ratios",

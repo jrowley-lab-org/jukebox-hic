@@ -2,7 +2,7 @@
 jukebox_hic
 -----------
 
-Lightweight Hi-C noise analysis library for .hic (via optional hicstraw) and .cool contact maps.
+Hi-C noise analysis library for .hic and .cool contact maps.
 """
 
 from . import backends, cli, figures, noise_fullmap, noise_sampling, filters, reference
