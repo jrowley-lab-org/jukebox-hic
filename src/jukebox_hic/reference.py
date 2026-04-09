@@ -397,6 +397,54 @@ def process_normalization_vectors_adaptive(
     return bias_vector
 
 
+def process_normalization_vectors_tanh(
+    noise_track: np.ndarray,
+    pred_log_N: float,
+    ebr: float,
+    scale_limit: float = 0.3,
+) -> np.ndarray:
+    """
+    JUKEBOX-TANH normalization.
+
+    Applies tanh compression so that log10(B_i) is bounded to (−S, +S),
+    preventing extreme bias values for outlier bins.
+
+    Math
+    ----
+    log10(B_i) = S · tanh( (log10(N_i) − pred_log_N) / S )
+    B_i        = 10 ^ log10(B_i)
+
+    With S=0.3 (default): B_i ∈ (10^−0.3, 10^0.3) ≈ (0.50, 2.00).
+
+    Interpretation
+    --------------
+    - When log10(N_i) == pred_log_N: tanh(0) = 0 → B_i = 1.0 (no correction).
+    - For large deviations: tanh saturates at ±1 → log-bias capped at ±S.
+    - For small deviations: tanh(x) ≈ x, so behaviour is near-linear.
+
+    Parameters
+    ----------
+    noise_track : per-bin raw noise values (may contain NaN/Inf)
+    pred_log_N  : predicted log10 noise for this chromosome (L̂_target),
+                  from compute_zmap() (= BETA_0 + BETA_1*log10(rho) + BETA_2*ebr)
+    ebr         : mean empty bin ratio (used as Gaussian sigma offset)
+    scale_limit : S — maximum absolute log10-bias allowed; bounds B_i to
+                  (10^−S, 10^S). Default: 0.3 → range ≈ (0.50, 2.00).
+
+    Returns
+    -------
+    bias_vector : same shape as noise_track; NaN where original was NaN/Inf
+    """
+    is_nan, log_N, _ = _preprocess_noise_track(noise_track, ebr)
+
+    S = float(scale_limit)
+    log_bias = S * np.tanh((log_N - float(pred_log_N)) / S)
+    bias_vector = np.power(10.0, log_bias)
+    bias_vector[is_nan] = np.nan
+
+    return bias_vector
+
+
 def process_normalization_vectors(
     noise_track: np.ndarray,
     gamma: float,

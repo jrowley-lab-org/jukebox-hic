@@ -435,7 +435,7 @@ def _write_juicer_vector_block(
             handle.write(f"{val}\n")
 
 
-_VALID_MODES = ("baseline", "adaptive")
+_VALID_MODES = ("baseline", "adaptive", "tanh")
 
 
 def build_bias_vectors_from_bedgraphs(
@@ -448,6 +448,7 @@ def build_bias_vectors_from_bedgraphs(
     skip_decoys: bool = True,
     mode: str = "baseline",
     alpha: float = 0.7,
+    scale_limit: float = 0.3,
 ) -> None:
     """
     Transform a full-noise bedGraph into a Juicer-format normalization vector file.
@@ -501,7 +502,12 @@ def build_bias_vectors_from_bedgraphs(
     chrom_sizes = _load_chrom_sizes(chrom_sizes_path)
     zmap_data = _load_zmap_summary(zmap_summary_path)
 
-    vector_name = "JUKEBOX-BASELINE" if mode == "baseline" else "JUKEBOX-ADAPTIVE"
+    if mode == "baseline":
+        vector_name = "JUKEBOX-BASELINE"
+    elif mode == "adaptive":
+        vector_name = "JUKEBOX-ADAPTIVE"
+    else:
+        vector_name = "JUKEBOX-TANH"
 
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"{res}.juicervector")
@@ -534,9 +540,13 @@ def build_bias_vectors_from_bedgraphs(
                 bias_vector = reference.process_normalization_vectors_baseline(
                     noise_track, pred_log_N, ebr
                 )
-            else:
+            elif mode == "adaptive":
                 bias_vector = reference.process_normalization_vectors_adaptive(
                     noise_track, pred_log_N, ebr, alpha
+                )
+            else:  # tanh
+                bias_vector = reference.process_normalization_vectors_tanh(
+                    noise_track, pred_log_N, ebr, scale_limit
                 )
 
             _write_juicer_vector_block(

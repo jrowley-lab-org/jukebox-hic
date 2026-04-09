@@ -422,12 +422,14 @@ def main() -> None:
     sp_bias.add_argument(
         "--mode",
         default="baseline",
-        choices=["baseline", "adaptive"],
+        choices=["baseline", "adaptive", "tanh"],
         help=(
             "Normalization mode: "
             "baseline = JUKEBOX-BASELINE (precise per-bin alignment to 4DN reference); "
             "adaptive = JUKEBOX-ADAPTIVE (global z-shift + dampened local variance, "
-            "recommended for sparse/palaeogenomic data). Default: baseline"
+            "recommended for sparse/palaeogenomic data); "
+            "tanh = JUKEBOX-TANH (tanh-compressed bias bounded to ±scale_limit in log10 space). "
+            "Default: baseline"
         ),
     )
     sp_bias.add_argument(
@@ -438,6 +440,15 @@ def main() -> None:
         # in the adaptive bias vector. 0.5 = aggressive smoothing, 0.8 = conservative.
         # 0.7 is a balanced default. Values outside 0.5–0.8 are not recommended.
         help="Damping factor for adaptive mode (default: 0.7; valid range 0.5–0.8)",
+    )
+    sp_bias.add_argument(
+        "--scale_limit",
+        type=float,
+        default=0.3,
+        help=(
+            "Scale limit S for tanh mode: maximum absolute log10-bias allowed. "
+            "B_i is bounded to (10^-S, 10^S). Default: 0.3 → range ≈ (0.50, 2.00)"
+        ),
     )
 
     # ------------------------------------------------------------------ #
@@ -549,9 +560,9 @@ def main() -> None:
     sp_run.add_argument(
         "--mode",
         default="baseline",
-        choices=["baseline", "adaptive"],
+        choices=["baseline", "adaptive", "tanh"],
         help=(
-            "Normalization mode for bias vectors: baseline (default) or adaptive. "
+            "Normalization mode for bias vectors: baseline (default), adaptive, or tanh. "
             "See bias-vectors --help for details."
         ),
     )
@@ -560,6 +571,15 @@ def main() -> None:
         type=float,
         default=0.7,
         help="Damping factor for adaptive mode (default: 0.7; valid range 0.5–0.8)",
+    )
+    sp_run.add_argument(
+        "--scale_limit",
+        type=float,
+        default=0.3,
+        help=(
+            "Scale limit S for tanh mode: maximum absolute log10-bias allowed. "
+            "B_i is bounded to (10^-S, 10^S). Default: 0.3 → range ≈ (0.50, 2.00)"
+        ),
     )
 
     # ------------------------------------------------------------------ #
@@ -670,6 +690,7 @@ def main() -> None:
                     skip_decoys=not bool(args.include_decoys),
                     mode=args.mode,
                     alpha=args.alpha,
+                    scale_limit=args.scale_limit,
                 )
                 print(f"  → {os.path.join(args.out_dir, f'{res}.juicervector')}")
 
@@ -883,6 +904,7 @@ def main() -> None:
                     nan_fill_value=nan_fill,
                     mode=args.mode,
                     alpha=args.alpha,
+                    scale_limit=args.scale_limit,
                 )
                 print(f"  → {os.path.join(vectors_dir, f'{res}.juicervector')}")
 
