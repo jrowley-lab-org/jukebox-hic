@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: jukebox-hic
-Version: 0.2.2
+Version: 0.2.2rc0
 Summary: Hi-C noise analysis toolkit for .hic/.cool matrices
 Author: NoiseSampler Developers
 License: BSD-3-Clause
