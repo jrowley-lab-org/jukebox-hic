@@ -435,11 +435,11 @@ def main() -> None:
     sp_bias.add_argument(
         "--alpha",
         type=float,
-        default=0.7,
+        default=0.5,
         # Alpha controls how much of the per-bin local noise deviation is retained
         # in the adaptive bias vector. 0.5 = aggressive smoothing, 0.8 = conservative.
         # 0.7 is a balanced default. Values outside 0.5–0.8 are not recommended.
-        help="Damping factor for adaptive mode (default: 0.7; valid range 0.5–0.8)",
+        help="Damping factor for adaptive mode (default: 0.5; valid range 0.5–0.8)",
     )
     sp_bias.add_argument(
         "--scale_limit",
@@ -569,8 +569,8 @@ def main() -> None:
     sp_run.add_argument(
         "--alpha",
         type=float,
-        default=0.7,
-        help="Damping factor for adaptive mode (default: 0.7; valid range 0.5–0.8)",
+        default=0.5,
+        help="Damping factor for adaptive mode (default: 0.5; valid range 0.5–0.8)",
     )
     sp_run.add_argument(
         "--scale_limit",
