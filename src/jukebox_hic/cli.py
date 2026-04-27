@@ -422,13 +422,15 @@ def main() -> None:
     sp_bias.add_argument(
         "--mode",
         default="baseline",
-        choices=["baseline", "adaptive", "tanh"],
+        choices=["baseline", "adaptive", "tanh", "powerlaw"],
         help=(
             "Normalization mode: "
             "baseline = JUKEBOX-BASELINE (precise per-bin alignment to 4DN reference); "
             "adaptive = JUKEBOX-ADAPTIVE (global z-shift + dampened local variance, "
             "recommended for sparse/palaeogenomic data); "
-            "tanh = JUKEBOX-TANH (tanh-compressed bias bounded to ±scale_limit in log10 space). "
+            "tanh = JUKEBOX-TANH (tanh-compressed bias bounded to ±scale_limit in log10 space); "
+            "powerlaw = JUKEBOX-POWERLAW (signed power-law root compression of the residual, "
+            "controlled by --p_factor and --alpha). "
             "Default: baseline"
         ),
     )
@@ -439,7 +441,7 @@ def main() -> None:
         # Alpha controls how much of the per-bin local noise deviation is retained
         # in the adaptive bias vector. 0.5 = aggressive smoothing, 0.8 = conservative.
         # 0.7 is a balanced default. Values outside 0.5–0.8 are not recommended.
-        help="Damping factor for adaptive mode (default: 0.5; valid range 0.5–0.8)",
+        help="Damping factor for adaptive mode, or scaling constant for powerlaw mode (default: 0.5)",
     )
     sp_bias.add_argument(
         "--scale_limit",
@@ -449,6 +451,12 @@ def main() -> None:
             "Scale limit S for tanh mode: maximum absolute log10-bias allowed. "
             "B_i is bounded to (10^-S, 10^S). Default: 0.3 → range ≈ (0.50, 2.00)"
         ),
+    )
+    sp_bias.add_argument(
+        "--p_factor",
+        type=float,
+        default=3.0,
+        help="Compression factor for powerlaw mode (default: 3.0; cube root). Use 2.0 for square root.",
     )
 
     # ------------------------------------------------------------------ #
@@ -560,9 +568,9 @@ def main() -> None:
     sp_run.add_argument(
         "--mode",
         default="baseline",
-        choices=["baseline", "adaptive", "tanh"],
+        choices=["baseline", "adaptive", "tanh", "powerlaw"],
         help=(
-            "Normalization mode for bias vectors: baseline (default), adaptive, or tanh. "
+            "Normalization mode for bias vectors: baseline (default), adaptive, tanh, or powerlaw. "
             "See bias-vectors --help for details."
         ),
     )
@@ -570,7 +578,7 @@ def main() -> None:
         "--alpha",
         type=float,
         default=0.5,
-        help="Damping factor for adaptive mode (default: 0.5; valid range 0.5–0.8)",
+        help="Damping factor for adaptive mode, or scaling constant for powerlaw mode (default: 0.5)",
     )
     sp_run.add_argument(
         "--scale_limit",
@@ -580,6 +588,12 @@ def main() -> None:
             "Scale limit S for tanh mode: maximum absolute log10-bias allowed. "
             "B_i is bounded to (10^-S, 10^S). Default: 0.3 → range ≈ (0.50, 2.00)"
         ),
+    )
+    sp_run.add_argument(
+        "--p_factor",
+        type=float,
+        default=3.0,
+        help="Compression factor for powerlaw mode (default: 3.0; cube root). Use 2.0 for square root.",
     )
 
     # ------------------------------------------------------------------ #
@@ -691,6 +705,7 @@ def main() -> None:
                     mode=args.mode,
                     alpha=args.alpha,
                     scale_limit=args.scale_limit,
+                    p_factor=args.p_factor,
                 )
                 print(f"  → {os.path.join(args.out_dir, f'{res}.juicervector')}")
 
@@ -905,6 +920,7 @@ def main() -> None:
                     mode=args.mode,
                     alpha=args.alpha,
                     scale_limit=args.scale_limit,
+                    p_factor=args.p_factor,
                 )
                 print(f"  → {os.path.join(vectors_dir, f'{res}.juicervector')}")
 

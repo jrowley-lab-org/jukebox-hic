@@ -445,6 +445,51 @@ def process_normalization_vectors_tanh(
     return bias_vector
 
 
+def process_normalization_vectors_powerlaw(
+    noise_track: np.ndarray,
+    pred_log_N: float,
+    ebr: float,
+    p: float = 3.0,
+    alpha: float = 0.5,
+) -> np.ndarray:
+    """
+    JUKEBOX-POWERLAW normalization.
+
+    Applies a signed power-law (root) transformation to the log-space residual,
+    compressing the long tail more aggressively than a linear scalar.
+
+    Math
+    ----
+    ε_i  = log10(N_i) − pred_log_N
+    ε_i′ = sign(ε_i) · |ε_i|^(1/p) · α
+    B_i  = 10 ^ ε_i′
+
+    With p=3 (cube root) and α=0.5: large residuals are pulled in relative to the
+    linear baseline while the sign of the correction is preserved, preventing
+    blowout from extreme outlier bins.
+
+    Parameters
+    ----------
+    noise_track : per-bin raw noise values (may contain NaN/Inf)
+    pred_log_N  : predicted log10 noise from compute_zmap()
+    ebr         : mean empty bin ratio (used as Gaussian sigma offset)
+    p           : compression factor; p=3 → cube root, p=2 → square root (default 3.0)
+    alpha       : scaling constant to keep center stable (default 0.5)
+
+    Returns
+    -------
+    bias_vector : same shape as noise_track; NaN where original was NaN/Inf
+    """
+    is_nan, log_N, _ = _preprocess_noise_track(noise_track, ebr)
+
+    residual = log_N - float(pred_log_N)
+    compressed = np.sign(residual) * np.power(np.abs(residual), 1.0 / float(p)) * float(alpha)
+    bias_vector = np.power(10.0, compressed)
+    bias_vector[is_nan] = np.nan
+
+    return bias_vector
+
+
 def process_normalization_vectors(
     noise_track: np.ndarray,
     gamma: float,
