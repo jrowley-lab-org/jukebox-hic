@@ -375,6 +375,18 @@ def main() -> None:
         "--chroms",
         help="Comma-separated list of chromosomes to process (default: all)",
     )
+    sp_full.add_argument(
+        "--dump_factor",
+        type=float,
+        default=10.0,
+        help=(
+            "Sliding-window chunk size multiplier for RAM control. "
+            "Each chunk covers max(2, dump_factor) × noise_bins core bins. "
+            "Lower values reduce peak RAM at the cost of more region fetches. "
+            "Default 10.0 works well down to ~1 kb resolution. "
+            "Try 4.0–6.0 for sub-1 kb or very large chromosomes."
+        ),
+    )
 
     # ------------------------------------------------------------------ #
     # bias-vectors                                                         #
@@ -593,6 +605,15 @@ def main() -> None:
             "Default: auto-computed as the median non-zero bin density."
         ),
     )
+    sp_run.add_argument(
+        "--dump_factor",
+        type=float,
+        default=10.0,
+        help=(
+            "Sliding-window chunk size multiplier passed to full-noise. "
+            "Lower values reduce peak RAM. Default: 10.0."
+        ),
+    )
 
     # ------------------------------------------------------------------ #
     # Dispatch                                                             #
@@ -664,6 +685,7 @@ def main() -> None:
                 cooler_selection=args.cooler_path,
                 cpu=args.cpu,
                 chroms=_comma_strs(args.chroms) if args.chroms else None,
+                dump_factor=args.dump_factor,
             )
 
         _profile_command("full-noise", run)
@@ -709,7 +731,6 @@ def main() -> None:
                 skip_decoys=not bool(args.include_decoys),
                 mode=args.mode,
                 alpha=args.alpha,
-                scale_limit=args.scale_limit,
                 p_factor=args.p_factor,
                 density_bedgraph_path=args.density_bedgraph,
                 k_density=args.k_density,
@@ -905,6 +926,7 @@ def main() -> None:
             cooler_selection=cooler_sel,
             cpu=args.cpu,
             chroms=chroms,
+            dump_factor=args.dump_factor,
         )
 
         # Phases 3 & 4: Per resolution

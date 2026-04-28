@@ -8,9 +8,10 @@ file is a Juicer .hic file or a cooler .cool/.mcool/.scool file.
 
 Architecture overview
 ---------------------
-``BaseProvider``  — abstract interface specifying two methods every backend must supply:
+``BaseProvider``  — abstract interface specifying three methods every backend must supply:
   - ``chrom_sizes()`` → dict of chromosome name → length in bp
   - ``fetch_chrom()`` → a ``ChromMatrix`` for a single chromosome
+  - ``fetch_region()`` → a ``ChromMatrix`` for a bp-bounded sub-region (local 0-based indices)
 
 ``HiCProvider``   — implements BaseProvider via the ``hicstraw`` library for .hic files.
 ``CoolerProvider``— implements BaseProvider via the ``cooler`` library for cooler files.
@@ -399,6 +400,21 @@ class BaseProvider:
         """
         raise NotImplementedError
 
+    def fetch_region(self, chrom: str, start_bp: int, end_bp: int) -> Optional[ChromMatrix]:
+        """
+        Load the contact sub-matrix for the diagonal block [start_bp, end_bp) of *chrom*.
+
+        The returned ``ChromMatrix`` uses **local 0-based indices**: bin 0 corresponds to
+        the genomic position ``start_bp``.  ``ChromMatrix.chrom_len`` is set to
+        ``end_bp - start_bp``.
+
+        Both ``start_bp`` and ``end_bp`` should be bin-aligned (multiples of the
+        provider's resolution) for predictable results.
+
+        Returns ``None`` if the region is empty, outside the chromosome, or has no contacts.
+        """
+        raise NotImplementedError
+
 
 class HiCProvider(BaseProvider):
     """
@@ -513,6 +529,65 @@ class HiCProvider(BaseProvider):
         csr = coo.tocsr()
         csc = coo.tocsc()
         return ChromMatrix(chrom=chrom, chrom_len=chrom_len, coo=coo, csr=csr, csc=csc)
+
+    def fetch_region(self, chrom: str, start_bp: int, end_bp: int) -> Optional[ChromMatrix]:
+        """
+        Extract a diagonal contact sub-matrix for [start_bp, end_bp) of *chrom*.
+
+        hicstraw accepts region strings in the form ``"chrom:start:end"`` for both
+        query regions.  Returned records have ``binX``/``binY`` in absolute bp; the
+        local bin offset (``start_bp // res``) is subtracted so the result is 0-based.
+        """
+        chrom_len = self._chrom_sizes.get(chrom)
+        if chrom_len is None:
+            return None
+        start_bp = max(0, int(start_bp))
+        end_bp = min(int(chrom_len), int(end_bp))
+        if end_bp <= start_bp:
+            return None
+
+        region = f"{chrom}:{start_bp}:{end_bp}"
+        try:
+            records = self._hicstraw.straw(
+                "observed", self.norm, self.path, region, region, "BP", self.res,
+            )
+        except Exception:
+            return None
+        if not records:
+            return None
+
+        bin_offset = start_bp // self.res
+        region_bins = (end_bp - start_bp + self.res - 1) // self.res
+
+        rows_list: List[int] = []
+        cols_list: List[int] = []
+        data_list: List[float] = []
+        for rec in records:
+            r = rec.binX // self.res - bin_offset
+            c = rec.binY // self.res - bin_offset
+            if r < 0 or r >= region_bins or c < 0 or c >= region_bins:
+                continue
+            rows_list.append(r)
+            cols_list.append(c)
+            data_list.append(float(rec.counts))
+
+        if not rows_list:
+            return None
+
+        row_arr = np.asarray(rows_list, dtype=np.int32)
+        col_arr = np.asarray(cols_list, dtype=np.int32)
+        data_arr = np.asarray(data_list, dtype=float)
+
+        mask = row_arr != col_arr
+        row_sym = np.concatenate([row_arr, col_arr[mask]])
+        col_sym = np.concatenate([col_arr, row_arr[mask]])
+        data_sym = np.concatenate([data_arr, data_arr[mask]])
+
+        coo = sparse.coo_matrix((data_sym, (row_sym, col_sym)), shape=(region_bins, region_bins))
+        coo.sum_duplicates()
+        csr = coo.tocsr()
+        csc = coo.tocsc()
+        return ChromMatrix(chrom=chrom, chrom_len=end_bp - start_bp, coo=coo, csr=csr, csc=csc)
 
 
 class CoolerProvider(BaseProvider):
@@ -666,6 +741,58 @@ class CoolerProvider(BaseProvider):
         csr = coo.tocsr()
         csc = coo.tocsc()
         return ChromMatrix(chrom=chrom, chrom_len=chrom_len, coo=coo, csr=csr, csc=csc)
+
+    def fetch_region(self, chrom: str, start_bp: int, end_bp: int) -> Optional[ChromMatrix]:
+        """
+        Extract a diagonal contact sub-matrix for [start_bp, end_bp) of *chrom*.
+
+        Uses cooler's region-fetch API (``"chrom:start-end"`` format).  The returned
+        matrix has local 0-based indices aligned to ``start_bp``.  Custom weight
+        vectors are sliced to the region using the chromosome's absolute bin offset.
+        """
+        if chrom not in self._chrom_sizes:
+            return None
+        chrom_len = int(self._chrom_sizes[chrom])
+        start_bp = max(0, int(start_bp))
+        end_bp = min(chrom_len, int(end_bp))
+        if end_bp <= start_bp:
+            return None
+
+        region = f"{chrom}:{start_bp}-{end_bp}"
+        try:
+            if self._norm_mode == "balance":
+                sub = self._balanced_matrix.fetch(region, region)  # type: ignore[union-attr]
+            else:
+                sub = self._raw_matrix.fetch(region, region)
+        except Exception:
+            return None
+
+        coo = sub.tocoo()
+
+        finite_mask = np.isfinite(coo.data)
+        if not np.all(finite_mask):
+            coo = sparse.coo_matrix(
+                (coo.data[finite_mask], (coo.row[finite_mask], coo.col[finite_mask])),
+                shape=coo.shape,
+            )
+
+        if self._norm_mode == "custom":
+            chrom_abs_start, _ = self._cooler.extent(chrom)
+            region_start_abs = chrom_abs_start + start_bp // self.res
+            region_bins = coo.shape[0]
+            weights = self._custom_weights[region_start_abs:region_start_abs + region_bins]
+            if coo.nnz > 0:
+                factor = weights[coo.row] * weights[coo.col]
+                data = coo.data * factor
+                coo = sparse.coo_matrix((data, (coo.row, coo.col)), shape=coo.shape)
+
+        if coo.nnz == 0:
+            return None
+
+        coo.sum_duplicates()
+        csr = coo.tocsr()
+        csc = coo.tocsc()
+        return ChromMatrix(chrom=chrom, chrom_len=end_bp - start_bp, coo=coo, csr=csr, csc=csc)
 
 
 def select_provider(

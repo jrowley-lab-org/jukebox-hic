@@ -68,6 +68,19 @@ def _default_bindist_bp(resolution: int) -> int:
     return 1_000_000
 
 
+def _compute_dump_bins(n_bins: int, noise_bins: int, dump_factor: float = 10.0) -> int:
+    """
+    Number of core bins to process per sliding-window chunk.
+
+    The chunk is at least ``2 * noise_bins`` wide (avoids pathologically small chunks
+    that would thrash the fetch API) but never larger than the chromosome (so small
+    chromosomes are always processed in a single pass).  ``dump_factor`` scales
+    linearly with ``noise_bins``: larger values mean fewer, larger fetches and higher
+    peak RAM; smaller values mean more fetches and lower peak RAM.
+    """
+    return int(min(n_bins, max(2 * noise_bins, int(dump_factor * noise_bins))))
+
+
 def _precompute_expectation(coo) -> Tuple[np.ndarray, float]:
     """
     Build a lookup table of expected (average) contact counts by genomic distance.
@@ -145,64 +158,51 @@ def _row_window_noise(
     bindist_bins: int,
     expected_lookup: np.ndarray,
     default_expected: float,
+    row_start: int = 0,
+    row_end: Optional[int] = None,
 ) -> np.ndarray:
     """
-    Compute the noise value for every bin in a chromosome's contact matrix.
+    Compute the noise value for a range of bins in a contact matrix.
 
-    For each genomic bin ``idx`` (from 0 to rowbins-1), this function:
-    1. Constructs an observed-count window vector of length ``bindist_bins * 2``
-       covering contacts within ``bindist_bins`` bins of the diagonal.
-    2. Constructs a matching expected-count vector using the distance-decay model.
-    3. Computes the lag-1 autocovariance of the ratio series and returns
-       ``1 / |autocovariance_lag1|`` as the noise value.
+    Processes rows ``row_start`` to ``row_end - 1`` (default: all rows).  The returned
+    array has length ``row_end - row_start``, with index 0 corresponding to
+    ``row_start`` in the matrix.  Passing ``row_start`` / ``row_end`` restricts
+    processing to core rows of a sliding-window chunk without reallocating the matrix.
 
-    The window is split into two halves:
-    - **Upstream half** (positions 0 … bindist_bins−1): contacts with bins j < idx.
-      Fetched from the CSC matrix (column slicing is efficient in CSC format).
-      Position mapping: ``pos = bindist_bins - lag`` where ``lag = idx - j``.
-      So lag=1 → position bindist_bins−1 (closest upstream neighbour).
-    - **Downstream half** (positions bindist_bins … 2*bindist_bins−1): contacts with
-      bins j > idx. Fetched from the CSR matrix (row slicing is efficient in CSR).
-      Position mapping: ``pos = bindist_bins - 1 + lag`` where ``lag = j - idx``.
-      So lag=1 → position bindist_bins (closest downstream neighbour).
+    For each bin ``idx``, two contact windows are built:
+    - **Upstream** (CSC column slice): contacts with bins j < idx, positions ``bindist_bins - lag``.
+    - **Downstream** (CSR row slice): contacts with bins j > idx, positions ``bindist_bins - 1 + lag``.
 
-    The asymmetric indexing keeps the diagonal at the boundary between the two halves
-    (between positions bindist_bins−1 and bindist_bins) rather than at the centre.
-    This simplifies the position arithmetic and makes it clear which half is upstream
-    vs. downstream.
-
-    Noise metric
-    ------------
-    For each bin, the ratio series ``score[k] = observed[k] / expected[k]`` (with
-    pseudo-counts) is computed. The lag-1 autocovariance of this series (``acovf``)
-    captures how smoothly the ratios vary with genomic distance:
-    - High autocovariance → smooth, predictable variation → LOW noise (small value).
-    - Low autocovariance → erratic, random variation → HIGH noise (large value).
-
-    The noise value is ``1 / |acovf_lag1|``, so noisier bins get larger values.
-    NaN is returned if the autocovariance is zero (perfectly alternating series)
-    or if an exception occurs during computation (e.g. too few data points).
+    Noise = ``1 / |lag-1 autocovariance|`` of the observed window.  NaN when the
+    autocovariance is zero or the computation fails.
 
     Parameters
     ----------
     matrix : ChromMatrix
-        Sparse contact matrix for this chromosome (CSR and CSC formats used).
+        Sparse contact matrix (CSR and CSC formats used).
     rowbins : int
-        Total number of bins in the chromosome (= matrix dimension).
+        Total number of bins in the matrix dimension.
     bindist_bins : int
-        Half-window size in bins (= bindist_bp // resolution).
+        Half-window size in bins.
     expected_lookup : np.ndarray
-        Distance-decay lookup table from ``_precompute_expectation()``.
+        Distance-decay lookup from ``_precompute_expectation()``.
     default_expected : float
         Fallback expected value for lags with no data.
+    row_start : int
+        First row index to process (default 0).
+    row_end : int or None
+        One-past-last row index to process (default ``rowbins``).
 
     Returns
     -------
-    noise_vals : np.ndarray of shape (rowbins,)
-        Per-bin noise values. NaN for bins where the metric could not be computed.
+    noise_vals : np.ndarray of shape (row_end - row_start,)
+        Per-bin noise values for the requested row range.
     """
-    noise_vals = np.zeros(rowbins, dtype=float)
-    for idx in range(rowbins):
+    if row_end is None:
+        row_end = rowbins
+    out_len = row_end - row_start
+    noise_vals = np.zeros(out_len, dtype=float)
+    for out_i, idx in enumerate(range(row_start, row_end)):
         window = bindist_bins * 2
         observed = np.zeros(window, dtype=float)
         # Initialise expected to the global default so un-contacted positions still
@@ -242,9 +242,9 @@ def _row_window_noise(
             # roughly constant over the short window, so the ratio and observed series
             # have nearly the same autocorrelation structure.
             ac = acovf(observed, nlag=1, fft=True)[1]
-            noise_vals[idx] = float("nan") if ac == 0 else 1.0 / abs(ac)
+            noise_vals[out_i] = float("nan") if ac == 0 else 1.0 / abs(ac)
         except Exception:
-            noise_vals[idx] = float("nan")
+            noise_vals[out_i] = float("nan")
 
     return noise_vals
 
@@ -331,6 +331,7 @@ class _FullNoiseTask:
     out_dir: str
     out_path: str
     density_out_path: str
+    dump_factor: float = 10.0
 
 
 def _full_noise_worker(task: _FullNoiseTask) -> Tuple[str, int, str, bool]:
@@ -364,9 +365,13 @@ def _full_noise_worker(task: _FullNoiseTask) -> Tuple[str, int, str, bool]:
         chromosome had no contacts or an error occurred.
     """
     provider, _ = select_provider(task.hic_path, task.res, task.norm, task.cooler_selection)
-    matrix = provider.fetch_chrom(task.chrom)
-    if matrix is None or matrix.coo.nnz == 0:
-        # No contacts for this chromosome — remove any stale output and signal failure.
+
+    res = int(task.res)
+    window_bp = task.bindist_bp or _default_bindist_bp(res)
+    noise_bins = max(1, window_bp // res)
+    n_bins = (task.chrom_len + res - 1) // res
+
+    if n_bins == 0:
         for stale in (task.out_path, task.density_out_path):
             if os.path.exists(stale):
                 try:
@@ -375,23 +380,62 @@ def _full_noise_worker(task: _FullNoiseTask) -> Tuple[str, int, str, bool]:
                     pass
         return task.chrom, task.res, task.out_path, False
 
-    window_bp = task.bindist_bp or _default_bindist_bp(int(task.res))
-    bindist_bins = max(1, window_bp // int(task.res))
-    expected_lookup, default_expected = _precompute_expectation(matrix.coo)
-    rowbins = matrix.coo.shape[0]
-    noise_vals = _row_window_noise(
-        matrix,
-        rowbins=rowbins,
-        bindist_bins=bindist_bins,
-        expected_lookup=expected_lookup,
-        default_expected=default_expected,
-    )
+    dump_bins = _compute_dump_bins(n_bins, noise_bins, task.dump_factor)
 
-    _write_bedgraph(task.chrom, int(task.res), task.chrom_len, noise_vals, task.out_path)
+    noise_vals = np.full(n_bins, float("nan"), dtype=float)
+    density_vals = np.zeros(n_bins, dtype=float)
+    any_data = False
 
-    # Per-bin row sum = total contacts touching bin i (local density for bayesian mode)
-    density_vals = np.asarray(matrix.csr.sum(axis=1)).ravel().astype(float)
-    _write_bedgraph(task.chrom, int(task.res), task.chrom_len, density_vals, task.density_out_path)
+    chunk_start = 0
+    while chunk_start < n_bins:
+        chunk_end = min(chunk_start + dump_bins, n_bins)
+
+        fetch_start_bin = max(0, chunk_start - noise_bins)
+        fetch_end_bin = min(n_bins, chunk_end + noise_bins)
+        fetch_start_bp = fetch_start_bin * res
+        fetch_end_bp = fetch_end_bin * res
+
+        matrix = provider.fetch_region(task.chrom, fetch_start_bp, fetch_end_bp)
+
+        if matrix is not None and matrix.coo.nnz > 0:
+            any_data = True
+            expected_lookup, default_expected = _precompute_expectation(matrix.coo)
+
+            local_chunk_start = chunk_start - fetch_start_bin
+            local_chunk_end = chunk_end - fetch_start_bin
+            fetch_bins = fetch_end_bin - fetch_start_bin
+
+            chunk_noise = _row_window_noise(
+                matrix,
+                rowbins=fetch_bins,
+                bindist_bins=noise_bins,
+                expected_lookup=expected_lookup,
+                default_expected=default_expected,
+                row_start=local_chunk_start,
+                row_end=local_chunk_end,
+            )
+            noise_vals[chunk_start:chunk_end] = chunk_noise
+
+            # Windowed row sums: contacts within the fetch window, semantically aligned
+            # with the noise window used by the lag-1 autocovariance metric.
+            chunk_density = np.asarray(
+                matrix.csr[local_chunk_start:local_chunk_end].sum(axis=1)
+            ).ravel().astype(float)
+            density_vals[chunk_start:chunk_end] = chunk_density
+
+        chunk_start = chunk_end
+
+    if not any_data:
+        for stale in (task.out_path, task.density_out_path):
+            if os.path.exists(stale):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+        return task.chrom, task.res, task.out_path, False
+
+    _write_bedgraph(task.chrom, res, task.chrom_len, noise_vals, task.out_path)
+    _write_bedgraph(task.chrom, res, task.chrom_len, density_vals, task.density_out_path)
 
     return task.chrom, task.res, task.out_path, True
 
@@ -406,6 +450,7 @@ def compute_full_noise(
     cooler_selection: Optional[str] = None,
     cpu: int = 1,
     chroms: Optional[List[str]] = None,
+    dump_factor: float = 10.0,
 ) -> None:
     """
     Compute noise values for every row/bin across the genome at the requested resolutions.
@@ -465,6 +510,11 @@ def compute_full_noise(
         Number of parallel worker processes (default 1 = serial).
     chroms : list of str or None
         If provided, restrict to these chromosome names.
+    dump_factor : float
+        Chunk size multiplier: each sliding-window chunk covers
+        ``max(2, dump_factor) * noise_bins`` core bins.  Larger values increase
+        peak RAM per worker; smaller values reduce RAM at the cost of more fetches.
+        Default 10.0 is a good balance for resolutions down to ~1 kb.
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -504,6 +554,7 @@ def compute_full_noise(
                     out_dir=out_dir,
                     out_path=out_path,
                     density_out_path=density_out_path,
+                    dump_factor=dump_factor,
                 )
             )
         del provider  # release file handle before forking worker processes
