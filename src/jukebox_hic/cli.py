@@ -18,9 +18,10 @@ full-noise
     bedgraph at each requested resolution, suitable for bias vector construction.
 
 bias-vectors
-    Transform full-noise bedgraphs into Juicer-format custom normalization vectors.
-    Requires the subsample_summary.tsv from sample-noise to obtain per-chromosome
-    z-map parameters.
+    Transform a full-noise bedgraph into a Juicer-format custom normalization vector
+    for a single resolution. Requires the subsample_summary.tsv from sample-noise at
+    the same resolution to obtain per-chromosome z-map parameters. Run once per
+    resolution.
 
 plot
     Render a density histogram of noise values from a bedgraph file.
@@ -394,10 +395,12 @@ def main() -> None:
     )
     sp_bias.add_argument(
         "--res",
+        type=int,
         default=None,
         help=(
-            "Comma-separated resolutions in bp to process "
-            "(default: auto-detect from {res}.bedgraph files in --noise_dir)"
+            "Resolution in bp to process (single integer, e.g. 10000). "
+            "If omitted, auto-detected from --noise_dir only when exactly one "
+            "{res}.bedgraph file is present. Run bias-vectors once per resolution."
         ),
     )
     sp_bias.add_argument(
@@ -672,15 +675,23 @@ def main() -> None:
 
     elif args.cmd == "bias-vectors":
         if args.res:
-            resolutions = _comma_ints(args.res)
+            res = args.res
         else:
-            # Auto-detect resolutions from files named {integer}.bedgraph in noise_dir
-            resolutions = _detect_resolutions_in_dir(args.noise_dir)
-            if not resolutions:
+            # Auto-detect only when exactly one {integer}.bedgraph exists in noise_dir;
+            # error when multiple are found so the user picks one explicitly.
+            detected = _detect_resolutions_in_dir(args.noise_dir)
+            if not detected:
                 parser.error(
                     f"No {{res}}.bedgraph files found in {args.noise_dir}. "
-                    "Use --res to specify resolutions explicitly."
+                    "Use --res to specify the resolution explicitly."
                 )
+            if len(detected) > 1:
+                parser.error(
+                    f"Multiple resolutions found in {args.noise_dir}: {detected}. "
+                    "bias-vectors processes one resolution at a time — "
+                    "use --res to specify which resolution to process."
+                )
+            res = detected[0]
         if not args.zmap_summary:
             parser.error(
                 "--zmap_summary is required. "
@@ -693,21 +704,20 @@ def main() -> None:
         nan_fill = float("nan") if args.nan_fill == "nan" else 0.0
 
         def run() -> None:
-            for res in resolutions:
-                noise_to_weights.build_bias_vectors_from_bedgraphs(
-                    noise_dir=args.noise_dir,
-                    res=res,
-                    out_dir=args.out_dir,
-                    zmap_summary_path=args.zmap_summary,
-                    chrom_sizes_path=args.chrom_sizes,
-                    nan_fill_value=nan_fill,
-                    skip_decoys=not bool(args.include_decoys),
-                    mode=args.mode,
-                    alpha=args.alpha,
-                    scale_limit=args.scale_limit,
-                    p_factor=args.p_factor,
-                )
-                print(f"  → {os.path.join(args.out_dir, f'{res}.juicervector')}")
+            noise_to_weights.build_bias_vectors_from_bedgraphs(
+                noise_dir=args.noise_dir,
+                res=res,
+                out_dir=args.out_dir,
+                zmap_summary_path=args.zmap_summary,
+                chrom_sizes_path=args.chrom_sizes,
+                nan_fill_value=nan_fill,
+                skip_decoys=not bool(args.include_decoys),
+                mode=args.mode,
+                alpha=args.alpha,
+                scale_limit=args.scale_limit,
+                p_factor=args.p_factor,
+            )
+            print(f"  → {os.path.join(args.out_dir, f'{res}.juicervector')}")
 
         _profile_command("bias-vectors", run)
 
