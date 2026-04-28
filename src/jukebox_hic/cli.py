@@ -21,7 +21,8 @@ bias-vectors
     Transform a full-noise bedgraph into a Juicer-format custom normalization vector
     for a single resolution. Requires the subsample_summary.tsv from sample-noise at
     the same resolution to obtain per-chromosome z-map parameters. Run once per
-    resolution.
+    resolution. The bayesian mode additionally requires a density bedgraph produced
+    by full-noise ({res}_density.bedgraph), auto-detected from --noise_dir by default.
 
 plot
     Render a density histogram of noise values from a bedgraph file.
@@ -424,42 +425,45 @@ def main() -> None:
     )
     sp_bias.add_argument(
         "--mode",
-        default="baseline",
-        choices=["baseline", "adaptive", "tanh", "powerlaw"],
+        default="powerlaw",
+        choices=["powerlaw", "bayesian"],
         help=(
             "Normalization mode: "
-            "baseline = JUKEBOX-BASELINE (precise per-bin alignment to 4DN reference); "
-            "adaptive = JUKEBOX-ADAPTIVE (global z-shift + dampened local variance, "
-            "recommended for sparse/palaeogenomic data); "
-            "tanh = JUKEBOX-TANH (tanh-compressed bias bounded to ±scale_limit in log10 space); "
             "powerlaw = JUKEBOX-POWERLAW (signed power-law root compression of the residual, "
-            "controlled by --p_factor and --alpha). "
-            "Default: baseline"
+            "controlled by --p_factor and --alpha); "
+            "bayesian = JUKEBOX-BAYESIAN (evidence-weighted shrinkage toward 1.0 for sparse bins, "
+            "requires density bedgraph from full-noise). "
+            "Default: powerlaw"
         ),
     )
     sp_bias.add_argument(
         "--alpha",
         type=float,
-        default=0.5,
-        # Alpha controls how much of the per-bin local noise deviation is retained
-        # in the adaptive bias vector. 0.5 = aggressive smoothing, 0.8 = conservative.
-        # 0.7 is a balanced default. Values outside 0.5–0.8 are not recommended.
-        help="Damping factor for adaptive mode, or scaling constant for powerlaw mode (default: 0.5)",
-    )
-    sp_bias.add_argument(
-        "--scale_limit",
-        type=float,
-        default=0.3,
-        help=(
-            "Scale limit S for tanh mode: maximum absolute log10-bias allowed. "
-            "B_i is bounded to (10^-S, 10^S). Default: 0.3 → range ≈ (0.50, 2.00)"
-        ),
+        default=1.0,
+        help="Scaling constant for powerlaw mode (default: 1.0)",
     )
     sp_bias.add_argument(
         "--p_factor",
         type=float,
-        default=3.0,
-        help="Compression factor for powerlaw mode (default: 3.0; cube root). Use 2.0 for square root.",
+        default=2.0,
+        help="Compression factor for powerlaw mode (default: 2.0; square root). Use 3.0 for cube root.",
+    )
+    sp_bias.add_argument(
+        "--density_bedgraph",
+        default=None,
+        help=(
+            "Path to the density bedgraph produced by full-noise ({res}_density.bedgraph). "
+            "Required for bayesian mode. If omitted, auto-detected from --noise_dir."
+        ),
+    )
+    sp_bias.add_argument(
+        "--k_density",
+        type=float,
+        default=None,
+        help=(
+            "Half-saturation constant K for bayesian mode (contacts/bin). "
+            "Default: auto-computed as the median non-zero bin density from the density bedgraph."
+        ),
     )
 
     # ------------------------------------------------------------------ #
@@ -569,34 +573,25 @@ def main() -> None:
         help="Comma-separated list of chromosomes to process (default: all)",
     )
     sp_run.add_argument(
-        "--mode",
-        default="baseline",
-        choices=["baseline", "adaptive", "tanh", "powerlaw"],
-        help=(
-            "Normalization mode for bias vectors: baseline (default), adaptive, tanh, or powerlaw. "
-            "See bias-vectors --help for details."
-        ),
-    )
-    sp_run.add_argument(
         "--alpha",
         type=float,
         default=0.5,
-        help="Damping factor for adaptive mode, or scaling constant for powerlaw mode (default: 0.5)",
-    )
-    sp_run.add_argument(
-        "--scale_limit",
-        type=float,
-        default=0.3,
-        help=(
-            "Scale limit S for tanh mode: maximum absolute log10-bias allowed. "
-            "B_i is bounded to (10^-S, 10^S). Default: 0.3 → range ≈ (0.50, 2.00)"
-        ),
+        help="Scaling constant for powerlaw mode (default: 0.5)",
     )
     sp_run.add_argument(
         "--p_factor",
         type=float,
         default=3.0,
         help="Compression factor for powerlaw mode (default: 3.0; cube root). Use 2.0 for square root.",
+    )
+    sp_run.add_argument(
+        "--k_density",
+        type=float,
+        default=None,
+        help=(
+            "Half-saturation constant K for bayesian mode (contacts/bin). "
+            "Default: auto-computed as the median non-zero bin density."
+        ),
     )
 
     # ------------------------------------------------------------------ #
@@ -716,8 +711,10 @@ def main() -> None:
                 alpha=args.alpha,
                 scale_limit=args.scale_limit,
                 p_factor=args.p_factor,
+                density_bedgraph_path=args.density_bedgraph,
+                k_density=args.k_density,
             )
-            print(f"  → {os.path.join(args.out_dir, f'{res}.juicervector')}")
+            print(f"  → {os.path.join(args.out_dir, args.mode, f'{res}.juicervector')}")
 
         _profile_command("bias-vectors", run)
 
@@ -915,24 +912,26 @@ def main() -> None:
             res_sample_dir = os.path.join(sample_root, str(res))
             zmap_summary = os.path.join(res_sample_dir, "subsample_summary.tsv")
 
-            # Phase 3: Bias vectors (requires subsample_summary.tsv from Phase 1)
-            print(f"\n[Phase 3] Building bias vectors at {res} bp (mode={args.mode}) ...")
+            # Phase 3: Bias vectors — both modes always produced
+            print(f"\n[Phase 3] Building bias vectors at {res} bp ...")
             if not os.path.isfile(zmap_summary):
                 print(f"  [WARN] subsample_summary.tsv not found for res={res} — skipping bias vectors")
             else:
-                noise_to_weights.build_bias_vectors_from_bedgraphs(
-                    noise_dir=full_dir,
-                    res=res,
-                    out_dir=vectors_dir,
-                    zmap_summary_path=zmap_summary,
-                    chrom_sizes_path=args.chrom_sizes,
-                    nan_fill_value=nan_fill,
-                    mode=args.mode,
-                    alpha=args.alpha,
-                    scale_limit=args.scale_limit,
-                    p_factor=args.p_factor,
-                )
-                print(f"  → {os.path.join(vectors_dir, f'{res}.juicervector')}")
+                for mode in ("powerlaw", "bayesian"):
+                    noise_to_weights.build_bias_vectors_from_bedgraphs(
+                        noise_dir=full_dir,
+                        res=res,
+                        out_dir=vectors_dir,
+                        zmap_summary_path=zmap_summary,
+                        chrom_sizes_path=args.chrom_sizes,
+                        nan_fill_value=nan_fill,
+                        mode=mode,
+                        alpha=args.alpha,
+                        p_factor=args.p_factor,
+                        density_bedgraph_path=None,  # auto-detected from full_dir/{res}_density.bedgraph
+                        k_density=args.k_density,
+                    )
+                    print(f"  → {os.path.join(vectors_dir, mode, f'{res}.juicervector')}")
 
             # Phase 4: Blacklist (flags top 1% noise bins — more conservative than the
             # standalone ``blacklist`` command's default of top 5%)

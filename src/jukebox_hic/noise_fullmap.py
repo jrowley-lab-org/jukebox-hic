@@ -330,6 +330,7 @@ class _FullNoiseTask:
     bindist_bp: Optional[int]
     out_dir: str
     out_path: str
+    density_out_path: str
 
 
 def _full_noise_worker(task: _FullNoiseTask) -> Tuple[str, int, str, bool]:
@@ -366,11 +367,12 @@ def _full_noise_worker(task: _FullNoiseTask) -> Tuple[str, int, str, bool]:
     matrix = provider.fetch_chrom(task.chrom)
     if matrix is None or matrix.coo.nnz == 0:
         # No contacts for this chromosome — remove any stale output and signal failure.
-        if os.path.exists(task.out_path):
-            try:
-                os.remove(task.out_path)
-            except OSError:
-                pass
+        for stale in (task.out_path, task.density_out_path):
+            if os.path.exists(stale):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
         return task.chrom, task.res, task.out_path, False
 
     window_bp = task.bindist_bp or _default_bindist_bp(int(task.res))
@@ -386,6 +388,11 @@ def _full_noise_worker(task: _FullNoiseTask) -> Tuple[str, int, str, bool]:
     )
 
     _write_bedgraph(task.chrom, int(task.res), task.chrom_len, noise_vals, task.out_path)
+
+    # Per-bin row sum = total contacts touching bin i (local density for bayesian mode)
+    density_vals = np.asarray(matrix.csr.sum(axis=1)).ravel().astype(float)
+    _write_bedgraph(task.chrom, int(task.res), task.chrom_len, density_vals, task.density_out_path)
+
     return task.chrom, task.res, task.out_path, True
 
 
@@ -484,6 +491,7 @@ def compute_full_noise(
             chrom_sizes = {c: chrom_sizes[c] for c in chroms if c in chrom_sizes}
         for chrom, chrom_len in chrom_sizes.items():
             out_path = os.path.join(out_dir, f"{chrom}_{res}.bedgraph")
+            density_out_path = os.path.join(out_dir, f"{chrom}_{res}_density.bedgraph")
             tasks.append(
                 _FullNoiseTask(
                     hic_path=hic_path,
@@ -495,6 +503,7 @@ def compute_full_noise(
                     bindist_bp=bindist_bp,
                     out_dir=out_dir,
                     out_path=out_path,
+                    density_out_path=density_out_path,
                 )
             )
         del provider  # release file handle before forking worker processes
@@ -502,11 +511,12 @@ def compute_full_noise(
     # --- Remove stale output files from previous runs ---
     # This ensures the concatenation step only sees freshly-generated files.
     for task in tasks:
-        if os.path.exists(task.out_path):
-            try:
-                os.remove(task.out_path)
-            except OSError:
-                pass
+        for stale in (task.out_path, task.density_out_path):
+            if os.path.exists(stale):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
 
     results: List[Tuple[str, int, str, bool]] = []
     errors: List[Tuple[_FullNoiseTask, Exception, Exception]] = []
@@ -598,6 +608,32 @@ def compute_full_noise(
                     continue
                 with open(path, "rb") as part:
                     merged_handle.write(part.read())
+
+    # --- Concatenate per-chromosome density files into one per-resolution density bedgraph ---
+    per_res_density: Dict[int, List[str]] = {}
+    for chrom, res_val, _, generated in results:
+        if not generated:
+            continue
+        dp = os.path.join(out_dir, f"{chrom}_{res_val}_density.bedgraph")
+        if os.path.exists(dp):
+            per_res_density.setdefault(res_val, []).append(dp)
+
+    for res_raw in res_list:
+        res_val = int(res_raw)
+        merged_density = os.path.join(out_dir, f"{res_val}_density.bedgraph")
+        if os.path.exists(merged_density):
+            try:
+                os.remove(merged_density)
+            except OSError:
+                pass
+        dpaths = sorted(per_res_density.get(res_val, []))
+        if not dpaths:
+            continue
+        with open(merged_density, "wb") as mh:
+            for dp in dpaths:
+                if os.path.exists(dp):
+                    with open(dp, "rb") as part:
+                        mh.write(part.read())
 
     # --- Report failures ---
     if errors:

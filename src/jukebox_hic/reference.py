@@ -35,7 +35,7 @@ Module contents
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
@@ -485,6 +485,64 @@ def process_normalization_vectors_powerlaw(
     residual = log_N - float(pred_log_N)
     compressed = np.sign(residual) * np.power(np.abs(residual), 1.0 / float(p)) * float(alpha)
     bias_vector = np.power(10.0, compressed)
+    bias_vector[is_nan] = np.nan
+
+    return bias_vector
+
+
+def process_normalization_vectors_bayesian(
+    noise_track: np.ndarray,
+    pred_log_N: float,
+    ebr: float,
+    density_track: np.ndarray,
+    k_density: Optional[float] = None,
+) -> np.ndarray:
+    """
+    JUKEBOX-BAYESIAN normalization.
+
+    Evidence-weighted Bayesian shrinkage: bins with low local contact density
+    receive less correction (shrink toward B_i = 1.0).
+
+    Math
+    ----
+    ρ_i  = per-bin contact density (row sum of the contact matrix)
+    K    = half-saturation constant (default: median non-zero density across all bins)
+    ε_i  = log10(N_i) − pred_log_N
+    w_i  = ρ_i / (ρ_i + K)
+    B_i  = 10 ^ (w_i · 0.5 · ε_i)
+
+    When ρ_i >> K: w_i → 1.0 → full baseline correction.
+    When ρ_i = K:  w_i = 0.5 → half correction.
+    When ρ_i → 0:  w_i → 0.0 → B_i = 1.0 (no correction; sparse bin shrinks to identity).
+
+    Parameters
+    ----------
+    noise_track   : per-bin raw noise values (may contain NaN/Inf)
+    pred_log_N    : predicted log10 noise from compute_zmap()
+    ebr           : mean empty bin ratio (Gaussian sigma offset)
+    density_track : per-bin contact density (row sums written by noise_fullmap)
+    k_density     : half-saturation constant K; if None, auto-set to the median
+                    of all non-zero density values in density_track
+
+    Returns
+    -------
+    bias_vector : same shape as noise_track; NaN where original was NaN/Inf
+    """
+    is_nan, log_N, _ = _preprocess_noise_track(noise_track, ebr)
+
+    residual = log_N - float(pred_log_N)
+
+    rho = np.clip(density_track.astype(float), 0.0, None)
+
+    if k_density is None or not np.isfinite(k_density) or k_density <= 0:
+        finite_rho = rho[np.isfinite(rho) & (rho > 0)]
+        k = float(np.median(finite_rho)) if finite_rho.size > 0 else 1.0
+    else:
+        k = float(k_density)
+
+    weight = rho / (rho + k)
+    log_bias = weight * 0.5 * residual
+    bias_vector = np.power(10.0, log_bias)
     bias_vector[is_nan] = np.nan
 
     return bias_vector

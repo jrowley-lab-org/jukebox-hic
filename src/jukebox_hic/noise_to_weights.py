@@ -435,7 +435,37 @@ def _write_juicer_vector_block(
             handle.write(f"{val}\n")
 
 
-_VALID_MODES = ("baseline", "adaptive", "tanh", "powerlaw")
+_VALID_MODES = ("powerlaw", "bayesian")
+
+
+def _resolve_density_bedgraph_path(noise_dir: str, res: int) -> str:
+    """
+    Find the merged density bedgraph for a given resolution in a directory.
+
+    ``noise_fullmap`` writes ``{chrom}_{res}_density.bedgraph`` per chromosome and
+    concatenates them into ``{res}_density.bedgraph`` in the same output directory.
+    This function resolves the merged file using the same extension variants as
+    ``_resolve_bedgraph_path``.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no matching density bedgraph is found.
+    """
+    if not os.path.isdir(noise_dir):
+        raise FileNotFoundError(f"Not a directory: {noise_dir}")
+    candidates = [
+        os.path.join(noise_dir, f"{res}_density.bedgraph"),
+        os.path.join(noise_dir, f"{res}_density.bedGraph"),
+        os.path.join(noise_dir, f"{res}_density.bg"),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError(
+        f"Could not locate density bedGraph for resolution {res} in {noise_dir}. "
+        "Run full-noise first to generate the density track."
+    )
 
 
 def build_bias_vectors_from_bedgraphs(
@@ -446,10 +476,11 @@ def build_bias_vectors_from_bedgraphs(
     chrom_sizes_path: Optional[str] = None,
     nan_fill_value: float = float("nan"),
     skip_decoys: bool = True,
-    mode: str = "baseline",
-    alpha: float = 0.7,
-    scale_limit: float = 0.3,
+    mode: str = "powerlaw",
+    alpha: float = 0.5,
     p_factor: float = 3.0,
+    density_bedgraph_path: Optional[str] = None,
+    k_density: Optional[float] = None,
 ) -> None:
     """
     Transform a full-noise bedGraph into a Juicer-format normalization vector file.
@@ -503,17 +534,19 @@ def build_bias_vectors_from_bedgraphs(
     chrom_sizes = _load_chrom_sizes(chrom_sizes_path)
     zmap_data = _load_zmap_summary(zmap_summary_path)
 
-    if mode == "baseline":
-        vector_name = "JUKEBOX-BASELINE"
-    elif mode == "adaptive":
-        vector_name = "JUKEBOX-ADAPTIVE"
-    elif mode == "tanh":
-        vector_name = "JUKEBOX-TANH"
-    else:
-        vector_name = "JUKEBOX-POWERLAW"
+    density_df: Optional[pd.DataFrame] = None
+    if mode == "bayesian":
+        resolved_density = density_bedgraph_path or _resolve_density_bedgraph_path(noise_dir, res)
+        density_df = _load_bedgraph(resolved_density)
 
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{res}.juicervector")
+    if mode == "powerlaw":
+        vector_name = "JUKEBOX-POWERLAW"
+    else:
+        vector_name = "JUKEBOX-BAYESIAN"
+
+    mode_dir = os.path.join(out_dir, mode)
+    os.makedirs(mode_dir, exist_ok=True)
+    out_path = os.path.join(mode_dir, f"{res}.juicervector")
 
     with open(out_path, "w") as out_handle:
         for chrom, group in noise_df.groupby("chrom", sort=True):
@@ -539,21 +572,22 @@ def build_bias_vectors_from_bedgraphs(
                 print(f"[WARN] {chrom}: pred_log_N missing from zmap_summary — skipping")
                 continue
 
-            if mode == "baseline":
-                bias_vector = reference.process_normalization_vectors_baseline(
-                    noise_track, pred_log_N, ebr
-                )
-            elif mode == "adaptive":
-                bias_vector = reference.process_normalization_vectors_adaptive(
-                    noise_track, pred_log_N, ebr, alpha
-                )
-            elif mode == "tanh":
-                bias_vector = reference.process_normalization_vectors_tanh(
-                    noise_track, pred_log_N, ebr, scale_limit
-                )
-            else:  # powerlaw
+            if mode == "powerlaw":
                 bias_vector = reference.process_normalization_vectors_powerlaw(
                     noise_track, pred_log_N, ebr, p_factor, alpha
+                )
+            else:  # bayesian
+                density_group = density_df[density_df["chrom"] == chrom].copy()
+                density_track = (
+                    group.merge(
+                        density_group[["start", "value"]].rename(columns={"value": "density"}),
+                        on="start",
+                        how="left",
+                    )["density"]
+                    .to_numpy(dtype=float)
+                )
+                bias_vector = reference.process_normalization_vectors_bayesian(
+                    noise_track, pred_log_N, ebr, density_track, k_density
                 )
 
             _write_juicer_vector_block(
