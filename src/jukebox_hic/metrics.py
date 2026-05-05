@@ -130,3 +130,55 @@ def collect_memory_usage_mb() -> Tuple[float, float]:
     are not available.
     """
     return _process_rss_mb(), _ru_maxrss_mb()
+
+
+def set_address_space_limit(limit_bytes: int) -> bool:
+    """
+    Set a hard virtual-address-space cap for this process (Linux/macOS only).
+
+    Uses ``resource.setrlimit(RLIMIT_AS, ...)``. When the limit is exceeded, the
+    next allocation raises ``MemoryError`` rather than crashing the process silently.
+    This allows the caller to catch and handle the condition gracefully.
+
+    Returns True if the limit was applied, False if unsupported (Windows) or if
+    setting failed (e.g. the requested limit exceeds the system hard limit).
+    """
+    if resource is None:
+        return False
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+        return True
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def estimate_worker_memory_mb(
+    dump_factor: float,
+    noise_bins: int,
+    density_estimate: float = 0.05,
+) -> float:
+    """
+    Estimate peak per-worker memory for one ``noise_fullmap`` band fetch (MB).
+
+    The padded fetch window covers ``dump_factor * noise_bins + 2 * noise_bins``
+    bins on each side, giving a square submatrix of that size.  For a sparse COO
+    matrix at the given density, each non-zero element occupies 24 bytes (int32
+    row, int32 col, float64 data).  The 0.05 default (5 % density) is appropriate
+    for typical Hi-C; use 0.3 or higher for deeply-sequenced samples.
+
+    Parameters
+    ----------
+    dump_factor : float
+        The dump_factor passed to ``compute_full_noise()`` (default 10.0).
+    noise_bins : int
+        Number of bins in the noise window (= ``window_bp // resolution``).
+    density_estimate : float
+        Fraction of the submatrix that is non-zero (default 0.05).
+
+    Returns
+    -------
+    float
+        Estimated peak memory in megabytes for one worker process.
+    """
+    fetch_bins = int(dump_factor * noise_bins) + 2 * noise_bins
+    return (fetch_bins ** 2) * density_estimate * 24 / 1e6

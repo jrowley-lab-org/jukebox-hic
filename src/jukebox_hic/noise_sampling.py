@@ -352,6 +352,8 @@ def compute_sampled_noise(
     seed: Optional[int] = None,
     profile_path: Optional[str] = None,
     chroms: Optional[List[str]] = None,
+    chunk_rows: Optional[int] = None,
+    precomputed_contacts: Optional[Dict[str, float]] = None,
 ) -> None:
     """
     Sample a subset of rows, compute noise metrics, and optionally profile usage.
@@ -417,6 +419,20 @@ def compute_sampled_noise(
         at this path (columns: chrom, resolution, elapsed_s, peak_rss_mb, ...).
     chroms : list of str or None
         If provided, restrict analysis to these chromosome names.
+    chunk_rows : int or None
+        When set, each chromosome is processed in genomic bands of this many rows
+        rather than loading the entire chromosome matrix at once.  Each band fetches
+        a square submatrix ``[band_start − bindist_bins, band_end + bindist_bins]``
+        so that every row in the band has its full contact window available.
+        The distance-decay expected curve is recomputed from the local band matrix,
+        which introduces a small per-band approximation but avoids ever holding the
+        full chromosome matrix in memory.  Recommended value: 2000–5000 rows.
+        ``None`` (default) preserves the original full-chromosome load behaviour.
+    precomputed_contacts : dict or None
+        Pre-computed total contact counts per chromosome (chromosome → float).
+        When provided, the full-matrix load that was previously needed solely to call
+        ``total_contacts()`` is skipped entirely, even in full-load mode.  The CLI
+        automatically passes the contacts dict produced by ``_dump_contacts_once()``.
     """
 
     provider, backend = select_provider(hic_path, int(res), norm, cooler_selection)
@@ -462,16 +478,48 @@ def compute_sampled_noise(
         start_ru_peak = ru_peak_so_far
         chrom_start_time = time.perf_counter()
 
-        matrices = provider.fetch_chrom(chrom)
-        if matrices is None or matrices.coo.nnz == 0:
-            continue
-        chrom_bp_sizes[chrom] = chrom_len
-        chrom_contacts = total_contacts(matrices)
+        n_bins = (chrom_len + int(res) - 1) // int(res)
+
+        # --- Load matrix / get contact count ---
+        # precomputed_contacts avoids a redundant full-matrix load when the caller
+        # (CLI) has already counted contacts at a coarser resolution.
+        matrices: Optional[ChromMatrix] = None
+        if precomputed_contacts is not None and chrom in precomputed_contacts:
+            chrom_contacts = float(precomputed_contacts[chrom])
+            if chrom_contacts <= 0:
+                continue
+            chrom_bp_sizes[chrom] = chrom_len
+            if chunk_rows is None:
+                # Full-matrix mode needs the matrix for row iteration even when
+                # contact count was precomputed at a coarser resolution.
+                matrices = provider.fetch_chrom(chrom)
+                if matrices is None or matrices.coo.nnz == 0:
+                    continue
+        else:
+            # Full matrix needed: either for row iteration (chunk_rows is None)
+            # or just for contact counting (chunk_rows set, no precomputed value).
+            matrices = provider.fetch_chrom(chrom)
+            if matrices is None or matrices.coo.nnz == 0:
+                continue
+            chrom_bp_sizes[chrom] = chrom_len
+            chrom_contacts = total_contacts(matrices)
+            if chunk_rows is not None:
+                # Discard immediately after counting; bands will be fetched below.
+                del matrices
+                matrices = None
+
         contacts_by_chrom[chrom] = chrom_contacts
 
-        expected_lookup, default_expected = _precompute_expectation(matrices.coo)
-
-        rowbins = matrices.coo.shape[0]
+        # --- Set up expected lookup ---
+        if matrices is not None:
+            # Full matrix path: compute expected curve once from the whole chromosome.
+            expected_lookup, default_expected = _precompute_expectation(matrices.coo)
+            rowbins = matrices.coo.shape[0]
+        else:
+            # Band path: expected_lookup computed per-band inside the row loop.
+            expected_lookup = np.zeros(1, dtype=float)
+            default_expected = 0.0
+            rowbins = n_bins
         # Skip the first and last ``bindist_bins`` rows: these edge bins have fewer
         # than ``bindist_bins`` neighbours on one side, making their window incomplete
         # and the noise estimate unreliable.
@@ -511,14 +559,62 @@ def compute_sampled_noise(
             for ratio in ratios
         }
 
+        # In band mode, sort rows ascending so each band is fetched exactly once.
+        # This changes iteration order but not the statistical properties of the sample.
+        if chunk_rows is not None:
+            row_order = np.sort(row_order)
+
+        # Band state — only active when chunk_rows is not None.
+        _band_matrix: Optional[ChromMatrix] = None
+        _band_start_idx: int = -1        # core start row of the currently-loaded band
+        _band_fetch_start_bin: int = 0   # first bin of the padded fetch window
+        _band_expected_lookup: np.ndarray = expected_lookup
+        _band_default_expected: float = default_expected
+
         for row_idx in row_order:
-            observed_vec, expected_vec = _row_window_vectors(
-                matrices,
-                row_idx=row_idx,
-                bindist_bins=bindist_bins,
-                expected_lookup=expected_lookup,
-                default_expected=default_expected,
-            )
+            # --- Band fetch dispatch (chunk_rows mode) ---
+            if chunk_rows is not None:
+                current_band_start = start_idx + (
+                    (int(row_idx) - start_idx) // chunk_rows
+                ) * chunk_rows
+                if current_band_start != _band_start_idx:
+                    band_end = min(stop_idx, current_band_start + chunk_rows)
+                    fetch_start_bin = max(0, current_band_start - bindist_bins)
+                    fetch_end_bin = min(n_bins, band_end + bindist_bins)
+                    _band_matrix = provider.fetch_region(
+                        chrom, fetch_start_bin * int(res), fetch_end_bin * int(res)
+                    )
+                    if _band_matrix is not None and _band_matrix.coo.nnz > 0:
+                        _band_expected_lookup, _band_default_expected = (
+                            _precompute_expectation(_band_matrix.coo)
+                        )
+                    else:
+                        _band_expected_lookup = np.zeros(1, dtype=float)
+                        _band_default_expected = 0.0
+                    _band_fetch_start_bin = fetch_start_bin
+                    _band_start_idx = current_band_start
+
+                if _band_matrix is None or _band_matrix.coo.nnz == 0:
+                    if sample_all:
+                        chrom_bed.append((row_idx, float("nan")))
+                    failed_rows += 1
+                    continue
+
+                observed_vec, expected_vec = _row_window_vectors(
+                    _band_matrix,
+                    row_idx=int(row_idx) - _band_fetch_start_bin,
+                    bindist_bins=bindist_bins,
+                    expected_lookup=_band_expected_lookup,
+                    default_expected=_band_default_expected,
+                )
+            else:
+                observed_vec, expected_vec = _row_window_vectors(
+                    matrices,
+                    row_idx=row_idx,
+                    bindist_bins=bindist_bins,
+                    expected_lookup=expected_lookup,
+                    default_expected=default_expected,
+                )
 
             # --- Quality filter: skip rows that are too sparse or too weak ---
             # mean_score < min_mean_score: the row's average observed/expected ratio
@@ -619,18 +715,20 @@ def compute_sampled_noise(
                 "mean_empty_bin_ratio": mean_ebr,
                 # estimated_contacts at this ratio = actual contacts * downsampling ratio
                 "estimated_contacts": float(chrom_contacts * float(ratio)),
-                # Placeholder columns filled in below by compute_zmap / sequencing_advisor
+                # Placeholder columns filled in below by compute_noise_model / sequencing_advisor
                 "z_map": float("nan"),
                 "gamma": float("nan"),
                 "pred_log_N": float("nan"),
-                "residual": float("nan"),
+                "pred_log_N_upper": float("nan"),
+                "pred_log_N_lower": float("nan"),
+                "epsilon": float("nan"),
+                "quality_status": "",
                 "advisor_target_density": float("nan"),
                 "advisor_fold_increase": float("nan"),
-                "advisor_efficiency_index": float("nan"),
                 "advisor_recommendation": "",
             }
-            # Only compute z-map and advisor for the full-depth (ratio == 1.0) run,
-            # since the reference model is calibrated against unsubsampled data.
+            # Only compute model metrics and advisor for the full-depth (ratio == 1.0)
+            # run, since the reference model is calibrated against unsubsampled data.
             if (
                 ratio == 1.0
                 and np.isfinite(median_noise)
@@ -641,33 +739,39 @@ def compute_sampled_noise(
                 c_len = chrom_bp_sizes.get(chrom, 0)
                 if c_len > 0:
                     try:
-                        zmap_result = reference.compute_zmap(
+                        model_result = reference.compute_noise_model(
                             contacts=chrom_contacts,
                             chrom_len=c_len,
                             resolution=int(res),
+                            window_bp=window,
                             median_noise=median_noise,
                             ebr=mean_ebr,
                         )
-                        record["z_map"] = zmap_result["z_map"]
-                        record["gamma"] = zmap_result["gamma"]
-                        record["pred_log_N"] = zmap_result["pred_log_N"]
-                        record["residual"] = zmap_result["residual"]
+                        record["z_map"]            = model_result["z_map"]
+                        record["gamma"]            = model_result["gamma"]
+                        record["pred_log_N"]       = model_result["pred_log_N"]
+                        record["pred_log_N_upper"] = model_result["pred_log_N_upper"]
+                        record["pred_log_N_lower"] = model_result["pred_log_N_lower"]
+                        record["epsilon"]          = model_result["epsilon"]
+                        record["quality_status"]   = model_result["quality_status"]
 
-                        # current_rho = contacts per bin = sequencing density at this chrom
-                        current_rho = chrom_contacts / (c_len / int(res))
+                        # current_rho_win = effective matrix coverage for this chrom
+                        current_rho_win = chrom_contacts / (
+                            (c_len / int(res)) * (window / int(res))
+                        )
                         advisor_result = reference.sequencing_advisor(
                             obs_noise=median_noise,
-                            current_rho=current_rho,
+                            current_rho_win=current_rho_win,
                             ebr=mean_ebr,
+                            window_bp=window,
                         )
                         record["advisor_target_density"] = advisor_result["target_density"]
-                        record["advisor_fold_increase"] = advisor_result["fold_increase"]
-                        record["advisor_efficiency_index"] = advisor_result["efficiency_index"]
+                        record["advisor_fold_increase"]  = advisor_result["fold_increase"]
                         record["advisor_recommendation"] = advisor_result["recommendation"]
                     except Exception:
                         # Expected failure modes: chromosome too sparse for a meaningful
-                        # zmap (e.g. very short or unplaced chromosomes with near-zero
-                        # contacts). Leave the fields as NaN silently.
+                        # model evaluation (e.g. very short or unplaced chromosomes with
+                        # near-zero contacts). Leave the fields as NaN silently.
                         pass
             summary_records.append(record)
 
@@ -717,9 +821,12 @@ def compute_sampled_noise(
             # Header comment lines encode metadata parsed by downstream tools:
             # - "# resolution=N" is read by the sequencing-advisor CLI to determine
             #   which resolution the summary applies to.
+            # - "# window_bp=N" is read by the sequencing-advisor CLI to compute
+            #   ρ_win (effective matrix coverage), which requires window size.
             # - "# chrom_info" lines provide chromosome sizes (not stored in the TSV
             #   body) so the advisor can compute contacts-per-bin (rho).
             handle.write(f"# resolution={int(res)}\n")
+            handle.write(f"# window_bp={int(window)}\n")
             for chrom in sorted(contacts_by_chrom):
                 handle.write(
                     f"# chrom_info\t{chrom}\tcontacts={contacts_by_chrom[chrom]:.6f}\t"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Universal 4DN Reference Equation constants and adaptive bias vector logic.
+JUKEBOX Hybrid Spline Noise Model — reference constants and model functions.
 
 This module implements the statistical reference model used to assess Hi-C data
 quality relative to the 4D Nucleome (4DN) consortium's benchmarking standards.
@@ -11,23 +11,29 @@ The 4DN consortium established empirical relationships between sequencing depth,
 genomic bin size, and expected Hi-C noise levels by profiling many Hi-C experiments.
 The key insight is that noise (measured as the lag-1 autocovariance metric from
 ``noise_sampling``) is predictable from:
-- **Sequencing density** (ρ = total contacts / number of bins): more reads → less noise.
+- **Effective Matrix Coverage** (ρ_win): contacts per bin-pair within the analysis
+  window, incorporating both sequencing depth and window size into one variable.
 - **Empty bin ratio** (EBR): the fraction of diagonal-adjacent bins with zero contacts.
   Higher EBR → sparser data → higher noise.
+- **Depth-sparsity interaction** (ρ_win × EBR): captures how sparsity effects scale
+  with coverage.
 
-The reference model is a linear equation in log space:
-    log10(N_predicted) = BETA_0 + BETA_1 * log10(ρ) + BETA_2 * EBR
+The reference model is a cubic B-spline in log(ρ_win)-space plus an EBR term and
+an interaction term:
 
-where N is the noise value. The residual between observed and predicted log-noise
-is the "z-map" score — a measure of how many standard deviations a sample's noise
-deviates from the 4DN reference.
+    log10(N_pred) = β0 + Σ(j=0..7) βj·sj(Lρ) + β_EBR·EBR + β_inter·(Lρ·EBR)
+
+where Lρ = log10(ρ_win) and sj are B-spline basis functions (degree=3, 5 knots).
+Three coefficient sets are hardcoded: OLS mean (central baseline), q=0.75 upper
+envelope, and q=0.25 lower envelope — used for quality gating.
 
 Module contents
 ---------------
-- ``compute_zmap()``                        — compute z-map quality score
+- ``compute_noise_model()``                 — compute spline-based quality metrics
+- ``compute_zmap()``                        — deprecated wrapper around compute_noise_model
 - ``sequencing_advisor()``                  — predict depth needed to reach target quality
+- ``_build_design_matrix()``               — build 11-feature design vector for one sample
 - ``_preprocess_noise_track()``             — shared noise preprocessing (smooth, log)
-- ``process_normalization_vectors_baseline()`` — JUKEBOX-BASELINE bias vector
 - ``process_normalization_vectors_adaptive()`` — JUKEBOX-ADAPTIVE bias vector
 - ``process_normalization_vectors()``       — legacy gamma-based bias vector (deprecated)
 - ``generate_blacklist()``                  — identify noisy/invalid bins
@@ -38,31 +44,213 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 import numpy as np
+from scipy.interpolate import BSpline
 from scipy.ndimage import gaussian_filter1d
+from scipy.optimize import brentq
 
 # ---------------------------------------------------------------------------
-# 4DN Universal Reference Model Constants
+# JUKEBOX Hybrid Spline Model Constants
 # ---------------------------------------------------------------------------
-# These constants parameterise the 3-term linear model that predicts log10(noise)
-# from sequencing density (log10(ρ)) and empty bin ratio (EBR):
+# Cubic B-spline (degree=3) with 5 interior knots over log10(ρ_win) space.
+# Augmented knot vector: [L_MIN]*4 + interior_knots + [L_MAX]*4 → 13 knots,
+# 9 basis functions total. The first basis is dropped per patsy bs() convention,
+# leaving 8 functions (s0…s7) in the design matrix.
 #
-#   log10(N_pred) = BETA_0 + BETA_1 * log10(ρ) + BETA_2 * EBR
+# Three coefficient arrays of length 11 each:
+#   [intercept, s0, s1, s2, s3, s4, s5, s6, s7, EBR, Lρ·EBR]
 #
-# BETA_0 : float — model intercept (log10-noise when ρ=1 and EBR=0)
-# BETA_1 : float — coefficient for log10(ρ). Negative because deeper sequencing
-#                  reduces noise (more contacts → smoother distance-decay patterns).
-# BETA_2 : float — coefficient for EBR. Positive because sparser data (higher EBR)
-#                  is noisier.
-# SIGMA_REF : float — standard deviation of residuals in the 4DN reference dataset.
-#                     Used to convert residuals into z-scores (z = residual / SIGMA_REF).
-#                     A value of 0.15 corresponds to ~15% variation in log10-noise
-#                     around the predicted value across the 4DN training samples.
-#
-# Source: These constants were calibrated against the 4DN Total Samples benchmark.
-BETA_0 = 1.1713
-BETA_1 = -0.0584
-BETA_2 = 1.9838
-SIGMA_REF = 0.15  # Proxy for universal residual spread
+# Source: calibrated against the 4DN Gold Standard database via OLS (mean) and
+# quantile regression (upper=q=0.75, lower=q=0.25).
+_INTERIOR_KNOTS: np.ndarray = np.array([-0.705123, 0.259331, 1.042659, 1.782153, 2.886834])
+_L_MIN: float = -4.051144
+_L_MAX: float = 5.374635
+_DEGREE: int = 3
+
+_BETA_MEAN: np.ndarray = np.array([
+    -8.908941,   # intercept
+     5.209811,   # s0
+     5.866539,   # s1
+     9.138779,   # s2
+    10.189710,   # s3
+     9.792181,   # s4
+    10.133563,   # s5
+    10.204176,   # s6
+    10.199352,   # s7
+     3.057336,   # EBR
+    -2.047100,   # Lρ·EBR (interaction)
+])
+
+_BETA_UPPER: np.ndarray = np.array([
+    -10.700096,  # intercept
+      6.684422,  # s0
+      6.519458,  # s1
+     10.852507,  # s2
+     12.107708,  # s3
+     11.714808,  # s4
+     12.167096,  # s5
+     12.170927,  # s6
+     12.210863,  # s7
+      3.565983,  # EBR
+     -2.338288,  # Lρ·EBR (interaction)
+])
+
+_BETA_LOWER: np.ndarray = np.array([
+    -9.544795,   # intercept
+     7.090679,   # s0
+     7.139118,   # s1
+     9.895400,   # s2
+    10.650998,   # s3
+    10.211015,   # s4
+    10.424150,   # s5
+    10.656722,   # s6
+    10.592492,   # s7
+     2.558768,   # EBR
+    -1.847717,   # Lρ·EBR (interaction)
+])
+
+# Pre-computed augmented knot vector and basis count (module-level, computed once)
+_KNOTS_AUG: np.ndarray = np.concatenate([
+    np.full(_DEGREE + 1, _L_MIN),
+    _INTERIOR_KNOTS,
+    np.full(_DEGREE + 1, _L_MAX),
+])
+_N_BASIS_TOTAL: int = len(_KNOTS_AUG) - _DEGREE - 1  # = 9
+
+
+def _build_design_matrix(L_rho: float, ebr: float) -> np.ndarray:
+    """
+    Build the 11-element design vector for one (L_rho, EBR) observation.
+
+    Design vector layout:
+        [intercept, s0, s1, s2, s3, s4, s5, s6, s7, EBR, L_rho·EBR]
+
+    The 8 spline basis values (s0…s7) are derived from a degree-3 B-spline with
+    5 interior knots over [L_MIN, L_MAX]. The augmented knot vector produces 9
+    basis functions; the first is dropped per the patsy ``bs(include_intercept=False)``
+    convention, leaving 8 that are included in the design.
+
+    L_rho is clipped to [L_MIN, L_MAX] before evaluation so extrapolation is
+    handled by clamping rather than by scipy's NaN-extrapolation default.
+
+    Parameters
+    ----------
+    L_rho : float
+        log10(ρ_win) for this chromosome sample.
+    ebr : float
+        Mean empty bin ratio.
+
+    Returns
+    -------
+    np.ndarray of shape (11,)
+    """
+    L = float(np.clip(L_rho, _L_MIN, _L_MAX))
+    identity = np.eye(_N_BASIS_TOTAL)
+    raw = np.array(
+        [BSpline(_KNOTS_AUG, identity[i], _DEGREE)(L) for i in range(_N_BASIS_TOTAL)],
+        dtype=float,
+    )
+    raw = np.nan_to_num(raw, nan=0.0)
+    s = raw[1:]  # drop first basis → s0…s7 (8 values)
+    return np.array([1.0, *s, float(ebr), L * float(ebr)])
+
+
+def compute_noise_model(
+    contacts: float,
+    chrom_len: int,
+    resolution: int,
+    window_bp: int,
+    median_noise: float,
+    ebr: float,
+) -> Dict[str, object]:
+    """
+    Evaluate the JUKEBOX hybrid spline noise model for one chromosome sample.
+
+    Computes predicted noise (central, upper envelope, lower envelope), quality
+    gating status, and the envelope-normalised z-map score.
+
+    The Effective Matrix Coverage:
+        ρ_win = contacts / ((chrom_len/res) × (window_bp/res))
+
+    incorporates both sequencing depth and window size so that the same contacts
+    at different resolutions produce the same ρ_win value.
+
+    Quality gating uses the quantile-regression envelopes:
+        y_up = max(X·β_upper, X·β_lower)   [ceiling — high noise boundary]
+        y_lo = min(X·β_upper, X·β_lower)   [floor   — masking boundary]
+        Pass        → y_lo ≤ log10(N_obs) ≤ y_up
+        Fail_High   → log10(N_obs) > y_up
+        Fail_Masked → log10(N_obs) < y_lo
+
+    The z-map is envelope-normalised:
+        z_map = ε / half_envelope   where ε = log10(N_obs) − X·β_mean
+        gamma = 1.0 + max(0, z_map) × 0.5
+
+    Parameters
+    ----------
+    contacts    : total contact pairs for this chromosome at this resolution
+    chrom_len   : chromosome length in bp
+    resolution  : bin size in bp
+    window_bp   : half-window size used during noise sampling (in bp)
+    median_noise: observed median noise value from the sampling phase
+    ebr         : mean empty bin ratio from the sampling phase
+
+    Returns
+    -------
+    dict with keys:
+        pred_log_N       — X·β_mean (central prediction)
+        pred_log_N_upper — y_up (upper envelope boundary)
+        pred_log_N_lower — y_lo (lower envelope boundary)
+        epsilon          — log10(N_obs) − pred_log_N (raw residual)
+        z_map            — ε / half_envelope (envelope-normalised score)
+        gamma            — 1.0 + max(0, z_map) × 0.5 (bias-vector penalty)
+        quality_status   — "Pass", "Fail_High", or "Fail_Masked"
+        obs_log_N        — log10(median_noise)
+        rho_win          — computed effective matrix coverage
+    """
+    rho_win = float(contacts) / ((float(chrom_len) / resolution) * (float(window_bp) / resolution))
+    L_rho = float(np.log10(max(rho_win, 1e-300)))
+
+    X = _build_design_matrix(L_rho, ebr)
+
+    pred_mean  = float(X @ _BETA_MEAN)
+    pred_upper = float(X @ _BETA_UPPER)
+    pred_lower = float(X @ _BETA_LOWER)
+
+    # Clipped envelopes: safe against quantile cross-over at extreme L_rho values
+    y_up = max(pred_upper, pred_lower)
+    y_lo = min(pred_upper, pred_lower)
+
+    obs_log_N = float(np.log10(max(float(median_noise), 1e-300)))
+    epsilon = obs_log_N - pred_mean
+
+    half_envelope = (y_up - y_lo) / 2.0
+    z_map = epsilon / half_envelope if half_envelope > 0.0 else 0.0
+    gamma = 1.0 + max(0.0, z_map) * 0.5
+
+    if obs_log_N > y_up:
+        quality_status = "Fail_High"
+    elif obs_log_N < y_lo:
+        quality_status = "Fail_Masked"
+    else:
+        quality_status = "Pass"
+
+    if z_map > 2.0:
+        print(
+            f"[WARN] z_map={z_map:.3f} > 2.0: high stochastic noise detected "
+            f"(quality_status={quality_status}, gamma={gamma:.3f})"
+        )
+
+    return {
+        "pred_log_N":       pred_mean,
+        "pred_log_N_upper": y_up,
+        "pred_log_N_lower": y_lo,
+        "epsilon":          epsilon,
+        "z_map":            z_map,
+        "gamma":            gamma,
+        "quality_status":   quality_status,
+        "obs_log_N":        obs_log_N,
+        "rho_win":          rho_win,
+    }
 
 
 def compute_zmap(
@@ -73,144 +261,137 @@ def compute_zmap(
     ebr: float,
 ) -> Dict[str, float]:
     """
-    Calculate the Map Quality Z-score against the 4DN universal reference.
+    Compute z-map quality score (deprecated wrapper).
 
-    The z-map score answers: "Given this chromosome's sequencing density and empty bin
-    ratio, how noisy is it relative to what the 4DN reference model predicts?"
+    .. deprecated::
+        Use ``compute_noise_model()`` instead. This wrapper calls ``compute_noise_model``
+        with a resolution-derived default window and returns a subset of its output
+        for backwards compatibility with callers that relied on the old 3-term linear
+        model interface.
 
-    A z-map near 0.0 means the sample matches the reference quality. Positive z-map
-    values indicate higher-than-expected noise (worse quality); negative values indicate
-    lower-than-expected noise (better than reference).
-
-    The gamma value is a multiplicative penalty that scales up for samples with
-    high z-map scores (noisy data gets stronger correction in the bias vector step):
-        gamma = 1.0 + max(0.0, z_map) * 0.5
-
-    For example:
-    - z_map = 0.0 → gamma = 1.0  (no penalty; data matches reference)
-    - z_map = 2.0 → gamma = 2.0  (double-strength correction for noisy data)
-    - z_map = -1.0 → gamma = 1.0 (no penalty even for better-than-reference data)
+        Note: the ``residual`` key is no longer returned; it is superseded by
+        ``epsilon`` in ``compute_noise_model()``.
 
     Parameters
     ----------
-    contacts    : total contact pairs for this chromosome
-    chrom_len   : chromosome length in bp
-    resolution  : bin size in bp
-    median_noise: observed median noise value from the sampling phase
-    ebr         : mean empty bin ratio from the sampling phase
+    contacts     : total contact pairs for this chromosome
+    chrom_len    : chromosome length in bp
+    resolution   : bin size in bp
+    median_noise : observed median noise value from the sampling phase
+    ebr          : mean empty bin ratio from the sampling phase
 
     Returns
     -------
-    dict with keys: z_map, gamma, pred_log_N, obs_log_N, residual
-
-    Logs a warning if z_map > 2.0.
+    dict with keys: z_map, gamma, pred_log_N, obs_log_N
     """
-    bins = chrom_len / resolution
-    # ρ (rho) = contacts per bin = sequencing density for this chromosome
-    rho = float(contacts) / bins
-    # Predicted log10(noise) from the 4DN linear reference model
-    pred_log_N = BETA_0 + (BETA_1 * np.log10(rho)) + (BETA_2 * float(ebr))
-    obs_log_N = float(np.log10(float(median_noise)))
-    residual = obs_log_N - pred_log_N
-    # z-score: how many reference standard deviations above the predicted noise level
-    z_map = residual / SIGMA_REF
-    # gamma: adaptive penalty factor for bias vector scaling (clamped at 1.0 minimum)
-    gamma = 1.0 + max(0.0, float(z_map)) * 0.5
-
-    if float(z_map) > 2.0:
-        print(
-            f"[WARN] z_map={z_map:.3f} > 2.0: high stochastic noise detected "
-            f"(gamma={gamma:.3f})"
-        )
-
+    from .noise_sampling import _default_window_bp  # avoid circular import at module level
+    result = compute_noise_model(
+        contacts=contacts,
+        chrom_len=chrom_len,
+        resolution=resolution,
+        window_bp=_default_window_bp(int(resolution)),
+        median_noise=median_noise,
+        ebr=ebr,
+    )
     return {
-        "z_map": float(z_map),
-        "gamma": float(gamma),
-        "pred_log_N": float(pred_log_N),
-        "obs_log_N": float(obs_log_N),
-        "residual": float(residual),
+        "z_map":      result["z_map"],
+        "gamma":      result["gamma"],
+        "pred_log_N": result["pred_log_N"],
+        "obs_log_N":  result["obs_log_N"],
     }
 
 
 def sequencing_advisor(
     obs_noise: float,
-    current_rho: float,
+    current_rho_win: float,
     ebr: float,
+    window_bp: int,
     z_target: float = 0.0,
     fold_threshold: float = 10.0,
 ) -> Dict[str, object]:
     """
-    Predict the sequencing density required to reach a target z-score and assess
-    whether further sequencing is worthwhile.
+    Predict the sequencing depth needed to reach a target quality level.
 
-    Inverts the 3-term reference model to solve for the density (contacts/bin)
-    at which the predicted noise would equal z_target standard deviations from
-    the reference.
+    The spline model is not analytically invertible, so this function uses
+    ``scipy.optimize.brentq`` to numerically find the ρ_win value at which the
+    model's central prediction equals the target noise level.
 
-    The inversion works as follows. The reference model predicts:
-        log10(N_pred) = BETA_0 + BETA_1 * log10(ρ) + BETA_2 * EBR
+    Target derivation
+    -----------------
+    The target log-noise is anchored at the current sample's position in the
+    model:
+        half_envelope = (y_up(current) − y_lo(current)) / 2
+        target_log_N  = X(current) · β_mean + z_target × half_envelope
 
-    Setting observed noise equal to the noise level at z_target:
-        log10(N_obs) = pred_log_N + z_target * SIGMA_REF
-                     = BETA_0 + BETA_1 * log10(ρ_target) + BETA_2 * EBR + z_target * SIGMA_REF
+    Then ``brentq`` finds L_target ∈ [L_MIN, L_MAX] such that:
+        X(L_target) · β_mean = target_log_N
 
-    Solving for log10(ρ_target):
-        log10(ρ_target) = (log10(N_obs) - BETA_0 - BETA_2*EBR - z_target*SIGMA_REF) / BETA_1
+    fold_increase = ρ_win_target / ρ_win_current.
 
-    The fold increase = ρ_target / ρ_current tells how many times more sequencing is needed.
-    If fold_increase > fold_threshold (default 10x), the recommendation is "Stop"
-    because the required increase is impractically large.
+    Because ρ_win = contacts / ((chrom_len/res) × (window_bp/res)), a fold
+    increase in ρ_win maps directly to the same fold increase in contacts
+    (window_bp and resolution are fixed).
 
     Parameters
     ----------
-    obs_noise       : observed median noise (from sampling phase)
-    current_rho     : current sequencing density in contacts/bin
-                      (= total_contacts / (chrom_len / resolution))
+    obs_noise       : observed median noise from the sampling phase
+    current_rho_win : current effective matrix coverage
+                      (= contacts / ((chrom_len/res) × (window_bp/res)))
     ebr             : mean empty bin ratio from the sampling phase
-    z_target        : desired z-score target (default: 0.0 = reference level)
+    window_bp       : analysis window size in bp (used to compute rho_win)
+    z_target        : desired envelope-normalised z-score (default: 0.0)
     fold_threshold  : fold-increase above which recommendation is "Stop"
                       (default: 10.0)
 
     Returns
     -------
     dict with keys:
-        target_density     : contacts/bin needed to reach z_target
-        fold_increase      : target_density / current_rho
-        efficiency_index   : abs(BETA_1) — log-linear sensitivity of noise
-                             to sequencing depth (constant; reported for reference)
-        recommendation     : "Proceed" or "Stop"
+        target_density  — ρ_win value needed to reach z_target
+        fold_increase   — target_density / current_rho_win
+        recommendation  — "Proceed" or "Stop"
     """
     nan_result: Dict[str, object] = {
         "target_density": float("nan"),
         "fold_increase": float("nan"),
-        "efficiency_index": float("nan"),
         "recommendation": "Insufficient data",
     }
 
     if (
         not np.isfinite(obs_noise)
         or obs_noise <= 0.0
-        or not np.isfinite(current_rho)
-        or current_rho <= 0.0
+        or not np.isfinite(current_rho_win)
+        or current_rho_win <= 0.0
         or not np.isfinite(ebr)
     ):
         return nan_result
 
     try:
-        # Invert the reference model to find the required sequencing density
-        log_target_rho = (
-            np.log10(obs_noise) - BETA_0 - BETA_2 * float(ebr) - z_target * SIGMA_REF
-        ) / BETA_1
-        target_rho = float(10.0 ** log_target_rho)
-        fold_increase = target_rho / float(current_rho)
+        L_current = float(np.log10(max(current_rho_win, 1e-300)))
+        X_current = _build_design_matrix(L_current, ebr)
+        pred_upper_c = float(X_current @ _BETA_UPPER)
+        pred_lower_c = float(X_current @ _BETA_LOWER)
+        half_envelope = (max(pred_upper_c, pred_lower_c) - min(pred_upper_c, pred_lower_c)) / 2.0
+        target_log_N = float(X_current @ _BETA_MEAN) + z_target * half_envelope
+
+        # Numerically invert: find L such that X(L)·β_mean = target_log_N
+        f = lambda L: float(_build_design_matrix(float(L), ebr) @ _BETA_MEAN) - target_log_N
+        f_lo = f(_L_MIN)
+        f_hi = f(_L_MAX)
+
+        if f_lo * f_hi > 0:
+            # No sign change → target_log_N is outside the model's predictable range
+            return nan_result
+
+        L_target = brentq(f, _L_MIN, _L_MAX, xtol=1e-6, maxiter=200)
+        rho_win_target = float(10.0 ** L_target)
+        fold_increase = rho_win_target / float(current_rho_win)
         recommendation = "Stop" if fold_increase > float(fold_threshold) else "Proceed"
     except Exception:
         return nan_result
 
     return {
-        "target_density": target_rho,
-        "fold_increase": fold_increase,
-        "efficiency_index": abs(BETA_1),
+        "target_density": rho_win_target,
+        "fold_increase":  fold_increase,
         "recommendation": recommendation,
     }
 
@@ -279,59 +460,6 @@ def _preprocess_noise_track(
     return is_nan, log_N, smoothed
 
 
-def process_normalization_vectors_baseline(
-    noise_track: np.ndarray,
-    pred_log_N: float,
-    ebr: float,
-) -> np.ndarray:
-    """
-    JUKEBOX-BASELINE normalization.
-
-    Forces every bin to conform to the 4DN universal baseline by computing
-    the exact distance between each bin's noise and the predicted log-noise
-    for this chromosome (L̂_target).
-
-    Math
-    ----
-    log10(B_i) = 0.5 * (log10(N_i) - pred_log_N)
-    B_i        = 10 ^ log10(B_i)
-
-    Interpretation
-    --------------
-    - If a bin's noise equals the predicted value (log10(N_i) == pred_log_N),
-      then log10(B_i) = 0 and B_i = 1.0 — no correction applied.
-    - If a bin is noisier than predicted (log10(N_i) > pred_log_N),
-      then B_i > 1.0 — this bin's contacts will be down-weighted in the matrix.
-    - If a bin is quieter than predicted (log10(N_i) < pred_log_N),
-      then B_i < 1.0 — slight up-weighting.
-
-    The factor of 0.5 provides a conservative half-strength correction, preventing
-    over-correction of bins that may have slightly elevated noise by chance.
-
-    This mode is appropriate when data quality is close to the 4DN reference and
-    you want a deterministic, model-anchored correction.
-
-    Parameters
-    ----------
-    noise_track : per-bin raw noise values (may contain NaN/Inf)
-    pred_log_N  : predicted log10 noise for this chromosome from compute_zmap()
-                  (= BETA_0 + BETA_1*log10(rho) + BETA_2*ebr)
-    ebr         : mean empty bin ratio (used as Gaussian sigma offset)
-
-    Returns
-    -------
-    bias_vector : same shape as noise_track; NaN where original was NaN/Inf
-    """
-    is_nan, log_N, _ = _preprocess_noise_track(noise_track, ebr)
-
-    log_bias = 0.5 * (log_N - float(pred_log_N))
-    bias_vector = np.power(10.0, log_bias)
-    # Restore NaN for originally invalid bins (balancing engines treat NaN as "ignore bin")
-    bias_vector[is_nan] = np.nan
-
-    return bias_vector
-
-
 def process_normalization_vectors_adaptive(
     noise_track: np.ndarray,
     pred_log_N: float,
@@ -341,24 +469,23 @@ def process_normalization_vectors_adaptive(
     """
     JUKEBOX-ADAPTIVE normalization.
 
-    Better suited for sparse or palaeogenomic data. Uses the global Z-score
-    to determine the intensity of the correction while dampening local bin
+    Better suited for sparse or palaeogenomic data. Uses the global shift from the
+    model prediction to determine correction intensity while dampening local bin
     variance to prevent blow-outs in stochastically noisy regions.
 
     Math
     ----
-    z_map  = (median(log10(N)) - pred_log_N) / SIGMA_REF
-    D_i    = log10(N_i) - median(log10(N))          # local deviation from chromosome median
-    log10(B_i) = 0.5 * (z_map * SIGMA_REF + alpha * D_i)
-    B_i        = 10 ^ log10(B_i)
+    global_shift = median(log10(N)) - pred_log_N
+    D_i          = log10(N_i) - median(log10(N))   # local deviation from chromosome median
+    log10(B_i)   = 0.5 * (global_shift + alpha * D_i)
+    B_i          = 10 ^ log10(B_i)
 
     Interpretation
     --------------
     The bias has two components:
-    1. **Global shift** (``0.5 * z_map * SIGMA_REF``): moves all bins up or down
-       proportionally to how far the chromosome's overall noise is from the reference.
-       This is the same correction the baseline mode applies but applied uniformly
-       rather than per-bin.
+    1. **Global shift** (``0.5 * global_shift``): moves all bins up or down
+       proportionally to how far the chromosome's overall noise is from the model
+       prediction. Applied uniformly across all bins.
     2. **Local deviation** (``0.5 * alpha * D_i``): adjusts each bin relative to the
        chromosome median, dampened by ``alpha`` (default 0.7). This preserves the
        spatial noise pattern while preventing extreme bins from being over-corrected.
@@ -371,7 +498,8 @@ def process_normalization_vectors_adaptive(
     Parameters
     ----------
     noise_track : per-bin raw noise values (may contain NaN/Inf)
-    pred_log_N  : predicted log10 noise for this chromosome from compute_zmap()
+    pred_log_N  : predicted log10 noise for this chromosome from compute_noise_model()
+                  (= X·β_mean from the spline model)
     ebr         : mean empty bin ratio (used as Gaussian sigma offset)
     alpha       : damping factor for local variance (default 0.7; range 0.5–0.8)
 
@@ -385,60 +513,12 @@ def process_normalization_vectors_adaptive(
     valid = ~is_nan
     median_obs = float(np.median(log_N[valid])) if valid.any() else float(pred_log_N)
 
-    # Global z-map: how far is this chromosome's median noise from the 4DN reference?
-    z_map = (median_obs - float(pred_log_N)) / SIGMA_REF
+    # Global shift: how far is this chromosome's median noise from the model prediction?
+    global_shift = median_obs - float(pred_log_N)
     # Local deviation: how far is each bin from the chromosome's own median?
     D_i = log_N - median_obs
 
-    log_bias = 0.5 * (z_map * SIGMA_REF + float(alpha) * D_i)
-    bias_vector = np.power(10.0, log_bias)
-    bias_vector[is_nan] = np.nan
-
-    return bias_vector
-
-
-def process_normalization_vectors_tanh(
-    noise_track: np.ndarray,
-    pred_log_N: float,
-    ebr: float,
-    scale_limit: float = 0.3,
-) -> np.ndarray:
-    """
-    JUKEBOX-TANH normalization.
-
-    Applies tanh compression so that log10(B_i) is bounded to (−S, +S),
-    preventing extreme bias values for outlier bins.
-
-    Math
-    ----
-    log10(B_i) = S · tanh( (log10(N_i) − pred_log_N) / S )
-    B_i        = 10 ^ log10(B_i)
-
-    With S=0.3 (default): B_i ∈ (10^−0.3, 10^0.3) ≈ (0.50, 2.00).
-
-    Interpretation
-    --------------
-    - When log10(N_i) == pred_log_N: tanh(0) = 0 → B_i = 1.0 (no correction).
-    - For large deviations: tanh saturates at ±1 → log-bias capped at ±S.
-    - For small deviations: tanh(x) ≈ x, so behaviour is near-linear.
-
-    Parameters
-    ----------
-    noise_track : per-bin raw noise values (may contain NaN/Inf)
-    pred_log_N  : predicted log10 noise for this chromosome (L̂_target),
-                  from compute_zmap() (= BETA_0 + BETA_1*log10(rho) + BETA_2*ebr)
-    ebr         : mean empty bin ratio (used as Gaussian sigma offset)
-    scale_limit : S — maximum absolute log10-bias allowed; bounds B_i to
-                  (10^−S, 10^S). Default: 0.3 → range ≈ (0.50, 2.00).
-
-    Returns
-    -------
-    bias_vector : same shape as noise_track; NaN where original was NaN/Inf
-    """
-    is_nan, log_N, _ = _preprocess_noise_track(noise_track, ebr)
-
-    S = float(scale_limit)
-    log_bias = S * np.tanh((log_N - float(pred_log_N)) / S)
+    log_bias = 0.5 * (global_shift + float(alpha) * D_i)
     bias_vector = np.power(10.0, log_bias)
     bias_vector[is_nan] = np.nan
 
@@ -471,7 +551,7 @@ def process_normalization_vectors_powerlaw(
     Parameters
     ----------
     noise_track : per-bin raw noise values (may contain NaN/Inf)
-    pred_log_N  : predicted log10 noise from compute_zmap()
+    pred_log_N  : predicted log10 noise from compute_noise_model() (= X·β_mean)
     ebr         : mean empty bin ratio (used as Gaussian sigma offset)
     p           : compression factor; p=3 → cube root, p=2 → square root (default 3.0)
     alpha       : scaling constant to keep center stable (default 0.5)
@@ -518,7 +598,7 @@ def process_normalization_vectors_bayesian(
     Parameters
     ----------
     noise_track   : per-bin raw noise values (may contain NaN/Inf)
-    pred_log_N    : predicted log10 noise from compute_zmap()
+    pred_log_N    : predicted log10 noise from compute_noise_model() (= X·β_mean)
     ebr           : mean empty bin ratio (Gaussian sigma offset)
     density_track : per-bin contact density (row sums written by noise_fullmap)
     k_density     : half-saturation constant K; if None, auto-set to the median

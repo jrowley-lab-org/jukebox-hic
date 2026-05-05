@@ -435,7 +435,7 @@ def _write_juicer_vector_block(
             handle.write(f"{val}\n")
 
 
-_VALID_MODES = ("powerlaw", "bayesian")
+_VALID_MODES = ("powerlaw", "bayesian", "adaptive")
 
 
 def _resolve_density_bedgraph_path(noise_dir: str, res: int) -> str:
@@ -477,7 +477,7 @@ def build_bias_vectors_from_bedgraphs(
     nan_fill_value: float = float("nan"),
     skip_decoys: bool = True,
     mode: str = "powerlaw",
-    alpha: float = 0.5,
+    alpha: Optional[float] = None,
     p_factor: float = 3.0,
     density_bedgraph_path: Optional[str] = None,
     k_density: Optional[float] = None,
@@ -487,10 +487,11 @@ def build_bias_vectors_from_bedgraphs(
 
     Reads ``{noise_dir}/{res}.bedgraph`` and writes ``{out_dir}/{res}.juicervector``.
     The vector name in the output encodes the mode:
-      - ``mode="baseline"``  → ``vector JUKEBOX-BASELINE``
+      - ``mode="powerlaw"``  → ``vector JUKEBOX-POWERLAW``
+      - ``mode="bayesian"``  → ``vector JUKEBOX-BAYESIAN``
       - ``mode="adaptive"``  → ``vector JUKEBOX-ADAPTIVE``
 
-    Both modes require ``zmap_summary_path`` to provide the per-chromosome
+    All modes require ``zmap_summary_path`` to provide the per-chromosome
     predicted log10-noise (``pred_log_N``).
 
     Processing pipeline per chromosome
@@ -501,8 +502,8 @@ def build_bias_vectors_from_bedgraphs(
     3. Look up per-chromosome ``pred_log_N`` and ``ebr`` from the zmap summary.
        Skip chromosomes missing from the summary (they were not sampled, probably
        because they had no contacts at the sampling resolution).
-    4. Compute the bias vector using either ``process_normalization_vectors_baseline()``
-       or ``process_normalization_vectors_adaptive()``.
+    4. Compute the bias vector using the function matching ``mode``
+       (powerlaw, bayesian, or adaptive).
     5. Write the bias vector block to the output file using ``_write_juicer_vector_block()``.
 
     Parameters
@@ -516,8 +517,9 @@ def build_bias_vectors_from_bedgraphs(
     nan_fill_value    : value written for NaN bins (default: NaN; use 0.0
                         for matrix balancing engines that do not accept NaN)
     skip_decoys       : skip unplaced/decoy chromosomes (default: True)
-    mode              : normalization mode — ``"baseline"`` (default) or ``"adaptive"``
-    alpha             : damping factor for adaptive mode (default: 0.7; range 0.5–0.8)
+    mode              : normalization mode — ``"powerlaw"`` (default), ``"bayesian"``, or ``"adaptive"``
+    alpha             : scaling/damping factor; mode-specific default applied if None
+                        (0.5 for powerlaw, 0.7 for adaptive)
     """
     if mode not in _VALID_MODES:
         raise ValueError(f"mode must be one of {_VALID_MODES}, got {mode!r}")
@@ -528,6 +530,9 @@ def build_bias_vectors_from_bedgraphs(
             f"does not exist: {zmap_summary_path!r}. "
             "Run sample-noise first and pass its subsample_summary.tsv."
         )
+
+    if alpha is None:
+        alpha = 0.7 if mode == "adaptive" else 0.5
 
     noise_bed_path = _resolve_bedgraph_path(noise_dir, res)
     noise_df = _load_bedgraph(noise_bed_path)
@@ -541,6 +546,8 @@ def build_bias_vectors_from_bedgraphs(
 
     if mode == "powerlaw":
         vector_name = "JUKEBOX-POWERLAW"
+    elif mode == "adaptive":
+        vector_name = "JUKEBOX-ADAPTIVE"
     else:
         vector_name = "JUKEBOX-BAYESIAN"
 
@@ -575,6 +582,10 @@ def build_bias_vectors_from_bedgraphs(
             if mode == "powerlaw":
                 bias_vector = reference.process_normalization_vectors_powerlaw(
                     noise_track, pred_log_N, ebr, p_factor, alpha
+                )
+            elif mode == "adaptive":
+                bias_vector = reference.process_normalization_vectors_adaptive(
+                    noise_track, pred_log_N, ebr, alpha=alpha
                 )
             else:  # bayesian
                 density_group = density_df[density_df["chrom"] == chrom].copy()

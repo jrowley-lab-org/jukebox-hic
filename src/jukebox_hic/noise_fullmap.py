@@ -37,6 +37,7 @@ import numpy as np
 from statsmodels.tsa.stattools import acovf
 
 from .backends import ChromMatrix, read_chrom_sizes, select_provider
+from . import metrics
 
 
 def _default_bindist_bp(resolution: int) -> int:
@@ -286,6 +287,12 @@ def _write_bedgraph(
             handle.write(f"{chrom} {start} {stop} {val}\n")
 
 
+def _worker_init(per_worker_limit_bytes: Optional[int]) -> None:
+    """Pool initializer: set a per-worker address space limit if requested."""
+    if per_worker_limit_bytes is not None:
+        metrics.set_address_space_limit(per_worker_limit_bytes)
+
+
 @dataclass(frozen=True)
 class _FullNoiseTask:
     """
@@ -451,6 +458,7 @@ def compute_full_noise(
     cpu: int = 1,
     chroms: Optional[List[str]] = None,
     dump_factor: float = 10.0,
+    max_memory_gb: Optional[float] = None,
 ) -> None:
     """
     Compute noise values for every row/bin across the genome at the requested resolutions.
@@ -515,6 +523,15 @@ def compute_full_noise(
         ``max(2, dump_factor) * noise_bins`` core bins.  Larger values increase
         peak RAM per worker; smaller values reduce RAM at the cost of more fetches.
         Default 10.0 is a good balance for resolutions down to ~1 kb.
+    max_memory_gb : float or None
+        Optional hard memory budget in gigabytes.  When set:
+        - The worker count is capped so that total estimated peak RAM stays within
+          this budget (using ``metrics.estimate_worker_memory_mb()``).
+        - Each worker process receives a ``RLIMIT_AS`` address-space limit equal to
+          ``max_memory_gb / workers`` GB, so allocations beyond the cap raise
+          ``MemoryError`` (Linux/macOS only; silently ignored on Windows).
+        The existing single-retry logic catches ``MemoryError`` from workers and
+        re-runs the failed task in the main process.
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -524,6 +541,21 @@ def compute_full_noise(
     if requested_cpu < 1:
         requested_cpu = 1
     workers = min(requested_cpu, cpu_count)
+
+    # Memory-aware worker count: estimate per-worker peak RAM from dump_factor and
+    # the noise window of the coarsest (most memory-intensive) resolution requested.
+    per_worker_bytes: Optional[int] = None
+    if max_memory_gb is not None and max_memory_gb > 0:
+        coarsest_res = max(int(r) for r in res_list) if res_list else 10000
+        noise_bins_est = max(1, _default_bindist_bp(coarsest_res) // coarsest_res)
+        per_worker_mb = metrics.estimate_worker_memory_mb(dump_factor, noise_bins_est)
+        if per_worker_mb > 0:
+            safe_workers = max(1, int(max_memory_gb * 1024 / per_worker_mb))
+            workers = min(workers, safe_workers)
+        per_worker_bytes = max(
+            int(1.5 * 1024**3),  # floor: 1.5 GB for Python + shared libs overhead
+            int(max_memory_gb * 1024**3 / workers),
+        )
 
     # --- Build task list ---
     # A provider is opened briefly to enumerate chromosomes, then closed (``del provider``)
@@ -616,7 +648,12 @@ def compute_full_noise(
         # the specific task completes). This preserves ordering without limiting
         # parallelism: the pool runs up to ``workers`` tasks simultaneously.
         ctx = mp.get_context()
-        with ctx.Pool(processes=workers, maxtasksperchild=10) as pool:
+        with ctx.Pool(
+            processes=workers,
+            maxtasksperchild=10,
+            initializer=_worker_init,
+            initargs=(per_worker_bytes,),
+        ) as pool:
             async_results = [(task, pool.apply_async(_full_noise_worker, (task,))) for task in tasks]
             for task, async_res in async_results:
                 try:

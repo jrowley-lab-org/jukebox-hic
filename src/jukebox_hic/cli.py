@@ -345,6 +345,17 @@ def main() -> None:
         "--chroms",
         help="Comma-separated list of chromosomes to process (default: all)",
     )
+    sp_sample.add_argument(
+        "--chunk_rows",
+        type=int,
+        default=None,
+        help=(
+            "Process each chromosome in bands of this many rows instead of loading "
+            "the full chromosome matrix at once.  Reduces peak RAM at the cost of "
+            "re-computing the distance-decay curve per band.  Recommended: 2000–5000. "
+            "Default: load full chromosome (original behaviour)."
+        ),
+    )
 
     # ------------------------------------------------------------------ #
     # full-noise                                                           #
@@ -374,6 +385,17 @@ def main() -> None:
     sp_full.add_argument(
         "--chroms",
         help="Comma-separated list of chromosomes to process (default: all)",
+    )
+    sp_full.add_argument(
+        "--max_memory_gb",
+        type=float,
+        default=None,
+        help=(
+            "Hard memory budget in GB.  Caps the number of parallel workers so that "
+            "estimated peak RAM stays within this limit.  Each worker also receives a "
+            "RLIMIT_AS address-space cap of budget/workers GB (Linux/macOS only). "
+            "Default: no cap."
+        ),
     )
     sp_full.add_argument(
         "--dump_factor",
@@ -438,21 +460,28 @@ def main() -> None:
     sp_bias.add_argument(
         "--mode",
         default="powerlaw",
-        choices=["powerlaw", "bayesian"],
+        choices=["powerlaw", "bayesian", "adaptive"],
         help=(
             "Normalization mode: "
             "powerlaw = JUKEBOX-POWERLAW (signed power-law root compression of the residual, "
             "controlled by --p_factor and --alpha); "
             "bayesian = JUKEBOX-BAYESIAN (evidence-weighted shrinkage toward 1.0 for sparse bins, "
-            "requires density bedgraph from full-noise). "
+            "requires density bedgraph from full-noise); "
+            "adaptive = JUKEBOX-ADAPTIVE (global model shift + damped local correction, "
+            "suited for sparse/palaeogenomic data, controlled by --alpha). "
             "Default: powerlaw"
         ),
     )
     sp_bias.add_argument(
         "--alpha",
         type=float,
-        default=1.0,
-        help="Scaling constant for powerlaw mode (default: 1.0)",
+        default=None,
+        help=(
+            "Scaling/damping factor. "
+            "powerlaw mode: scaling constant (default: 0.5). "
+            "adaptive mode: local-deviation damping factor (default: 0.7; valid range 0.5–0.8). "
+            "Explicitly supplied values override the mode-specific default."
+        ),
     )
     sp_bias.add_argument(
         "--p_factor",
@@ -587,8 +616,13 @@ def main() -> None:
     sp_run.add_argument(
         "--alpha",
         type=float,
-        default=0.5,
-        help="Scaling constant for powerlaw mode (default: 0.5)",
+        default=None,
+        help=(
+            "Scaling/damping factor. "
+            "powerlaw mode: scaling constant (default: 0.5). "
+            "adaptive mode: local-deviation damping factor (default: 0.7). "
+            "Explicitly supplied values override the mode-specific default."
+        ),
     )
     sp_run.add_argument(
         "--p_factor",
@@ -612,6 +646,24 @@ def main() -> None:
         help=(
             "Sliding-window chunk size multiplier passed to full-noise. "
             "Lower values reduce peak RAM. Default: 10.0."
+        ),
+    )
+    sp_run.add_argument(
+        "--max_memory_gb",
+        type=float,
+        default=None,
+        help=(
+            "Hard memory budget in GB for the full-noise phase.  Caps worker count "
+            "and sets a per-worker address-space limit (Linux/macOS).  Default: no cap."
+        ),
+    )
+    sp_run.add_argument(
+        "--chunk_rows",
+        type=int,
+        default=None,
+        help=(
+            "Band size (rows) for sample-noise phase.  Prevents loading the full "
+            "chromosome matrix at once.  Recommended: 2000–5000.  Default: full load."
         ),
     )
 
@@ -658,6 +710,8 @@ def main() -> None:
                     seed=args.seed,
                     profile_path=args.profile,
                     chroms=chroms,
+                    chunk_rows=args.chunk_rows,
+                    precomputed_contacts=contacts or None,
                 )
 
         _profile_command("sample-noise", run)
@@ -686,6 +740,7 @@ def main() -> None:
                 cpu=args.cpu,
                 chroms=_comma_strs(args.chroms) if args.chroms else None,
                 dump_factor=args.dump_factor,
+                max_memory_gb=args.max_memory_gb,
             )
 
         _profile_command("full-noise", run)
@@ -766,11 +821,13 @@ def main() -> None:
             parser.error(f"Summary file not found: {args.summary}")
 
         # Parse the subsample_summary.tsv header comments to extract metadata.
-        # The file format uses two types of comment lines:
-        #   "# resolution=N" — the resolution this summary was computed at
+        # The file format uses comment lines:
+        #   "# resolution=N"    — the resolution this summary was computed at
+        #   "# window_bp=N"     — the analysis window size used during sampling
         #   "# chrom_info<tab>chrom<tab>contacts=N<tab>size_bp=N" — chromosome metadata
         # These are needed because chromosome sizes are not stored in the TSV body.
         summary_res: Optional[int] = None
+        summary_window_bp: Optional[int] = None
         chrom_sizes_adv: Dict[str, int] = {}
         data_lines: List[str] = []
         with open(args.summary) as fh:
@@ -778,6 +835,11 @@ def main() -> None:
                 if line.startswith("# resolution="):
                     try:
                         summary_res = int(line.strip().split("=", 1)[1])
+                    except ValueError:
+                        pass
+                elif line.startswith("# window_bp="):
+                    try:
+                        summary_window_bp = int(line.strip().split("=", 1)[1])
                     except ValueError:
                         pass
                 elif line.startswith("# chrom_info"):
@@ -807,6 +869,10 @@ def main() -> None:
                 "Could not recover chromosome sizes from the summary file. "
                 "Ensure the file was produced by jukebox-hic sample-noise."
             )
+        # Fall back to resolution-based default window for summary files produced
+        # before the # window_bp= header was added.
+        if summary_window_bp is None:
+            summary_window_bp = noise_sampling._default_window_bp(summary_res)
 
         df = pd.read_csv(io.StringIO("".join(data_lines)), sep="\t")
         if "ratio" in df.columns:
@@ -828,15 +894,19 @@ def main() -> None:
                 ebr = float(row["mean_empty_bin_ratio"])
                 est_contacts = float(row["estimated_contacts"])
                 z_map_val = float(row["z_map"]) if "z_map" in df.columns else float("nan")
+                quality_status_val = str(row["quality_status"]) if "quality_status" in df.columns else ""
                 c_len = chrom_sizes_adv.get(chrom, 0)
 
                 if c_len > 0:
-                    # current_rho = contacts per bin = sequencing density for this chrom
-                    current_rho = est_contacts / (c_len / summary_res)
+                    # current_rho_win = effective matrix coverage for this chrom
+                    current_rho_win = est_contacts / (
+                        (c_len / summary_res) * (summary_window_bp / summary_res)
+                    )
                     adv = reference.sequencing_advisor(
                         obs_noise=median_noise,
-                        current_rho=current_rho,
+                        current_rho_win=current_rho_win,
                         ebr=ebr,
+                        window_bp=summary_window_bp,
                         z_target=args.z_target,
                         fold_threshold=args.fold_threshold,
                     )
@@ -845,7 +915,6 @@ def main() -> None:
                     adv = {
                         "target_density": float("nan"),
                         "fold_increase": float("nan"),
-                        "efficiency_index": float("nan"),
                         "recommendation": "Insufficient data",
                     }
 
@@ -855,9 +924,9 @@ def main() -> None:
                     "mean_empty_bin_ratio": ebr,
                     "estimated_contacts": est_contacts,
                     "z_map": z_map_val,
+                    "quality_status": quality_status_val,
                     "advisor_target_density": adv["target_density"],
                     "advisor_fold_increase": adv["fold_increase"],
-                    "advisor_efficiency_index": adv["efficiency_index"],
                     "advisor_recommendation": adv["recommendation"],
                 })
 
@@ -913,6 +982,8 @@ def main() -> None:
                 chrom_sizes_path=args.chrom_sizes,
                 cooler_selection=cooler_sel,
                 chroms=chroms,
+                chunk_rows=args.chunk_rows,
+                precomputed_contacts=contacts or None,
             )
 
         # Phase 2: Full noise for all resolutions at once (benefits from shared I/O)
@@ -927,6 +998,7 @@ def main() -> None:
             cpu=args.cpu,
             chroms=chroms,
             dump_factor=args.dump_factor,
+            max_memory_gb=args.max_memory_gb,
         )
 
         # Phases 3 & 4: Per resolution
@@ -939,7 +1011,7 @@ def main() -> None:
             if not os.path.isfile(zmap_summary):
                 print(f"  [WARN] subsample_summary.tsv not found for res={res} — skipping bias vectors")
             else:
-                for mode in ("powerlaw", "bayesian"):
+                for mode in ("powerlaw", "bayesian", "adaptive"):
                     noise_to_weights.build_bias_vectors_from_bedgraphs(
                         noise_dir=full_dir,
                         res=res,
