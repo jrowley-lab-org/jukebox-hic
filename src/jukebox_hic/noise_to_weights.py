@@ -478,7 +478,7 @@ def build_bias_vectors_from_bedgraphs(
     skip_decoys: bool = True,
     mode: str = "powerlaw",
     alpha: Optional[float] = None,
-    p_factor: float = 3.0,
+    p_factor: float = 2.0,
     density_bedgraph_path: Optional[str] = None,
     k_density: Optional[float] = None,
 ) -> None:

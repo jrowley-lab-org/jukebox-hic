@@ -627,8 +627,8 @@ def main() -> None:
     sp_run.add_argument(
         "--p_factor",
         type=float,
-        default=3.0,
-        help="Compression factor for powerlaw mode (default: 3.0; cube root). Use 2.0 for square root.",
+        default=2.0,
+        help="Compression factor for powerlaw mode (default: 2.0; square root). Use 3.0 for cube root.",
     )
     sp_run.add_argument(
         "--k_density",

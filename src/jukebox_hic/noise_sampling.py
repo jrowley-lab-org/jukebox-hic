@@ -723,6 +723,7 @@ def compute_sampled_noise(
                 "pred_log_N_lower": float("nan"),
                 "epsilon": float("nan"),
                 "quality_status": "",
+                "quality_percentile": -1,
                 "advisor_target_density": float("nan"),
                 "advisor_fold_increase": float("nan"),
                 "advisor_recommendation": "",
@@ -754,6 +755,16 @@ def compute_sampled_noise(
                         record["pred_log_N_lower"] = model_result["pred_log_N_lower"]
                         record["epsilon"]          = model_result["epsilon"]
                         record["quality_status"]   = model_result["quality_status"]
+
+                        # Decile Diagnostic — classify noise relative to 4DN percentile landscape
+                        _rho_win  = model_result["rho_win"]
+                        _L_rho    = float(np.log10(max(_rho_win, 1e-300)))
+                        _obs_log_N = float(np.log10(max(median_noise, 1e-300)))
+                        record["quality_percentile"] = reference.classify_quality_percentile(
+                            L_rho=_L_rho,
+                            ebr=mean_ebr,
+                            obs_noise_log10=_obs_log_N,
+                        )
 
                         # current_rho_win = effective matrix coverage for this chrom
                         current_rho_win = chrom_contacts / (

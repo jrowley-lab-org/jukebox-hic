@@ -108,6 +108,37 @@ _BETA_LOWER: np.ndarray = np.array([
     -1.847717,   # Lρ·EBR (interaction)
 ])
 
+# ---------------------------------------------------------------------------
+# JUKEBOX Decile Diagnostic Constants (q10–q90)
+# ---------------------------------------------------------------------------
+# Higher-precision knot values calibrated against the 4DN Gold Standard database
+# via quantile regression at deciles 10–90.
+#
+# Beta vector layout (11 elements): [const, s0, s1, s2, s3, s4, s5, s6, s7, EBR, Lρ·EBR]
+_DECILE_INTERIOR_KNOTS: np.ndarray = np.array([
+    -0.70512324, 0.25933136, 1.04265875, 1.78215330, 2.88683441
+])
+_DECILE_L_MIN: float = -4.05114379
+_DECILE_L_MAX: float =  5.37463540
+
+_DECILE_KNOTS_AUG: np.ndarray = np.concatenate([
+    np.full(_DEGREE + 1, _DECILE_L_MIN),
+    _DECILE_INTERIOR_KNOTS,
+    np.full(_DEGREE + 1, _DECILE_L_MAX),
+])
+
+_DECILE_BETAS: Dict[int, np.ndarray] = {
+    10: np.array([ -9.7430, 6.8718, 7.3579, 10.0377, 10.7694, 10.3195, 10.4304, 10.7010, 10.5921,  2.4502, -1.8769]),
+    20: np.array([ -9.4172, 6.9640, 7.0586,  9.7539, 10.4912, 10.0538, 10.2463, 10.4742, 10.4272,  2.5183, -1.8338]),
+    30: np.array([ -9.6105, 7.2113, 7.1612,  9.9671, 10.7384, 10.3050, 10.5358, 10.7649, 10.7080,  2.6019, -1.8435]),
+    40: np.array([ -9.4982, 6.8836, 6.8846,  9.8332, 10.6857, 10.2387, 10.5280, 10.7166, 10.6876,  2.7279, -1.8874]),
+    50: np.array([ -9.5537, 6.6355, 6.6372,  9.8448, 10.7966, 10.3451, 10.6819, 10.8515, 10.8268,  2.9097, -1.9698]),
+    60: np.array([ -9.6776, 6.3950, 6.3759,  9.9090, 10.9728, 10.5357, 10.9102, 11.0527, 11.0105,  3.1340, -2.0709]),
+    70: np.array([-10.5867, 6.6732, 6.5670, 10.7372, 11.9476, 11.5479, 11.9546, 12.0301, 12.0440,  3.4744, -2.2855]),
+    80: np.array([-10.6838, 6.4941, 6.3865, 10.8508, 12.1604, 11.7751, 12.2638, 12.1899, 12.2361,  3.6430, -2.4016]),
+    90: np.array([-10.0198, 5.9371, 6.0107, 10.3712, 11.7477, 11.3243, 12.0291, 11.5292, 11.8412,  3.5812, -2.4003]),
+}
+
 # Pre-computed augmented knot vector and basis count (module-level, computed once)
 _KNOTS_AUG: np.ndarray = np.concatenate([
     np.full(_DEGREE + 1, _L_MIN),
@@ -152,6 +183,85 @@ def _build_design_matrix(L_rho: float, ebr: float) -> np.ndarray:
     raw = np.nan_to_num(raw, nan=0.0)
     s = raw[1:]  # drop first basis → s0…s7 (8 values)
     return np.array([1.0, *s, float(ebr), L * float(ebr)])
+
+
+def _build_decile_design_row(L_rho: float, ebr: float) -> np.ndarray:
+    """
+    Build the 11-element design vector for the decile diagnostic model.
+
+    Identical structure to ``_build_design_matrix()`` but uses the higher-precision
+    decile knot geometry (``_DECILE_KNOTS_AUG``, ``_DECILE_L_MIN/MAX``).
+
+    Parameters
+    ----------
+    L_rho : float
+        log10(ρ_win) for this chromosome sample.
+    ebr : float
+        Mean empty bin ratio.
+
+    Returns
+    -------
+    np.ndarray of shape (11,)
+        [const, s0, s1, s2, s3, s4, s5, s6, s7, EBR, L_rho·EBR]
+    """
+    L = float(np.clip(L_rho, _DECILE_L_MIN, _DECILE_L_MAX))
+    identity = np.eye(_N_BASIS_TOTAL)
+    raw = np.array(
+        [BSpline(_DECILE_KNOTS_AUG, identity[i], _DEGREE)(L) for i in range(_N_BASIS_TOTAL)],
+        dtype=float,
+    )
+    raw = np.nan_to_num(raw, nan=0.0)
+    s = raw[1:]  # drop first basis — patsy bs(include_intercept=False) convention
+    return np.array([1.0, *s, float(ebr), L * float(ebr)])
+
+
+def classify_quality_percentile(L_rho: float, ebr: float, obs_noise_log10: float) -> int:
+    """
+    Classify a sample's noise quality as a percentile decile relative to the 4DN landscape.
+
+    Evaluates each of the nine decile boundary predictions (q10–q90) and returns the
+    lowest decile whose predicted boundary is at or above the observed log10 noise.
+    Returns 95 when the observed noise exceeds the q90 boundary (worse than the 90th
+    percentile of the 4DN noise distribution).
+
+    A monotony guardrail is applied before classification: spline flexibility at extreme
+    L_rho coordinates can cause pred(qn) < pred(qn-1). A running-maximum enforcement
+    ensures boundaries are non-decreasing from q10 to q90, preventing a sample from
+    being incorrectly classified as high-quality in a "pinched" coordinate region.
+
+    Parameters
+    ----------
+    L_rho : float
+        log10(ρ_win) — log-effective matrix coverage for this chromosome.
+    ebr : float
+        Mean empty bin ratio from the sampling phase.
+    obs_noise_log10 : float
+        log10(median_noise) — observed noise in log space.
+
+    Returns
+    -------
+    int
+        Percentile decile: one of {10, 20, 30, 40, 50, 60, 70, 80, 90, 95}.
+    """
+    design_row = _build_decile_design_row(L_rho, ebr)
+
+    raw_predictions: Dict[int, float] = {
+        q: float(np.dot(design_row, beta))
+        for q, beta in _DECILE_BETAS.items()
+    }
+
+    # Enforce monotonically non-decreasing boundaries q10 → q90
+    monotone_predictions: Dict[int, float] = {}
+    running_max = float("-inf")
+    for q in sorted(raw_predictions):
+        running_max = max(running_max, raw_predictions[q])
+        monotone_predictions[q] = running_max
+
+    for q in sorted(monotone_predictions):
+        if obs_noise_log10 <= monotone_predictions[q]:
+            return q
+
+    return 95  # observed noise exceeds the 90th percentile boundary
 
 
 def compute_noise_model(
