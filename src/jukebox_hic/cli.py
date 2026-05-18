@@ -463,9 +463,9 @@ def main() -> None:
         choices=["powerlaw", "bayesian", "adaptive"],
         help=(
             "Normalization mode: "
-            "powerlaw = JUKEBOX-POWERLAW (signed power-law root compression of the residual, "
+            "powerlaw = JUKEBOX_SQRT (signed power-law root compression of the residual, "
             "controlled by --p_factor and --alpha); "
-            "bayesian = JUKEBOX-BAYESIAN (evidence-weighted shrinkage toward 1.0 for sparse bins, "
+            "bayesian = JUKEBOX_BAY (evidence-weighted shrinkage toward 1.0 for sparse bins, "
             "requires density bedgraph from full-noise); "
             "adaptive = JUKEBOX-ADAPTIVE (global model shift + damped local correction, "
             "suited for sparse/palaeogenomic data, controlled by --alpha). "

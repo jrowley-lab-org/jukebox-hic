@@ -374,6 +374,10 @@ def _load_zmap_summary(path: str) -> Dict[str, Dict[str, float]]:
             entry["ebr"] = float(row["mean_empty_bin_ratio"])
         if "pred_log_N" in row.index and pd.notna(row["pred_log_N"]):
             entry["pred_log_N"] = float(row["pred_log_N"])
+        if "pred_log_N_upper" in row.index and pd.notna(row["pred_log_N_upper"]):
+            entry["pred_log_N_upper"] = float(row["pred_log_N_upper"])
+        if "pred_log_N_lower" in row.index and pd.notna(row["pred_log_N_lower"]):
+            entry["pred_log_N_lower"] = float(row["pred_log_N_lower"])
         if entry:
             result[chrom] = entry
     return result
@@ -487,8 +491,8 @@ def build_bias_vectors_from_bedgraphs(
 
     Reads ``{noise_dir}/{res}.bedgraph`` and writes ``{out_dir}/{res}.juicervector``.
     The vector name in the output encodes the mode:
-      - ``mode="powerlaw"``  → ``vector JUKEBOX-POWERLAW``
-      - ``mode="bayesian"``  → ``vector JUKEBOX-BAYESIAN``
+      - ``mode="powerlaw"``  → ``vector JUKEBOX_SQRT``
+      - ``mode="bayesian"``  → ``vector JUKEBOX_BAY``
       - ``mode="adaptive"``  → ``vector JUKEBOX-ADAPTIVE``
 
     All modes require ``zmap_summary_path`` to provide the per-chromosome
@@ -545,11 +549,11 @@ def build_bias_vectors_from_bedgraphs(
         density_df = _load_bedgraph(resolved_density)
 
     if mode == "powerlaw":
-        vector_name = "JUKEBOX-POWERLAW"
+        vector_name = "JUKEBOX_SQRT"
     elif mode == "adaptive":
         vector_name = "JUKEBOX-ADAPTIVE"
     else:
-        vector_name = "JUKEBOX-BAYESIAN"
+        vector_name = "JUKEBOX_BAY"
 
     mode_dir = os.path.join(out_dir, mode)
     os.makedirs(mode_dir, exist_ok=True)

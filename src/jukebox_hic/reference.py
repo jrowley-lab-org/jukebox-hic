@@ -570,6 +570,16 @@ def _preprocess_noise_track(
     return is_nan, log_N, smoothed
 
 
+def _center_log_bias(log_bias: np.ndarray, is_nan: np.ndarray) -> None:
+    """Subtract mean of valid log-bias values so geometric_mean(10^log_bias) = 1.0."""
+    valid = ~is_nan
+    if not valid.any():
+        return
+    shift = float(np.mean(log_bias[valid]))
+    if np.isfinite(shift):
+        log_bias[valid] -= shift
+
+
 def process_normalization_vectors_adaptive(
     noise_track: np.ndarray,
     pred_log_N: float,
@@ -629,6 +639,7 @@ def process_normalization_vectors_adaptive(
     D_i = log_N - median_obs
 
     log_bias = 0.5 * (global_shift + float(alpha) * D_i)
+    _center_log_bias(log_bias, is_nan)
     bias_vector = np.power(10.0, log_bias)
     bias_vector[is_nan] = np.nan
 
@@ -643,7 +654,7 @@ def process_normalization_vectors_powerlaw(
     alpha: float = 0.5,
 ) -> np.ndarray:
     """
-    JUKEBOX-POWERLAW normalization.
+    JUKEBOX_SQRT normalization.
 
     Applies a signed power-law (root) transformation to the log-space residual,
     compressing the long tail more aggressively than a linear scalar.
@@ -674,6 +685,7 @@ def process_normalization_vectors_powerlaw(
 
     residual = log_N - float(pred_log_N)
     compressed = np.sign(residual) * np.power(np.abs(residual), 1.0 / float(p)) * float(alpha)
+    _center_log_bias(compressed, is_nan)
     bias_vector = np.power(10.0, compressed)
     bias_vector[is_nan] = np.nan
 
@@ -688,7 +700,7 @@ def process_normalization_vectors_bayesian(
     k_density: Optional[float] = None,
 ) -> np.ndarray:
     """
-    JUKEBOX-BAYESIAN normalization.
+    JUKEBOX_BAY normalization.
 
     Evidence-weighted Bayesian shrinkage: bins with low local contact density
     receive less correction (shrink toward B_i = 1.0).
@@ -732,6 +744,7 @@ def process_normalization_vectors_bayesian(
 
     weight = rho / (rho + k)
     log_bias = weight * 0.5 * residual
+    _center_log_bias(log_bias, is_nan)
     bias_vector = np.power(10.0, log_bias)
     bias_vector[is_nan] = np.nan
 
