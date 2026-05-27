@@ -1,0 +1,60 @@
+# Python build & packaging
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+
+# Environment variable files
+.env
+.env.*
+*.env
+
+# Test & coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Type-checking / linting caches
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / editor configs
+.vscode/
+.idea/
+*.suo
+*.user
+*.swp
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Tool output (generated during runs — not source)
+*.bedgraph
+*.bedGraph
+*.bg
+*.juicervector
+*.bed
+subsample_summary.tsv
+contacts_overview.tsv
+full_noise_errors.tsv
+
+# Logs
+*.log
+nohup.out
