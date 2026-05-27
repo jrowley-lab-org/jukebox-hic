@@ -809,25 +809,26 @@ def generate_blacklist(
     noise_track: np.ndarray,
     chrom: str,
     resolution: int,
+    top_quantile: float = 0.99,
+    bottom_quantile: float = 0.0,
 ) -> List[List]:
     """
-    Build BED rows flagging the noisiest 1% of bins and all NaN/Inf bins.
+    Build BED rows flagging extreme-noise bins and all NaN/Inf bins.
 
-    Blacklisted bins should be excluded from downstream analyses (loop calling,
-    compartment detection, etc.) because their noise estimates indicate they are
-    unreliable — typically due to repeat elements, mappability issues, or very low
-    coverage.
+    Two categories are always flagged:
+    1. **NaN/Inf bins**: no reliable noise estimate (too sparse).
+    2. **High-noise bins**: at or above the ``top_quantile`` percentile.
 
-    Two categories of bins are flagged:
-    1. **NaN/Inf bins**: no reliable noise estimate could be computed (too sparse).
-    2. **Top 1% noise bins**: bins with noise values at or above the 99th percentile
-       of the finite noise distribution on this chromosome.
+    Optionally also flags low-noise bins (``bottom_quantile > 0``):
+    3. **Suspiciously smooth bins**: at or below the ``bottom_quantile`` percentile.
 
     Parameters
     ----------
-    noise_track : per-bin raw noise values
-    chrom       : chromosome name
-    resolution  : bin size in bp
+    noise_track     : per-bin raw noise values
+    chrom           : chromosome name
+    resolution      : bin size in bp
+    top_quantile    : upper percentile threshold as a fraction, e.g. 0.99 (default)
+    bottom_quantile : lower percentile threshold as a fraction, e.g. 0.01; 0 disables
 
     Returns
     -------
@@ -835,11 +836,13 @@ def generate_blacklist(
     """
     finite_vals = noise_track[~np.isnan(noise_track) & ~np.isinf(noise_track)]
     if finite_vals.size > 0:
-        # 99th percentile threshold: flag the most extreme 1% of bins
-        p99 = float(np.percentile(finite_vals, 99))
-        flagged = np.where(
-            (noise_track >= p99) | np.isnan(noise_track) | np.isinf(noise_track)
-        )[0]
+        p_high = float(np.percentile(finite_vals, top_quantile * 100))
+        invalid = np.isnan(noise_track) | np.isinf(noise_track)
+        mask = (noise_track >= p_high) | invalid
+        if bottom_quantile > 0.0:
+            p_low = float(np.percentile(finite_vals, bottom_quantile * 100))
+            mask |= (noise_track <= p_low) & ~invalid
+        flagged = np.where(mask)[0]
     else:
         # All bins are NaN/Inf — flag everything
         flagged = np.where(np.isnan(noise_track) | np.isinf(noise_track))[0]

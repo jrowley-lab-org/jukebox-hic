@@ -155,43 +155,46 @@ def build_blacklist_from_bedgraphs(
     output_path: str,
     zscore_cutoff: float | None = None,
     top_quantile: float = 0.95,
+    bottom_quantile: float = 0.01,
 ) -> None:
     """
-    Load one or more per-chromosome bedgraphs, flag rows with NaN noise or high noise
-    signal, and emit a blacklist BED file with merged intervals.
+    Load one or more per-chromosome bedgraphs, flag rows with extreme noise values or
+    non-finite noise, and emit a blacklist BED file with merged intervals.
 
-    Two flagging modes are available:
+    Flagging is two-tailed: both the noisiest bins (high tail) and the smoothest bins
+    (low tail) are flagged. Bins with non-finite noise (NaN or Inf) are always flagged
+    regardless of the selected mode.
 
-    **Z-score mode** (``zscore_cutoff`` is not None):
-        Compute z-scores of the noise values across all loaded bedgraphs:
-            z = (noise - mean) / std
-        Flag bins with z ≥ zscore_cutoff. This mode is scale-invariant: the same
-        cutoff applies regardless of the absolute noise level.
-        If std == 0 (all values identical), bins at or above the mean are flagged.
+    **Upper tail — noisy bins**:
 
-    **Quantile mode** (``zscore_cutoff`` is None, default):
-        Flag bins whose noise value is at or above the ``top_quantile`` percentile
-        across all loaded bedgraphs. The default threshold of 0.95 flags the top 5%
-        of bins. Use a higher value (e.g. 0.99) for a more conservative blacklist.
+    *Z-score mode* (``zscore_cutoff`` is not None):
+        Compute z-scores across all loaded bedgraphs: z = (noise - mean) / std.
+        Flag bins with z ≥ zscore_cutoff. If std == 0, flag bins at or above the mean.
 
-    In both modes, bins with non-finite noise (NaN or Inf) are also always flagged —
-    these correspond to bins that were too sparse for any noise estimate.
+    *Quantile mode* (``zscore_cutoff`` is None, default):
+        Flag bins at or above the ``top_quantile`` percentile (default 0.95 = top 5%).
 
-    Flagged intervals are merged per chromosome using ``_merge_intervals()`` so that
-    adjacent flagged bins appear as a single BED entry rather than many individual lines.
+    **Lower tail — suspiciously smooth bins** (quantile mode only):
+        Flag bins at or below the ``bottom_quantile`` percentile (default 0.01 = bottom
+        1%). Bins with unnaturally regular contact patterns can arise from collapsed
+        repeats, copy-number amplifications, or PCR artefacts. Set ``bottom_quantile=0``
+        to disable lower-tail flagging.
+
+    Flagged intervals are merged per chromosome using ``_merge_intervals()``.
 
     Parameters
     ----------
     inputs : Sequence[str]
-        One or more file paths or glob patterns pointing to per-chromosome bedgraph
-        files (e.g. ``["chr1_10000.bedgraph", "chr*.bedgraph"]``).
+        File paths or glob patterns for per-chromosome bedgraph files.
     output_path : str
-        Path for the output BED file (created; parent directories are created if absent).
+        Output BED file path (parent directories created if absent).
     zscore_cutoff : float or None
-        Z-score threshold for flagging. If None, ``top_quantile`` is used instead.
+        Z-score upper threshold. If None, ``top_quantile`` is used instead.
     top_quantile : float
-        Quantile threshold (0–1) for flagging (default 0.95 = top 5%).
-        Only used when ``zscore_cutoff`` is None.
+        Upper quantile threshold, 0–1 (default 0.95 = top 5%). Ignored when
+        ``zscore_cutoff`` is set.
+    bottom_quantile : float
+        Lower quantile threshold, 0–1 (default 0.01 = bottom 1%). Set to 0 to disable.
 
     Raises
     ------
@@ -242,6 +245,11 @@ def build_blacklist_from_bedgraphs(
             quantile_value = float(np.nanquantile(valid_values, float(top_quantile)))
             thresh_mask = valid_values >= quantile_value
         flagged.loc[valid_mask] |= thresh_mask
+
+        # Lower tail: flag bins at or below the bottom_quantile percentile
+        if bottom_quantile > 0.0:
+            floor_value = float(np.nanquantile(valid_values, float(bottom_quantile)))
+            flagged.loc[valid_mask] |= (valid_values <= floor_value)
 
     flagged_df = data.loc[flagged, ["chrom", "start", "end"]].copy()
     if flagged_df.empty:

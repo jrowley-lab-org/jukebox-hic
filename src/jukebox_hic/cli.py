@@ -538,7 +538,15 @@ def main() -> None:
         default=0.95,
         # 0.95 = flag the top 5% noisiest bins. Use 0.99 for a more conservative list
         # (only the absolute worst 1%). The default-run pipeline uses 0.99.
-        help="Quantile threshold for blacklisting when z-score cutoff is not provided (default: 0.95)",
+        help="Upper quantile threshold: bins at or above this percentile are flagged as noisy (default: 0.95)",
+    )
+    sp_mask.add_argument(
+        "--bottom_quantile",
+        type=float,
+        default=0.01,
+        # 0.01 = flag the bottom 1% smoothest bins (suspiciously uniform contact patterns).
+        # Set to 0 to disable lower-tail flagging entirely.
+        help="Lower quantile threshold: bins at or below this percentile are flagged as suspiciously smooth (default: 0.01). Set to 0 to disable.",
     )
 
     # ------------------------------------------------------------------ #
@@ -809,6 +817,7 @@ def main() -> None:
                 output_path=args.out,
                 zscore_cutoff=args.zscore_cutoff,
                 top_quantile=args.top_quantile,
+                bottom_quantile=args.bottom_quantile,
             )
 
         _profile_command("blacklist", run)
@@ -1041,6 +1050,7 @@ def main() -> None:
                     # 0.99 = top 1% threshold; stricter than the standalone command's 0.95 default
                     # because the full-noise bedgraph covers the entire genome and is more reliable.
                     top_quantile=0.99,
+                    bottom_quantile=0.01,
                 )
                 print(f"  → {out_blacklist}")
             else:
