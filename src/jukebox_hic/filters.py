@@ -1,64 +1,27 @@
 #!/usr/bin/env python
 """
-Blacklist generation from per-chromosome Hi-C noise bedgraphs.
+Blacklist generation for Hi-C contact matrices using per-chromosome elbow detection.
 
-A "blacklist" in Hi-C analysis is a set of genomic regions that should be excluded
-from downstream analyses (loop calling, compartment detection, TAD analysis) because
-they produce unreliable or artifactual signals. Common sources of blacklisted regions:
-- Repetitive sequences with multi-mapping reads (high stochastic contact noise).
-- Low-mappability regions (telomeres, centromeres, satellite repeats).
-- Extreme GC bias regions.
-- Bins with essentially no contacts (NaN noise values).
+Bins are flagged using the Kneedle algorithm applied independently to two metrics:
 
-This module flags bins based on their noise values: bins above a user-specified noise
-threshold (either a z-score cutoff or a quantile threshold) and bins with non-finite
-noise (NaN/Inf) are merged into a BED-format blacklist.
+- **Contact density** (per-bin row sums from ``noise_fullmap``)
+- **Noise values** (lag-1 autocovariance metric from ``noise_fullmap``)
 
-Main entry point: ``build_blacklist_from_bedgraphs()``.
+The union rule flags a bin when it falls outside the data-driven threshold in
+either metric.  Flagged intervals are merged into a BED-format blacklist.
+
+Main entry points:
+
+- ``detect_elbow_thresholds()``            — compute per-chromosome thresholds
+- ``build_blacklist_from_elbow_thresholds()`` — run detection and write BED
 """
-import math
 import os
-from typing import Iterable, Sequence
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy.ndimage import gaussian_filter1d
 
-
-def _gather_paths(patterns: Sequence[str]) -> list[str]:
-    """
-    Expand a list of file paths and/or glob patterns into a sorted list of absolute paths.
-
-    Accepts a mix of:
-    - Literal file paths (e.g. ``"/data/chr1_10000.bedgraph"``): included if the file
-      exists, silently ignored if it does not.
-    - Glob patterns (containing ``*``, ``?``, or ``[...]``): expanded using
-      ``glob.glob()``; matched files are included, non-matching patterns produce no
-      error (the empty match is silently ignored).
-
-    Duplicate paths (from overlapping globs or explicit + glob matches) are deduplicated.
-    The returned list is sorted alphabetically for deterministic processing order.
-
-    Parameters
-    ----------
-    patterns : Sequence[str]
-        Mix of literal file paths and glob patterns to expand.
-
-    Returns
-    -------
-    list of str
-        Sorted, deduplicated list of absolute paths to existing files.
-    """
-    unique: set[str] = set()
-    for pat in patterns:
-        if "*" in pat or "?" in pat or "[" in pat:
-            import glob
-            # Expand glob pattern; only include files (not directories)
-            matches = glob.glob(pat)
-            unique.update(os.path.abspath(p) for p in matches if os.path.isfile(p))
-        else:
-            if os.path.isfile(pat):
-                unique.add(os.path.abspath(pat))
-    return sorted(unique)
 
 
 def _merge_intervals(df: pd.DataFrame) -> pd.DataFrame:
@@ -150,113 +113,311 @@ def _merge_intervals(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def build_blacklist_from_bedgraphs(
-    inputs: Sequence[str],
-    output_path: str,
-    zscore_cutoff: float | None = None,
-    top_quantile: float = 0.95,
-    bottom_quantile: float = 0.01,
-) -> None:
+
+# ---------------------------------------------------------------------------
+# Elbow detection helpers (Kneedle method)
+# ---------------------------------------------------------------------------
+
+def _apply_transform(y: np.ndarray, transform: str) -> np.ndarray:
+    """Apply a variance-stabilising transform before Kneedle normalisation."""
+    if transform == "sqrt":
+        return np.sqrt(np.clip(y, 0.0, None))
+    if transform == "cbrt":
+        return np.cbrt(y)
+    if transform == "log1p":
+        return np.log1p(np.clip(y, 0.0, None))
+    return y.astype(float)  # "none"
+
+
+def _kneedle(values: np.ndarray, smooth_sigma: float, transform: str = "none") -> int:
     """
-    Load one or more per-chromosome bedgraphs, flag rows with extreme noise values or
-    non-finite noise, and emit a blacklist BED file with merged intervals.
+    Core Kneedle on a sorted ascending 1-D array.
 
-    Flagging is two-tailed: both the noisiest bins (high tail) and the smoothest bins
-    (low tail) are flagged. Bins with non-finite noise (NaN or Inf) are always flagged
-    regardless of the selected mode.
-
-    **Upper tail — noisy bins**:
-
-    *Z-score mode* (``zscore_cutoff`` is not None):
-        Compute z-scores across all loaded bedgraphs: z = (noise - mean) / std.
-        Flag bins with z ≥ zscore_cutoff. If std == 0, flag bins at or above the mean.
-
-    *Quantile mode* (``zscore_cutoff`` is None, default):
-        Flag bins at or above the ``top_quantile`` percentile (default 0.95 = top 5%).
-
-    **Lower tail — suspiciously smooth bins** (quantile mode only):
-        Flag bins at or below the ``bottom_quantile`` percentile (default 0.01 = bottom
-        1%). Bins with unnaturally regular contact patterns can arise from collapsed
-        repeats, copy-number amplifications, or PCR artefacts. Set ``bottom_quantile=0``
-        to disable lower-tail flagging.
-
-    Flagged intervals are merged per chromosome using ``_merge_intervals()``.
-
-    Parameters
-    ----------
-    inputs : Sequence[str]
-        File paths or glob patterns for per-chromosome bedgraph files.
-    output_path : str
-        Output BED file path (parent directories created if absent).
-    zscore_cutoff : float or None
-        Z-score upper threshold. If None, ``top_quantile`` is used instead.
-    top_quantile : float
-        Upper quantile threshold, 0–1 (default 0.95 = top 5%). Ignored when
-        ``zscore_cutoff`` is set.
-    bottom_quantile : float
-        Lower quantile threshold, 0–1 (default 0.01 = bottom 1%). Set to 0 to disable.
-
-    Raises
-    ------
-    ValueError
-        If no bedgraph files are found or all loaded files are empty.
+    Returns the local index at which the perpendicular distance from the
+    normalised curve to the unit diagonal y = x is maximised.  ``transform``
+    is applied after Gaussian smoothing so right-skewed distributions are
+    spread before normalisation; the returned index is into the original array.
     """
-    paths = _gather_paths(inputs)
-    if not paths:
-        raise ValueError("No bedgraph files found for provided inputs")
+    y = gaussian_filter1d(values.astype(float), sigma=max(1.0, float(smooth_sigma)))
+    y = _apply_transform(y, transform)
+    span = float(y[-1]) - float(y[0])
+    if span < 1e-12:
+        return len(values) - 1
+    y_n = (y - y[0]) / span
+    x_n = np.linspace(0.0, 1.0, len(y))
+    return int(np.argmax(np.abs(y_n - x_n) / np.sqrt(2.0)))
 
-    frames = []
-    for path in paths:
-        df = pd.read_csv(
-            path,
-            sep=r"\s+",
-            header=None,
-            names=["chrom", "start", "end", "noise"],
-            dtype={"chrom": str},
-            engine="c",
+
+def detect_upper_elbow(
+    values: np.ndarray,
+    search_frac: float = 0.40,
+    smooth_sigma: float = 10.0,
+    transform: str = "none",
+) -> int:
+    """
+    Return the global index of the upper (high-value) elbow in a sorted array.
+
+    Restricts the Kneedle search to the top ``search_frac`` fraction so that
+    normalisation spans the exponential spike region rather than the gradual bulk.
+    """
+    n = len(values)
+    start = max(0, int(n * (1.0 - search_frac)))
+    return start + _kneedle(values[start:], smooth_sigma, transform)
+
+
+def detect_lower_elbow(
+    values: np.ndarray,
+    search_frac: float = 0.30,
+    smooth_sigma: float = 10.0,
+    transform: str = "none",
+) -> int:
+    """
+    Return the global index of the lower (near-zero) elbow in a sorted array.
+
+    Restricts the Kneedle search to the bottom ``search_frac`` fraction to find
+    where near-zero / empty bins transition into the normal population.
+    """
+    end = max(3, int(len(values) * search_frac))
+    return _kneedle(values[:end], smooth_sigma, transform)
+
+
+def _analyse_chrom_elbow(
+    d_sorted: np.ndarray,
+    n_sorted: np.ndarray,
+    d_upper_frac: float,
+    d_lower_frac: float,
+    n_upper_frac: float,
+    n_lower_frac: float,
+    sigma: float,
+    d_transform: str = "none",
+    n_transform: str = "sqrt",
+) -> Dict:
+    """Compute all four elbow thresholds for one chromosome."""
+
+    def _threshold(arr: np.ndarray, idx: int) -> Dict:
+        return {"value": float(arr[idx]), "pct": 100.0 * idx / len(arr)}
+
+    d_lo = detect_lower_elbow(d_sorted, d_lower_frac, sigma, d_transform)
+    d_hi = detect_upper_elbow(d_sorted, d_upper_frac, sigma, d_transform)
+    n_lo = detect_lower_elbow(n_sorted, n_lower_frac, sigma, n_transform)
+    n_hi = detect_upper_elbow(n_sorted, n_upper_frac, sigma, n_transform)
+
+    t: Dict = {}
+    for k, v in _threshold(d_sorted, d_lo).items():
+        t[f"density_lower_{k}"] = v
+    for k, v in _threshold(d_sorted, d_hi).items():
+        t[f"density_upper_{k}"] = v
+    for k, v in _threshold(n_sorted, n_lo).items():
+        t[f"noise_lower_{k}"] = v
+    for k, v in _threshold(n_sorted, n_hi).items():
+        t[f"noise_upper_{k}"] = v
+    t["d_lo_idx"] = d_lo
+    t["d_hi_idx"] = d_hi
+    t["n_lo_idx"] = n_lo
+    t["n_hi_idx"] = n_hi
+    return t
+
+
+def _canonical_chrom_key(c: str):
+    """Sort key that places chr1–22 before chrX/Y/M, decoys last."""
+    num_str = (
+        c.replace("chr", "")
+         .replace("X", "23")
+         .replace("Y", "24")
+         .replace("M", "25")
+         .split("_")[0]
+    )
+    return (not c.startswith("chr"), int(num_str) if num_str.isdigit() else 99, c)
+
+
+# ---------------------------------------------------------------------------
+# Elbow-based blacklist — public API
+# ---------------------------------------------------------------------------
+
+_ELBOW_TSV_COLS = [
+    "chrom", "n_bins",
+    "density_lower_value", "density_lower_pct",
+    "density_upper_value", "density_upper_pct",
+    "noise_lower_value",   "noise_lower_pct",
+    "noise_upper_value",   "noise_upper_pct",
+]
+
+
+def detect_elbow_thresholds(
+    density_bedgraph: str,
+    noise_bedgraph: str,
+    smooth_sigma: float = 10.0,
+    density_upper_frac: float = 0.01,
+    density_lower_frac: float = 0.01,
+    noise_upper_frac: float = 0.10,
+    noise_lower_frac: float = 0.01,
+    density_transform: str = "none",
+    noise_transform: str = "sqrt",
+) -> Tuple[pd.DataFrame, dict]:
+    """
+    Run per-chromosome dual-metric elbow detection on density and noise bedgraphs.
+
+    Returns
+    -------
+    thresholds_df : pd.DataFrame
+        One row per chromosome with columns defined by ``_ELBOW_TSV_COLS``.
+    per_chrom_curves : dict
+        ``chrom → (d_sorted, n_sorted, d_lo_idx, d_hi_idx, n_lo_idx, n_hi_idx)``
+        passed to ``figures.plot_elbow_figure()`` for the diagnostic figure.
+    """
+    from .noise_to_weights import _load_bedgraph, _is_decoy_chrom
+
+    d_df = _load_bedgraph(density_bedgraph)
+    n_df = _load_bedgraph(noise_bedgraph)
+    d_df["value"] = pd.to_numeric(d_df["value"], errors="coerce")
+    n_df["value"] = pd.to_numeric(n_df["value"], errors="coerce")
+
+    chroms = [
+        c for c in sorted(
+            set(d_df["chrom"].unique()) & set(n_df["chrom"].unique()),
+            key=_canonical_chrom_key,
         )
-        df["source"] = os.path.basename(path)
-        # Coerce noise column to float; non-numeric values (e.g. "nan", "NaN") become NaN
-        df["noise"] = pd.to_numeric(df["noise"], errors="coerce")
-        frames.append(df)
+        if not _is_decoy_chrom(c)
+    ]
 
-    data = pd.concat(frames, ignore_index=True)
-    if data.empty:
-        raise ValueError("No rows found in bedgraph inputs")
+    results = []
+    per_chrom_curves: dict = {}
 
-    # Always flag non-finite bins (NaN/Inf = no reliable noise estimate)
-    flagged = ~np.isfinite(data["noise"])
-    valid_mask = np.isfinite(data["noise"])
-    valid_values = data.loc[valid_mask, "noise"]
+    for chrom in chroms:
+        d_raw = d_df.loc[d_df["chrom"] == chrom, "value"].to_numpy(float)
+        n_raw = n_df.loc[n_df["chrom"] == chrom, "value"].to_numpy(float)
+        d_sorted = np.sort(d_raw[np.isfinite(d_raw)])
+        n_sorted = np.sort(n_raw[np.isfinite(n_raw)])
 
-    if not valid_values.empty:
-        if zscore_cutoff is not None:
-            # Z-score mode: flag bins that deviate far above the mean
-            mean = float(valid_values.mean())
-            std = float(valid_values.std(ddof=0))
-            if std <= 0:
-                # Degenerate: all values are identical. Flag anything at or above mean.
-                thresh_mask = valid_values >= mean
-            else:
-                zscores = (valid_values - mean) / std
-                thresh_mask = zscores >= float(zscore_cutoff)
+        if len(d_sorted) < 4 or len(n_sorted) < 4:
+            continue
+
+        t = _analyse_chrom_elbow(
+            d_sorted, n_sorted,
+            d_upper_frac=density_upper_frac,
+            d_lower_frac=density_lower_frac,
+            n_upper_frac=noise_upper_frac,
+            n_lower_frac=noise_lower_frac,
+            sigma=smooth_sigma,
+            d_transform=density_transform,
+            n_transform=noise_transform,
+        )
+        results.append({"chrom": chrom, "n_bins": len(d_sorted), **t})
+        per_chrom_curves[chrom] = (
+            d_sorted, n_sorted,
+            t["d_lo_idx"], t["d_hi_idx"],
+            t["n_lo_idx"], t["n_hi_idx"],
+        )
+
+    tsv_rows = [{k: r[k] for k in _ELBOW_TSV_COLS} for r in results]
+    return pd.DataFrame(tsv_rows, columns=_ELBOW_TSV_COLS), per_chrom_curves
+
+
+def build_blacklist_from_elbow_thresholds(
+    density_bedgraph: str,
+    noise_bedgraph: str,
+    output_path: str,
+    smooth_sigma: float = 10.0,
+    density_upper_frac: float = 0.01,
+    density_lower_frac: float = 0.01,
+    noise_upper_frac: float = 0.10,
+    noise_lower_frac: float = 0.01,
+    density_transform: str = "none",
+    noise_transform: str = "sqrt",
+    thresholds_df: Optional[pd.DataFrame] = None,
+    require_both_metrics: bool = False,
+) -> Tuple[pd.DataFrame, dict]:
+    """
+    Build a BED blacklist using per-chromosome elbow thresholds.
+
+    If ``thresholds_df`` is None, ``detect_elbow_thresholds()`` is called first.
+
+    Two flagging rules are available via ``require_both_metrics``:
+
+    Union rule (default, ``require_both_metrics=False``)::
+
+        flagged = non-finite(density) OR non-finite(noise)
+               OR density <= density_lower_value
+               OR density >= density_upper_value
+               OR noise   <= noise_lower_value
+               OR noise   >= noise_upper_value
+
+    Intersection rule (``require_both_metrics=True``)::
+
+        density_oob = density <= density_lower_value OR density >= density_upper_value
+        noise_oob   = noise   <= noise_lower_value   OR noise   >= noise_upper_value
+        flagged     = non-finite(density) OR non-finite(noise)
+                   OR (density_oob AND noise_oob)
+
+    The intersection rule is less conservative: a bin must be out-of-bounds for
+    both metrics simultaneously to be blacklisted.  Non-finite bins are always
+    flagged regardless of rule.
+
+    Returns
+    -------
+    (thresholds_df, per_chrom_curves)
+        The caller can save ``thresholds_df`` as a TSV and pass both to
+        ``figures.plot_elbow_figure()`` without re-running detection.
+    """
+    from .noise_to_weights import _load_bedgraph
+
+    per_chrom_curves: dict = {}
+    if thresholds_df is None:
+        thresholds_df, per_chrom_curves = detect_elbow_thresholds(
+            density_bedgraph=density_bedgraph,
+            noise_bedgraph=noise_bedgraph,
+            smooth_sigma=smooth_sigma,
+            density_upper_frac=density_upper_frac,
+            density_lower_frac=density_lower_frac,
+            noise_upper_frac=noise_upper_frac,
+            noise_lower_frac=noise_lower_frac,
+            density_transform=density_transform,
+            noise_transform=noise_transform,
+        )
+
+    d_df = _load_bedgraph(density_bedgraph)
+    n_df = _load_bedgraph(noise_bedgraph)
+    d_df["value"] = pd.to_numeric(d_df["value"], errors="coerce")
+    n_df["value"] = pd.to_numeric(n_df["value"], errors="coerce")
+
+    # Join density and noise on genomic coordinates
+    combined = d_df.rename(columns={"value": "density"}).merge(
+        n_df[["chrom", "start", "end", "value"]].rename(columns={"value": "noise"}),
+        on=["chrom", "start", "end"],
+        how="outer",
+    )
+
+    # Always flag non-finite bins
+    flagged = ~np.isfinite(combined["density"]) | ~np.isfinite(combined["noise"])
+
+    # Per-chromosome threshold application
+    thresh_by_chrom = thresholds_df.set_index("chrom")
+    for chrom in thresh_by_chrom.index:
+        row = thresh_by_chrom.loc[chrom]
+        mask = combined["chrom"] == chrom
+        d_lo = float(row["density_lower_value"])
+        d_hi = float(row["density_upper_value"])
+        n_lo = float(row["noise_lower_value"])
+        n_hi = float(row["noise_upper_value"])
+        density_oob = (
+            (combined.loc[mask, "density"] <= d_lo) |
+            (combined.loc[mask, "density"] >= d_hi)
+        )
+        noise_oob = (
+            (combined.loc[mask, "noise"] <= n_lo) |
+            (combined.loc[mask, "noise"] >= n_hi)
+        )
+        if require_both_metrics:
+            flagged.loc[mask] |= density_oob & noise_oob
         else:
-            # Quantile mode: flag bins at or above the Nth percentile
-            quantile_value = float(np.nanquantile(valid_values, float(top_quantile)))
-            thresh_mask = valid_values >= quantile_value
-        flagged.loc[valid_mask] |= thresh_mask
+            flagged.loc[mask] |= density_oob | noise_oob
 
-        # Lower tail: flag bins at or below the bottom_quantile percentile
-        if bottom_quantile > 0.0:
-            floor_value = float(np.nanquantile(valid_values, float(bottom_quantile)))
-            flagged.loc[valid_mask] |= (valid_values <= floor_value)
-
-    flagged_df = data.loc[flagged, ["chrom", "start", "end"]].copy()
-    if flagged_df.empty:
-        merged = pd.DataFrame(columns=["chrom", "start", "end"])
-    else:
-        merged = _merge_intervals(flagged_df)
+    flagged_df = combined.loc[flagged, ["chrom", "start", "end"]].copy()
+    merged = _merge_intervals(flagged_df) if not flagged_df.empty else pd.DataFrame(
+        columns=["chrom", "start", "end"]
+    )
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
-    # Write as tab-separated BED (no header, no index) — compatible with bedtools and IGV
     merged.to_csv(output_path, sep="\t", header=False, index=False)
+
+    return thresholds_df, per_chrom_curves

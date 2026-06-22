@@ -28,8 +28,9 @@ plot
     Render a density histogram of noise values from a bedgraph file.
 
 blacklist
-    Build a BED-format blacklist from per-chromosome noise bedgraphs by flagging
-    bins with high noise or NaN values.
+    Build a per-chromosome BED blacklist from noise and density bedgraphs using
+    data-driven elbow detection.  Requires --density_bedgraph and --noise_bedgraph
+    (outputs of full-noise).
 
 sequencing-advisor
     Re-run the sequencing depth advisor from a saved subsample_summary.tsv, optionally
@@ -518,35 +519,67 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # blacklist                                                            #
     # ------------------------------------------------------------------ #
-    # Subparser for flagging noisy/sparse bins and producing a BED blacklist.
-    sp_mask = sub.add_parser("blacklist", help="Build a blacklist from per-chrom bedgraphs")
+    # Subparser for elbow-based blacklist generation.
+    sp_mask = sub.add_parser(
+        "blacklist",
+        help="Build a per-chromosome BED blacklist using elbow detection on density + noise",
+    )
     sp_mask.add_argument(
-        "--input",
-        nargs="+",
+        "--out_dir",
         required=True,
-        help="One or more bedgraph paths or glob patterns (e.g. chr*.bedgraph)",
-    )
-    sp_mask.add_argument("--out", required=True, help="Output BED path for blacklisted intervals")
-    sp_mask.add_argument(
-        "--zscore_cutoff",
-        type=float,
-        help="Z-score cutoff; rows with noise z-score >= value are blacklisted",
+        help=(
+            "Output directory.  Writes: elbow_blacklist.bed, elbow_thresholds.tsv, "
+            "elbow.png, elbow.pdf"
+        ),
     )
     sp_mask.add_argument(
-        "--top_quantile",
-        type=float,
-        default=0.95,
-        # 0.95 = flag the top 5% noisiest bins. Use 0.99 for a more conservative list
-        # (only the absolute worst 1%). The default-run pipeline uses 0.99.
-        help="Upper quantile threshold: bins at or above this percentile are flagged as noisy (default: 0.95)",
+        "--density_bedgraph",
+        required=True,
+        help="Density bedgraph ({res}_density.bedgraph) produced by full-noise",
     )
     sp_mask.add_argument(
-        "--bottom_quantile",
-        type=float,
-        default=0.01,
-        # 0.01 = flag the bottom 1% smoothest bins (suspiciously uniform contact patterns).
-        # Set to 0 to disable lower-tail flagging entirely.
-        help="Lower quantile threshold: bins at or below this percentile are flagged as suspiciously smooth (default: 0.01). Set to 0 to disable.",
+        "--noise_bedgraph",
+        required=True,
+        help="Noise bedgraph ({res}.bedgraph) produced by full-noise",
+    )
+    # Elbow tuning
+    sp_mask.add_argument(
+        "--density_transform", default="none",
+        choices=["none", "sqrt", "cbrt", "log1p"],
+        help="Pre-transform for density values in elbow detection (default: none)",
+    )
+    sp_mask.add_argument(
+        "--noise_transform", default="sqrt",
+        choices=["none", "sqrt", "cbrt", "log1p"],
+        help="Pre-transform for noise values in elbow detection (default: sqrt)",
+    )
+    sp_mask.add_argument(
+        "--density_upper_frac", type=float, default=0.01,
+        help="Top fraction of density bins searched for the upper elbow (default: 0.01 = top 1%%)",
+    )
+    sp_mask.add_argument(
+        "--density_lower_frac", type=float, default=0.01,
+        help="Bottom fraction of density bins searched for the lower elbow (default: 0.01 = bottom 1%%)",
+    )
+    sp_mask.add_argument(
+        "--noise_upper_frac", type=float, default=0.10,
+        help="Top fraction of noise bins searched for the upper elbow (default: 0.10 = top 10%%)",
+    )
+    sp_mask.add_argument(
+        "--noise_lower_frac", type=float, default=0.01,
+        help="Bottom fraction of noise bins searched for the lower elbow (default: 0.01 = bottom 1%%)",
+    )
+    sp_mask.add_argument(
+        "--elbow_smooth_sigma", type=float, default=10.0,
+        help="Gaussian smoothing sigma for elbow detection (default: 10.0)",
+    )
+    sp_mask.add_argument(
+        "--require_both_metrics", action="store_true", default=False,
+        help=(
+            "Use the intersection rule: flag a bin only when it is out-of-bounds "
+            "for BOTH density AND noise.  Default (off) uses the union rule: flag "
+            "when out-of-bounds for either metric."
+        ),
     )
 
     # ------------------------------------------------------------------ #
@@ -672,6 +705,34 @@ def main() -> None:
         help=(
             "Band size (rows) for sample-noise phase.  Prevents loading the full "
             "chromosome matrix at once.  Recommended: 2000–5000.  Default: full load."
+        ),
+    )
+    # Elbow blacklist tuning (Phase 4)
+    sp_run.add_argument(
+        "--density_transform", default="none",
+        choices=["none", "sqrt", "cbrt", "log1p"],
+        help="Pre-transform for density values in elbow detection (default: none)",
+    )
+    sp_run.add_argument(
+        "--noise_transform", default="sqrt",
+        choices=["none", "sqrt", "cbrt", "log1p"],
+        help="Pre-transform for noise values in elbow detection (default: sqrt)",
+    )
+    sp_run.add_argument("--density_upper_frac", type=float, default=0.01,
+                        help="Top fraction of density bins searched for the upper elbow (default: 0.01 = top 1%%)")
+    sp_run.add_argument("--density_lower_frac", type=float, default=0.01,
+                        help="Bottom fraction of density bins searched for the lower elbow (default: 0.01 = bottom 1%%)")
+    sp_run.add_argument("--noise_upper_frac", type=float, default=0.10,
+                        help="Top fraction of noise bins searched for the upper elbow (default: 0.10 = top 10%%)")
+    sp_run.add_argument("--noise_lower_frac", type=float, default=0.01,
+                        help="Bottom fraction of noise bins searched for the lower elbow (default: 0.01 = bottom 1%%)")
+    sp_run.add_argument("--elbow_smooth_sigma", type=float, default=10.0,
+                        help="Gaussian smoothing sigma for elbow detection (default: 10.0)")
+    sp_run.add_argument(
+        "--require_both_metrics", action="store_true", default=False,
+        help=(
+            "Use the intersection rule for blacklisting: flag a bin only when it is "
+            "out-of-bounds for BOTH density AND noise.  Default (off) uses the union rule."
         ),
     )
 
@@ -810,15 +871,36 @@ def main() -> None:
         _profile_command("plot", run)
 
     elif args.cmd == "blacklist":
+        os.makedirs(args.out_dir, exist_ok=True)
+        out_prefix    = os.path.join(args.out_dir, "elbow")
+        out_blacklist = out_prefix + "_blacklist.bed"
+        out_tsv       = out_prefix + "_thresholds.tsv"
 
         def run() -> None:
-            filters.build_blacklist_from_bedgraphs(
-                inputs=args.input,
-                output_path=args.out,
-                zscore_cutoff=args.zscore_cutoff,
-                top_quantile=args.top_quantile,
-                bottom_quantile=args.bottom_quantile,
+            thresholds_df, per_chrom_curves = filters.build_blacklist_from_elbow_thresholds(
+                density_bedgraph=args.density_bedgraph,
+                noise_bedgraph=args.noise_bedgraph,
+                output_path=out_blacklist,
+                smooth_sigma=args.elbow_smooth_sigma,
+                density_upper_frac=args.density_upper_frac,
+                density_lower_frac=args.density_lower_frac,
+                noise_upper_frac=args.noise_upper_frac,
+                noise_lower_frac=args.noise_lower_frac,
+                density_transform=args.density_transform,
+                noise_transform=args.noise_transform,
+                require_both_metrics=args.require_both_metrics,
             )
+            thresholds_df.to_csv(out_tsv, sep="\t", index=False, float_format="%.6g")
+            figures.plot_elbow_figure(
+                per_chrom_curves=per_chrom_curves,
+                results=thresholds_df.to_dict("records"),
+                out_prefix=out_prefix,
+                density_transform=args.density_transform,
+                noise_transform=args.noise_transform,
+            )
+            print(f"  → {out_blacklist}")
+            print(f"  → {out_tsv}")
+            print(f"  → {out_prefix}.png  /  {out_prefix}.pdf")
 
         _profile_command("blacklist", run)
 
@@ -1036,25 +1118,42 @@ def main() -> None:
                     )
                     print(f"  → {os.path.join(vectors_dir, mode, f'{res}.juicervector')}")
 
-            # Phase 4: Blacklist (flags top 1% noise bins — more conservative than the
-            # standalone ``blacklist`` command's default of top 5%)
-            print(f"\n[Phase 4] Building blacklist (P99 + NaN) at {res} bp ...")
-            full_noise_bed = os.path.join(full_dir, f"{res}.bedgraph")
-            if os.path.isfile(full_noise_bed):
-                out_blacklist = os.path.join(
-                    args.out_dir, f"{args.sample_name}_{res}_noise_blacklist.bed"
-                )
-                filters.build_blacklist_from_bedgraphs(
-                    inputs=[full_noise_bed],
+            # Phase 4: Elbow-based blacklist + diagnostic figures
+            print(f"\n[Phase 4] Building elbow blacklist at {res} bp ...")
+            density_bed = os.path.join(full_dir, f"{res}_density.bedgraph")
+            noise_bed   = os.path.join(full_dir, f"{res}.bedgraph")
+
+            if os.path.isfile(noise_bed) and os.path.isfile(density_bed):
+                out_prefix    = os.path.join(args.out_dir, f"{args.sample_name}_{res}_elbow")
+                out_blacklist = out_prefix + "_blacklist.bed"
+                out_tsv       = out_prefix + "_thresholds.tsv"
+
+                thresholds_df, per_chrom_curves = filters.build_blacklist_from_elbow_thresholds(
+                    density_bedgraph=density_bed,
+                    noise_bedgraph=noise_bed,
                     output_path=out_blacklist,
-                    # 0.99 = top 1% threshold; stricter than the standalone command's 0.95 default
-                    # because the full-noise bedgraph covers the entire genome and is more reliable.
-                    top_quantile=0.99,
-                    bottom_quantile=0.01,
+                    smooth_sigma=args.elbow_smooth_sigma,
+                    density_upper_frac=args.density_upper_frac,
+                    density_lower_frac=args.density_lower_frac,
+                    noise_upper_frac=args.noise_upper_frac,
+                    noise_lower_frac=args.noise_lower_frac,
+                    density_transform=args.density_transform,
+                    noise_transform=args.noise_transform,
+                    require_both_metrics=args.require_both_metrics,
+                )
+                thresholds_df.to_csv(out_tsv, sep="\t", index=False, float_format="%.6g")
+                figures.plot_elbow_figure(
+                    per_chrom_curves=per_chrom_curves,
+                    results=thresholds_df.to_dict("records"),
+                    out_prefix=out_prefix,
+                    density_transform=args.density_transform,
+                    noise_transform=args.noise_transform,
                 )
                 print(f"  → {out_blacklist}")
+                print(f"  → {out_tsv}")
+                print(f"  → {out_prefix}.png  /  {out_prefix}.pdf")
             else:
-                print(f"  [WARN] Full-noise bedgraph not found: {full_noise_bed}")
+                print(f"  [WARN] Bedgraph(s) not found for res={res} — skipping blacklist")
 
         print("\n[default-run] Complete.")
 

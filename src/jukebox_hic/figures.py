@@ -5,8 +5,9 @@ Matplotlib-based plotting utilities for Hi-C noise distribution visualization.
 These functions produce density histograms of the noise metric values from bedgraph
 files, useful for visually assessing data quality and comparing samples.
 """
-from typing import Tuple
+from typing import List, Tuple
 
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -155,3 +156,159 @@ def plot_two_noise_beds(
     ax.set_title("Noise Distributions")
     fig.tight_layout()
     fig.savefig(out_png, dpi=_FIGURE_DPI)
+
+
+# ---------------------------------------------------------------------------
+# Elbow diagnostic figure
+# ---------------------------------------------------------------------------
+
+_ELBOW_UPPER_COLOR = "#d62728"
+_ELBOW_LOWER_COLOR = "#1f77b4"
+_ELBOW_BAND_ALPHA  = 0.15
+
+
+def _elbow_apply_transform(y: np.ndarray, transform: str) -> np.ndarray:
+    """Variance-stabilising transform for elbow display (mirrors filters.py)."""
+    if transform == "sqrt":
+        return np.sqrt(np.clip(y, 0.0, None))
+    if transform == "cbrt":
+        return np.cbrt(y)
+    if transform == "log1p":
+        return np.log1p(np.clip(y, 0.0, None))
+    return y.astype(float)
+
+
+def _elbow_overlay_panel(
+    ax,
+    per_chrom_curves: dict,
+    sorted_key: int,
+    hi_key: int,
+    lo_key: int,
+    transform: str,
+    title: str,
+) -> None:
+    """Overlay normalised sorted curves for all chromosomes on one axes."""
+    cmap = matplotlib.colormaps["tab20"]
+    chrom_list = list(per_chrom_curves.keys())
+    hi_pcts, lo_pcts = [], []
+
+    for i, chrom in enumerate(chrom_list):
+        vals   = per_chrom_curves[chrom][sorted_key]
+        hi_idx = per_chrom_curves[chrom][hi_key]
+        lo_idx = per_chrom_curves[chrom][lo_key]
+
+        x_n    = np.linspace(0.0, 100.0, len(vals))
+        y_disp = _elbow_apply_transform(vals, transform)
+        span   = float(y_disp[-1]) - float(y_disp[0])
+        if span < 1e-12:
+            continue
+        y_plot = (y_disp - y_disp[0]) / span
+        ax.plot(x_n, y_plot, lw=0.5, alpha=0.4, color=cmap(i % 20))
+        hi_pcts.append(100.0 * hi_idx / len(vals))
+        lo_pcts.append(100.0 * lo_idx / len(vals))
+
+    if hi_pcts:
+        med_hi = float(np.median(hi_pcts))
+        med_lo = float(np.median(lo_pcts))
+        ax.axvspan(med_hi - 1, med_hi + 1, color=_ELBOW_UPPER_COLOR, alpha=_ELBOW_BAND_ALPHA)
+        ax.axvline(med_hi, color=_ELBOW_UPPER_COLOR, lw=1.5, ls="--",
+                   label=f"Median upper elbow: {med_hi:.1f}th pct")
+        ax.axvspan(med_lo - 1, med_lo + 1, color=_ELBOW_LOWER_COLOR, alpha=_ELBOW_BAND_ALPHA)
+        ax.axvline(med_lo, color=_ELBOW_LOWER_COLOR, lw=1.5, ls="--",
+                   label=f"Median lower elbow: {med_lo:.1f}th pct")
+
+    ylabel = f"Normalised value ({transform})" if transform != "none" else "Normalised value"
+    ax.set_title(title, fontsize=10)
+    ax.set_xlabel("Bin percentile (%)", fontsize=8)
+    ax.set_ylabel(ylabel, fontsize=8)
+    ax.legend(fontsize=7, loc="upper left")
+    ax.grid(True, lw=0.3, alpha=0.4)
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 1)
+
+
+def _elbow_dotplot_panel(
+    ax,
+    results: List[dict],
+    hi_col: str,
+    lo_col: str,
+    title: str,
+) -> None:
+    """Per-chromosome scatter of elbow percentiles (upper=red, lower=blue)."""
+    chroms  = [r["chrom"] for r in results]
+    hi_pcts = [r[hi_col] for r in results]
+    lo_pcts = [r[lo_col] for r in results]
+    x = np.arange(len(chroms))
+
+    ax.scatter(x, hi_pcts, color=_ELBOW_UPPER_COLOR, s=30, zorder=3, label="Upper elbow")
+    ax.scatter(x, lo_pcts, color=_ELBOW_LOWER_COLOR, s=30, zorder=3, label="Lower elbow")
+    ax.axhline(float(np.median(hi_pcts)), color=_ELBOW_UPPER_COLOR, lw=1.0, ls=":", alpha=0.6)
+    ax.axhline(float(np.median(lo_pcts)), color=_ELBOW_LOWER_COLOR, lw=1.0, ls=":", alpha=0.6)
+    ax.set_xticks(x)
+    ax.set_xticklabels(chroms, rotation=90, fontsize=6)
+    ax.set_ylabel("Elbow percentile (%)", fontsize=8)
+    ax.set_title(title, fontsize=10)
+    ax.legend(fontsize=7)
+    ax.grid(True, lw=0.3, alpha=0.4, axis="y")
+
+
+def plot_elbow_figure(
+    per_chrom_curves: dict,
+    results: List[dict],
+    out_prefix: str,
+    density_transform: str = "none",
+    noise_transform: str = "sqrt",
+) -> None:
+    """
+    Save the 2×2 elbow diagnostic figure as both PNG and PDF.
+
+    ``out_prefix`` is the output path without extension
+    (e.g. ``/out/sample_10000_elbow``).  Writes ``{out_prefix}.png`` (150 dpi)
+    and ``{out_prefix}.pdf`` (vector).
+
+    Parameters
+    ----------
+    per_chrom_curves : dict
+        ``chrom → (d_sorted, n_sorted, d_lo_idx, d_hi_idx, n_lo_idx, n_hi_idx)``
+        as returned by ``filters.detect_elbow_thresholds()``.
+    results : list of dict
+        Per-chromosome threshold rows (from ``thresholds_df.to_dict("records")``).
+    out_prefix : str
+        Output path without file extension.
+    density_transform, noise_transform : str
+        The same transforms used during detection, applied here for display.
+    """
+    # Tuple layout: (d_sorted=0, n_sorted=1, d_lo_idx=2, d_hi_idx=3, n_lo_idx=4, n_hi_idx=5)
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    fig.suptitle(
+        "Per-chromosome elbow detection — density & noise metrics",
+        fontsize=11,
+    )
+
+    _elbow_overlay_panel(
+        axes[0, 0], per_chrom_curves,
+        sorted_key=0, hi_key=3, lo_key=2,
+        transform=density_transform,
+        title=f"Density — sorted curves (normalised, transform={density_transform})",
+    )
+    _elbow_overlay_panel(
+        axes[0, 1], per_chrom_curves,
+        sorted_key=1, hi_key=5, lo_key=4,
+        transform=noise_transform,
+        title=f"Noise — sorted curves (normalised, transform={noise_transform})",
+    )
+    _elbow_dotplot_panel(
+        axes[1, 0], results,
+        hi_col="density_upper_pct", lo_col="density_lower_pct",
+        title="Density elbow percentile per chromosome",
+    )
+    _elbow_dotplot_panel(
+        axes[1, 1], results,
+        hi_col="noise_upper_pct", lo_col="noise_lower_pct",
+        title="Noise elbow percentile per chromosome",
+    )
+
+    plt.tight_layout()
+    plt.savefig(out_prefix + ".png", dpi=150, bbox_inches="tight")
+    plt.savefig(out_prefix + ".pdf", bbox_inches="tight")
+    plt.close(fig)
