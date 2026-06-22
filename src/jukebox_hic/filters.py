@@ -325,33 +325,35 @@ def build_blacklist_from_elbow_thresholds(
     density_transform: str = "none",
     noise_transform: str = "sqrt",
     thresholds_df: Optional[pd.DataFrame] = None,
-    require_both_metrics: bool = False,
+    mode: str = "union",
 ) -> Tuple[pd.DataFrame, dict]:
     """
     Build a BED blacklist using per-chromosome elbow thresholds.
 
     If ``thresholds_df`` is None, ``detect_elbow_thresholds()`` is called first.
 
-    Two flagging rules are available via ``require_both_metrics``:
+    Four flagging modes are available via ``mode``:
 
-    Union rule (default, ``require_both_metrics=False``)::
-
+    ``"union"`` (default)::
         flagged = non-finite(density) OR non-finite(noise)
-               OR density <= density_lower_value
-               OR density >= density_upper_value
-               OR noise   <= noise_lower_value
-               OR noise   >= noise_upper_value
+               OR density_oob OR noise_oob
 
-    Intersection rule (``require_both_metrics=True``)::
+    ``"intersection"``::
+        flagged = non-finite(density) OR non-finite(noise)
+               OR (density_oob AND noise_oob)
 
-        density_oob = density <= density_lower_value OR density >= density_upper_value
-        noise_oob   = noise   <= noise_lower_value   OR noise   >= noise_upper_value
-        flagged     = non-finite(density) OR non-finite(noise)
-                   OR (density_oob AND noise_oob)
+    ``"density_only"``::
+        flagged = non-finite(density) OR density_oob
+        (noise metric is ignored entirely)
 
-    The intersection rule is less conservative: a bin must be out-of-bounds for
-    both metrics simultaneously to be blacklisted.  Non-finite bins are always
-    flagged regardless of rule.
+    ``"noise_only"``::
+        flagged = non-finite(noise) OR noise_oob
+        (density metric is ignored entirely)
+
+    where ``density_oob = density <= density_lower_value OR density >= density_upper_value``
+    and   ``noise_oob   = noise   <= noise_lower_value   OR noise   >= noise_upper_value``.
+
+    Non-finite bins are always flagged within the scope of their relevant metric(s).
 
     Returns
     -------
@@ -387,8 +389,13 @@ def build_blacklist_from_elbow_thresholds(
         how="outer",
     )
 
-    # Always flag non-finite bins
-    flagged = ~np.isfinite(combined["density"]) | ~np.isfinite(combined["noise"])
+    # Seed with mode-appropriate non-finite flags
+    if mode == "density_only":
+        flagged = ~np.isfinite(combined["density"])
+    elif mode == "noise_only":
+        flagged = ~np.isfinite(combined["noise"])
+    else:  # union / intersection
+        flagged = ~np.isfinite(combined["density"]) | ~np.isfinite(combined["noise"])
 
     # Per-chromosome threshold application
     thresh_by_chrom = thresholds_df.set_index("chrom")
@@ -407,9 +414,13 @@ def build_blacklist_from_elbow_thresholds(
             (combined.loc[mask, "noise"] <= n_lo) |
             (combined.loc[mask, "noise"] >= n_hi)
         )
-        if require_both_metrics:
+        if mode == "density_only":
+            flagged.loc[mask] |= density_oob
+        elif mode == "noise_only":
+            flagged.loc[mask] |= noise_oob
+        elif mode == "intersection":
             flagged.loc[mask] |= density_oob & noise_oob
-        else:
+        else:  # union
             flagged.loc[mask] |= density_oob | noise_oob
 
     flagged_df = combined.loc[flagged, ["chrom", "start", "end"]].copy()
