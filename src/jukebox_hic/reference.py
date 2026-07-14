@@ -31,7 +31,9 @@ Module contents
 ---------------
 - ``compute_noise_model()``                 — compute spline-based quality metrics
 - ``compute_zmap()``                        — deprecated wrapper around compute_noise_model
-- ``sequencing_advisor()``                  — predict depth needed to reach target quality
+- ``select_advisor_resolution()``           — ENCODE-tier resolution selection from total contacts
+- ``aggregate_genome_wide_noise_ebr()``     — contact-weighted genome-wide noise/EBR aggregation
+- ``map_sequencing_advisor()``              — whole-map sequencing-sufficiency recommendation
 - ``_build_design_matrix()``               — build 11-feature design vector for one sample
 - ``_preprocess_noise_track()``             — shared noise preprocessing (smooth, log)
 - ``process_normalization_vectors_adaptive()`` — JUKEBOX-ADAPTIVE bias vector
@@ -41,12 +43,11 @@ Module contents
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.interpolate import BSpline
 from scipy.ndimage import gaussian_filter1d
-from scipy.optimize import brentq
 
 # ---------------------------------------------------------------------------
 # JUKEBOX Hybrid Spline Model Constants
@@ -138,6 +139,28 @@ _DECILE_BETAS: Dict[int, np.ndarray] = {
     80: np.array([-10.6838, 6.4941, 6.3865, 10.8508, 12.1604, 11.7751, 12.2638, 12.1899, 12.2361,  3.6430, -2.4016]),
     90: np.array([-10.0198, 5.9371, 6.0107, 10.3712, 11.7477, 11.3243, 12.0291, 11.5292, 11.8412,  3.5812, -2.4003]),
 }
+
+# ---------------------------------------------------------------------------
+# ENCODE-standards Whole-Map Sequencing Advisor Tiers
+# ---------------------------------------------------------------------------
+# Resolution (bin size, in bp) at which the whole-map residual (epsilon) should
+# be evaluated, selected by total genome-wide contact count. Each tuple is
+# (lower_bound_inclusive, upper_bound_exclusive, resolution_bp). A resolution
+# of None in the last tier means "use the finest (smallest bp) resolution
+# actually requested/run in this invocation" rather than a fixed value.
+_ADVISOR_RESOLUTION_TIERS: List[Tuple[float, float, Optional[int]]] = [
+    (0.0,              50_000_000.0,    100_000),
+    (50_000_000.0,     100_000_000.0,   25_000),
+    (100_000_000.0,    250_000_000.0,   10_000),
+    (250_000_000.0,    500_000_000.0,   5_000),
+    (500_000_000.0,    1_000_000_000.0, 1_000),
+    (1_000_000_000.0,  2_000_000_000.0, None),
+]
+
+# ENCODE guidance: 2 billion total contacts is considered sufficient for Hi-C.
+# At or above this, no further sequencing is ever advised, regardless of the
+# residual — this must be checked before any residual is computed/consulted.
+_ENCODE_SUFFICIENT_CONTACTS: float = 2_000_000_000.0
 
 # Pre-computed augmented knot vector and basis count (module-level, computed once)
 _KNOTS_AUG: np.ndarray = np.concatenate([
@@ -411,98 +434,176 @@ def compute_zmap(
     }
 
 
-def sequencing_advisor(
-    obs_noise: float,
-    current_rho_win: float,
-    ebr: float,
-    window_bp: int,
-    z_target: float = 0.0,
-    fold_threshold: float = 10.0,
-) -> Dict[str, object]:
+def select_advisor_resolution(
+    total_contacts: float,
+    available_resolutions: Sequence[int],
+) -> Optional[int]:
     """
-    Predict the sequencing depth needed to reach a target quality level.
+    Choose which resolution's whole-map data the sequencing advisor should
+    consult, based on total genome-wide contact count (ENCODE-standards tiers,
+    see ``_ADVISOR_RESOLUTION_TIERS``).
 
-    The spline model is not analytically invertible, so this function uses
-    ``scipy.optimize.brentq`` to numerically find the ρ_win value at which the
-    model's central prediction equals the target noise level.
-
-    Target derivation
-    -----------------
-    The target log-noise is anchored at the current sample's position in the
-    model:
-        half_envelope = (y_up(current) − y_lo(current)) / 2
-        target_log_N  = X(current) · β_mean + z_target × half_envelope
-
-    Then ``brentq`` finds L_target ∈ [L_MIN, L_MAX] such that:
-        X(L_target) · β_mean = target_log_N
-
-    fold_increase = ρ_win_target / ρ_win_current.
-
-    Because ρ_win = contacts / ((chrom_len/res) × (window_bp/res)), a fold
-    increase in ρ_win maps directly to the same fold increase in contacts
-    (window_bp and resolution are fixed).
+    Returns the target resolution in bp, or ``None`` if ``total_contacts``
+    already meets/exceeds the ENCODE-sufficient threshold
+    (``_ENCODE_SUFFICIENT_CONTACTS``) — callers must treat ``None`` as an
+    unconditional "Sufficient" short-circuit and must NOT evaluate the
+    residual in that case.
 
     Parameters
     ----------
-    obs_noise       : observed median noise from the sampling phase
-    current_rho_win : current effective matrix coverage
-                      (= contacts / ((chrom_len/res) × (window_bp/res)))
-    ebr             : mean empty bin ratio from the sampling phase
-    window_bp       : analysis window size in bp (used to compute rho_win)
-    z_target        : desired envelope-normalised z-score (default: 0.0)
-    fold_threshold  : fold-increase above which recommendation is "Stop"
-                      (default: 10.0)
+    total_contacts         : total contact pairs across the whole genome
+    available_resolutions  : resolutions (bp) actually requested/run in this
+                              invocation; used to resolve the "finest requested
+                              resolution" tier (1B–2B contacts)
+
+    Raises
+    ------
+    ValueError
+        If the finest-requested-resolution tier is selected but
+        ``available_resolutions`` is empty.
+    """
+    if total_contacts >= _ENCODE_SUFFICIENT_CONTACTS:
+        return None
+
+    for lower, upper, res in _ADVISOR_RESOLUTION_TIERS:
+        if lower <= total_contacts < upper:
+            if res is None:
+                if not available_resolutions:
+                    raise ValueError(
+                        "total_contacts falls in the finest-requested-resolution "
+                        "tier (1B–2B contacts), but no resolutions were provided."
+                    )
+                return min(int(r) for r in available_resolutions)
+            return res
+
+    # total_contacts < 0 (should not occur in practice) — fall back to the
+    # coarsest tier's resolution.
+    return _ADVISOR_RESOLUTION_TIERS[0][2]
+
+
+def aggregate_genome_wide_noise_ebr(
+    chrom_median_noise: Dict[str, float],
+    chrom_mean_ebr: Dict[str, float],
+    chrom_contacts: Dict[str, float],
+) -> Tuple[float, float]:
+    """
+    Aggregate per-chromosome ``median_noise`` and ``mean_empty_bin_ratio`` into
+    single genome-wide values, for use as inputs to ``map_sequencing_advisor()``.
+
+    Uses a contact-weighted mean:
+        agg_x = Σ(x_c · contacts_c) / Σ(contacts_c)
+
+    This mirrors how ρ_win (the model's core covariate) is itself an implicit
+    contact-weighted density over the genome, so chromosomes contributing more
+    contacts dominate the aggregate proportionally. Falls back to a plain
+    (unweighted) median across chromosomes only if total contact weight is
+    zero (degenerate case).
+
+    Parameters
+    ----------
+    chrom_median_noise : per-chromosome median noise, at one resolution
+    chrom_mean_ebr      : per-chromosome mean empty bin ratio, at the same resolution
+    chrom_contacts      : per-chromosome contacts, at the same resolution
+
+    Returns
+    -------
+    (agg_median_noise, agg_ebr) : Tuple[float, float]
+    """
+    chroms = [
+        c for c in chrom_median_noise
+        if c in chrom_contacts and c in chrom_mean_ebr
+        and np.isfinite(chrom_contacts[c]) and chrom_contacts[c] > 0
+        and np.isfinite(chrom_median_noise[c]) and np.isfinite(chrom_mean_ebr[c])
+    ]
+    if not chroms:
+        raise ValueError("No chromosomes with valid contacts/noise/ebr to aggregate.")
+
+    weights = np.array([chrom_contacts[c] for c in chroms], dtype=float)
+    total_w = float(weights.sum())
+    if total_w <= 0.0:
+        return (
+            float(np.median([chrom_median_noise[c] for c in chroms])),
+            float(np.median([chrom_mean_ebr[c] for c in chroms])),
+        )
+
+    noise_vals = np.array([chrom_median_noise[c] for c in chroms], dtype=float)
+    ebr_vals   = np.array([chrom_mean_ebr[c] for c in chroms], dtype=float)
+    return (
+        float(np.sum(noise_vals * weights) / total_w),
+        float(np.sum(ebr_vals * weights) / total_w),
+    )
+
+
+def map_sequencing_advisor(
+    total_contacts: float,
+    genome_len: int,
+    resolution: int,
+    window_bp: int,
+    median_noise: float,
+    ebr: float,
+) -> Dict[str, object]:
+    """
+    Whole-map sequencing-sufficiency check (ENCODE/4DN rule).
+
+    Rule
+    ----
+    1. If ``total_contacts >= _ENCODE_SUFFICIENT_CONTACTS`` (2 billion, per
+       ENCODE Hi-C guidance): short-circuit to "Sufficient" WITHOUT evaluating
+       any residual.
+    2. Otherwise call ``compute_noise_model()`` at whole-genome scale and use
+       the sign of ``epsilon`` (raw log10 residual, obs_log_N − pred_log_N):
+           epsilon > 0  → "Sequence Further" (quality has not yet reached the
+                          reference standard at this depth/resolution)
+           epsilon <= 0 → "Sufficient" (quality has met the reference standard)
+
+    Parameters
+    ----------
+    total_contacts : total contact pairs across the whole genome
+    genome_len     : total genome length in bp (sum of chromosome sizes)
+    resolution     : bin size in bp selected by ``select_advisor_resolution()``
+    window_bp      : analysis window size in bp for this resolution
+    median_noise   : genome-wide aggregated median noise (see
+                     ``aggregate_genome_wide_noise_ebr()``)
+    ebr            : genome-wide aggregated mean empty bin ratio
 
     Returns
     -------
     dict with keys:
-        target_density  — ρ_win value needed to reach z_target
-        fold_increase   — target_density / current_rho_win
-        recommendation  — "Proceed" or "Stop"
+        total_contacts, genome_len, resolution, window_bp, epsilon,
+        quality_status, recommendation
+        (``resolution``/``window_bp``/``epsilon``/``quality_status`` are
+        ``None``/NaN/"" when short-circuited at the 2B-contacts tier)
     """
-    nan_result: Dict[str, object] = {
-        "target_density": float("nan"),
-        "fold_increase": float("nan"),
-        "recommendation": "Insufficient data",
-    }
+    if total_contacts >= _ENCODE_SUFFICIENT_CONTACTS:
+        return {
+            "total_contacts":  float(total_contacts),
+            "genome_len":      int(genome_len),
+            "resolution":      None,
+            "window_bp":       None,
+            "epsilon":         float("nan"),
+            "quality_status":  "",
+            "recommendation":  "Sufficient",
+        }
 
-    if (
-        not np.isfinite(obs_noise)
-        or obs_noise <= 0.0
-        or not np.isfinite(current_rho_win)
-        or current_rho_win <= 0.0
-        or not np.isfinite(ebr)
-    ):
-        return nan_result
-
-    try:
-        L_current = float(np.log10(max(current_rho_win, 1e-300)))
-        X_current = _build_design_matrix(L_current, ebr)
-        pred_upper_c = float(X_current @ _BETA_UPPER)
-        pred_lower_c = float(X_current @ _BETA_LOWER)
-        half_envelope = (max(pred_upper_c, pred_lower_c) - min(pred_upper_c, pred_lower_c)) / 2.0
-        target_log_N = float(X_current @ _BETA_MEAN) + z_target * half_envelope
-
-        # Numerically invert: find L such that X(L)·β_mean = target_log_N
-        f = lambda L: float(_build_design_matrix(float(L), ebr) @ _BETA_MEAN) - target_log_N
-        f_lo = f(_L_MIN)
-        f_hi = f(_L_MAX)
-
-        if f_lo * f_hi > 0:
-            # No sign change → target_log_N is outside the model's predictable range
-            return nan_result
-
-        L_target = brentq(f, _L_MIN, _L_MAX, xtol=1e-6, maxiter=200)
-        rho_win_target = float(10.0 ** L_target)
-        fold_increase = rho_win_target / float(current_rho_win)
-        recommendation = "Stop" if fold_increase > float(fold_threshold) else "Proceed"
-    except Exception:
-        return nan_result
+    model_result = compute_noise_model(
+        contacts=total_contacts,
+        chrom_len=genome_len,
+        resolution=resolution,
+        window_bp=window_bp,
+        median_noise=median_noise,
+        ebr=ebr,
+    )
+    epsilon = model_result["epsilon"]
+    recommendation = "Sequence Further" if epsilon > 0.0 else "Sufficient"
 
     return {
-        "target_density": rho_win_target,
-        "fold_increase":  fold_increase,
-        "recommendation": recommendation,
+        "total_contacts":  float(total_contacts),
+        "genome_len":      int(genome_len),
+        "resolution":      int(resolution),
+        "window_bp":       int(window_bp),
+        "epsilon":         epsilon,
+        "quality_status":  model_result["quality_status"],
+        "recommendation":  recommendation,
     }
 
 

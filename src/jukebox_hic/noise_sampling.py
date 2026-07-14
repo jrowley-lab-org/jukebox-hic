@@ -13,7 +13,12 @@ Sampling a representative subset of rows (default: all rows, configurable via
 ``sample_fraction``) gives a fast, robust estimate of the median noise level and
 autocorrelation structure, which is then used to:
 - Compute the z-map quality score (via ``reference.compute_zmap``).
-- Power the sequencing advisor (via ``reference.sequencing_advisor``).
+- Feed the whole-map sequencing advisor: per-chromosome outputs (``z_map``,
+  ``epsilon``, ``quality_status``, ``quality_percentile``) are aggregated
+  across chromosomes (``reference.aggregate_genome_wide_noise_ebr``) and
+  evaluated at a resolution chosen by ``reference.select_advisor_resolution``,
+  via ``reference.map_sequencing_advisor`` — computed separately in ``cli.py``,
+  not in this module.
 - Optionally simulate what noise would look like at lower sequencing depths
   (via ``subsample_ratios``) to model sequencing depth effects.
 
@@ -715,7 +720,7 @@ def compute_sampled_noise(
                 "mean_empty_bin_ratio": mean_ebr,
                 # estimated_contacts at this ratio = actual contacts * downsampling ratio
                 "estimated_contacts": float(chrom_contacts * float(ratio)),
-                # Placeholder columns filled in below by compute_noise_model / sequencing_advisor
+                # Placeholder columns filled in below by compute_noise_model
                 "z_map": float("nan"),
                 "gamma": float("nan"),
                 "pred_log_N": float("nan"),
@@ -724,9 +729,6 @@ def compute_sampled_noise(
                 "epsilon": float("nan"),
                 "quality_status": "",
                 "quality_percentile": -1,
-                "advisor_target_density": float("nan"),
-                "advisor_fold_increase": float("nan"),
-                "advisor_recommendation": "",
             }
             # Only compute model metrics and advisor for the full-depth (ratio == 1.0)
             # run, since the reference model is calibrated against unsubsampled data.
@@ -765,20 +767,6 @@ def compute_sampled_noise(
                             ebr=mean_ebr,
                             obs_noise_log10=_obs_log_N,
                         )
-
-                        # current_rho_win = effective matrix coverage for this chrom
-                        current_rho_win = chrom_contacts / (
-                            (c_len / int(res)) * (window / int(res))
-                        )
-                        advisor_result = reference.sequencing_advisor(
-                            obs_noise=median_noise,
-                            current_rho_win=current_rho_win,
-                            ebr=mean_ebr,
-                            window_bp=window,
-                        )
-                        record["advisor_target_density"] = advisor_result["target_density"]
-                        record["advisor_fold_increase"]  = advisor_result["fold_increase"]
-                        record["advisor_recommendation"] = advisor_result["recommendation"]
                     except Exception:
                         # Expected failure modes: chromosome too sparse for a meaningful
                         # model evaluation (e.g. very short or unplaced chromosomes with

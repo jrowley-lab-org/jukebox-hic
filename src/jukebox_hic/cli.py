@@ -33,19 +33,25 @@ blacklist
     (outputs of full-noise).
 
 sequencing-advisor
-    Re-run the sequencing depth advisor from a saved subsample_summary.tsv, optionally
-    with different target z-score or fold-increase threshold.
+    Whole-map ENCODE/4DN sequencing-sufficiency check: reads one
+    subsample_summary.tsv per resolution under --summary_dir, picks a
+    resolution tier from total genome-wide contacts, and produces a single
+    genome-wide "Sequence Further" / "Sufficient" recommendation.
 
 default-run
     Run the full jukebox-hic pipeline in sequence:
-    Phase 1: sample-noise → Phase 2: full-noise → Phase 3: bias-vectors → Phase 4: blacklist.
+    Phase 1: sample-noise → Phase 1.5: sequencing-advisor →
+    Phase 2: full-noise → Phase 3: bias-vectors → Phase 4: blacklist.
     Use this for a complete first-pass analysis.
 """
 import argparse
 import glob
+import io
 import os
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
+
+import pandas as pd
 
 from . import figures, noise_fullmap, noise_sampling, filters, noise_to_weights, reference
 from .backends import (
@@ -273,6 +279,175 @@ def _dump_contacts_once(
             continue
         contacts[chrom] = total_contacts(matrices)
     return contacts
+
+
+def _parse_subsample_summary(
+    path: str,
+) -> Tuple[Optional[int], Optional[int], Dict[str, int], "pd.DataFrame"]:
+    """
+    Parse one ``subsample_summary.tsv`` produced by ``sample-noise``.
+
+    The file format uses comment lines:
+        "# resolution=N"    — the resolution this summary was computed at
+        "# window_bp=N"     — the analysis window size used during sampling
+        "# chrom_info<tab>chrom<tab>contacts=N<tab>size_bp=N" — chromosome metadata
+    These are needed because chromosome sizes are not stored in the TSV body.
+
+    Parameters
+    ----------
+    path : str
+        Path to a subsample_summary.tsv file.
+
+    Returns
+    -------
+    (resolution, window_bp, chrom_sizes, df)
+        ``df`` is filtered to ``ratio == 1.0`` rows (full-depth) only.
+    """
+    resolution: Optional[int] = None
+    window_bp: Optional[int] = None
+    chrom_sizes: Dict[str, int] = {}
+    data_lines: List[str] = []
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith("# resolution="):
+                try:
+                    resolution = int(line.strip().split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif line.startswith("# window_bp="):
+                try:
+                    window_bp = int(line.strip().split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif line.startswith("# chrom_info"):
+                parts = line.strip().split("\t")
+                chrom_name = parts[1] if len(parts) > 1 else None
+                for part in parts[2:]:
+                    if part.startswith("size_bp="):
+                        try:
+                            size = int(part.split("=", 1)[1])
+                            if chrom_name:
+                                chrom_sizes[chrom_name] = size
+                        except ValueError:
+                            pass
+            elif not line.startswith("#"):
+                data_lines.append(line)
+
+    df = pd.read_csv(io.StringIO("".join(data_lines)), sep="\t")
+    if "ratio" in df.columns:
+        df = df[df["ratio"] == 1.0].copy()
+    return resolution, window_bp, chrom_sizes, df
+
+
+def _read_total_from_contacts_overview(path: str) -> float:
+    """Read a contacts_overview.tsv and return the TOTAL row's contacts value."""
+    df = pd.read_csv(path, sep="\t")
+    return float(df.loc[df["chrom"] == "TOTAL", "contacts"].iloc[0])
+
+
+def _run_sequencing_advisor(summary_dir: str, out_path: str) -> Dict[str, object]:
+    """
+    Whole-map sequencing-sufficiency check (ENCODE/4DN rule).
+
+    Reads one ``{resolution}/subsample_summary.tsv`` per resolution
+    subdirectory of ``summary_dir`` (the layout produced by
+    ``sample-noise --out_dir <summary_dir>``, or ``default-run``'s
+    ``<out_dir>/sample`` directory), selects a resolution tier from the total
+    genome-wide contact count, aggregates per-chromosome noise/EBR at that
+    resolution, and evaluates ``reference.map_sequencing_advisor()``.
+
+    Writes a single-row TSV to ``out_path`` and prints a one-line summary.
+
+    Parameters
+    ----------
+    summary_dir : str
+        Directory containing one ``{resolution}/subsample_summary.tsv`` per
+        resolution.
+    out_path : str
+        Output TSV path for the advisor report.
+
+    Returns
+    -------
+    Dict[str, object]
+        The advisor result (see ``reference.map_sequencing_advisor()``), plus
+        ``resolution_selected`` (tier target) and ``resolution_used`` (actual,
+        possibly a fallback).
+    """
+    available: Dict[int, str] = {}
+    for name in sorted(os.listdir(summary_dir)):
+        sub_path = os.path.join(summary_dir, name, "subsample_summary.tsv")
+        if name.isdigit() and os.path.isfile(sub_path):
+            available[int(name)] = sub_path
+    if not available:
+        raise SystemExit(
+            f"No <resolution>/subsample_summary.tsv found under {summary_dir}. "
+            "Run sample-noise (or default-run) first."
+        )
+
+    # total_contacts is resolution-independent — read from any one available resolution.
+    any_res = sorted(available)[0]
+    _, _, _, any_df = _parse_subsample_summary(available[any_res])
+    overview_path = os.path.join(summary_dir, str(any_res), "contacts_overview.tsv")
+    if os.path.isfile(overview_path):
+        total_contacts_val = _read_total_from_contacts_overview(overview_path)
+    else:
+        total_contacts_val = float(any_df["estimated_contacts"].sum())
+
+    resolution_selected = reference.select_advisor_resolution(total_contacts_val, list(available.keys()))
+
+    if resolution_selected is None:
+        result: Dict[str, object] = {
+            "total_contacts":  total_contacts_val,
+            "genome_len":      None,
+            "resolution":      None,
+            "window_bp":       None,
+            "epsilon":         float("nan"),
+            "quality_status":  "",
+            "recommendation":  "Sufficient",
+            "resolution_selected": None,
+            "resolution_used":    None,
+        }
+    else:
+        if resolution_selected in available:
+            resolution_used = resolution_selected
+        else:
+            resolution_used = min(available, key=lambda r: abs(r - resolution_selected))
+            print(
+                f"[WARN] sequencing-advisor: tier requires {resolution_selected} bp, "
+                f"but only {sorted(available)} bp were run. Falling back to nearest "
+                f"available: {resolution_used} bp. For an accurate check, re-run "
+                f"sample-noise with --res including {resolution_selected}."
+            )
+
+        _, window_bp, chrom_sizes, df = _parse_subsample_summary(available[resolution_used])
+        chrom_noise    = dict(zip(df["chrom"], df["median_noise"].astype(float)))
+        chrom_ebr      = dict(zip(df["chrom"], df["mean_empty_bin_ratio"].astype(float)))
+        chrom_contacts = dict(zip(df["chrom"], df["estimated_contacts"].astype(float)))
+        genome_len = int(sum(chrom_sizes.values()))
+
+        agg_noise, agg_ebr = reference.aggregate_genome_wide_noise_ebr(chrom_noise, chrom_ebr, chrom_contacts)
+        if window_bp is None:
+            window_bp = noise_sampling._default_window_bp(resolution_used)
+        result = reference.map_sequencing_advisor(
+            total_contacts=total_contacts_val,
+            genome_len=genome_len,
+            resolution=resolution_used,
+            window_bp=window_bp,
+            median_noise=agg_noise,
+            ebr=agg_ebr,
+        )
+        result["resolution_selected"] = resolution_selected
+        result["resolution_used"] = resolution_used
+
+    out_df = pd.DataFrame([result])
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    out_df.to_csv(out_path, sep="\t", index=False)
+    print(
+        f"[sequencing-advisor] total_contacts={result['total_contacts']:.0f} "
+        f"resolution_used={result.get('resolution_used')} epsilon={result.get('epsilon')} "
+        f"-> {result['recommendation']}  (report: {out_path})"
+    )
+    return result
 
 
 def main() -> None:
@@ -585,34 +760,21 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # sequencing-advisor                                                   #
     # ------------------------------------------------------------------ #
-    # Subparser for the standalone sequencing depth advisor (reads a saved summary).
+    # Subparser for the standalone whole-map sequencing-sufficiency advisor.
     sp_adv = sub.add_parser(
         "sequencing-advisor",
-        help="Predict sequencing depth needed to reach a target noise z-score",
+        help="Whole-map ENCODE/4DN sequencing-sufficiency check (single genome-wide recommendation)",
     )
     sp_adv.add_argument(
-        "--summary",
+        "--summary_dir",
         required=True,
-        help="Path to subsample_summary.tsv produced by sample-noise",
+        help=(
+            "Directory containing one <resolution>/subsample_summary.tsv per resolution, "
+            "as produced by 'sample-noise --out_dir <this>' (or default-run's "
+            "<out_dir>/sample directory)."
+        ),
     )
-    sp_adv.add_argument("--out", required=True, help="Output TSV path for the advisor report")
-    sp_adv.add_argument(
-        "--z_target",
-        type=float,
-        default=0.0,
-        # z_target=0.0 means "reach the 4DN reference quality level".
-        # Negative values target better-than-reference quality (more sequencing required).
-        # Positive values accept worse-than-reference quality (less sequencing needed).
-        help="Target z-score to reach (default: 0.0 = 4DN reference level)",
-    )
-    sp_adv.add_argument(
-        "--fold_threshold",
-        type=float,
-        default=10.0,
-        # If more than 10× additional sequencing is needed, the advisor recommends "Stop"
-        # because the return on investment is too low (diminishing returns in Hi-C).
-        help='Fold-increase above which recommendation is "Stop" (default: 10.0)',
-    )
+    sp_adv.add_argument("--out", required=True, help="Output TSV path for the whole-map advisor report")
 
     # ------------------------------------------------------------------ #
     # default-run                                                          #
@@ -905,126 +1067,11 @@ def main() -> None:
         _profile_command("blacklist", run)
 
     elif args.cmd == "sequencing-advisor":
-        import io
-        import pandas as pd
-
-        if not os.path.isfile(args.summary):
-            parser.error(f"Summary file not found: {args.summary}")
-
-        # Parse the subsample_summary.tsv header comments to extract metadata.
-        # The file format uses comment lines:
-        #   "# resolution=N"    — the resolution this summary was computed at
-        #   "# window_bp=N"     — the analysis window size used during sampling
-        #   "# chrom_info<tab>chrom<tab>contacts=N<tab>size_bp=N" — chromosome metadata
-        # These are needed because chromosome sizes are not stored in the TSV body.
-        summary_res: Optional[int] = None
-        summary_window_bp: Optional[int] = None
-        chrom_sizes_adv: Dict[str, int] = {}
-        data_lines: List[str] = []
-        with open(args.summary) as fh:
-            for line in fh:
-                if line.startswith("# resolution="):
-                    try:
-                        summary_res = int(line.strip().split("=", 1)[1])
-                    except ValueError:
-                        pass
-                elif line.startswith("# window_bp="):
-                    try:
-                        summary_window_bp = int(line.strip().split("=", 1)[1])
-                    except ValueError:
-                        pass
-                elif line.startswith("# chrom_info"):
-                    # Parse: "# chrom_info\tchromname\tcontacts=N\tsize_bp=N"
-                    parts = line.strip().split("\t")
-                    chrom_name = parts[1] if len(parts) > 1 else None
-                    for part in parts[2:]:
-                        if part.startswith("size_bp="):
-                            try:
-                                size = int(part.split("=", 1)[1])
-                                if chrom_name:
-                                    chrom_sizes_adv[chrom_name] = size
-                            except ValueError:
-                                pass
-                elif not line.startswith("#"):
-                    data_lines.append(line)
-
-        if not data_lines:
-            parser.error(f"No data rows found in {args.summary}")
-        if summary_res is None:
-            parser.error(
-                "Could not read resolution from the summary file. "
-                "Ensure the file was produced by jukebox-hic sample-noise."
-            )
-        if not chrom_sizes_adv:
-            parser.error(
-                "Could not recover chromosome sizes from the summary file. "
-                "Ensure the file was produced by jukebox-hic sample-noise."
-            )
-        # Fall back to resolution-based default window for summary files produced
-        # before the # window_bp= header was added.
-        if summary_window_bp is None:
-            summary_window_bp = noise_sampling._default_window_bp(summary_res)
-
-        df = pd.read_csv(io.StringIO("".join(data_lines)), sep="\t")
-        if "ratio" in df.columns:
-            # Only use full-depth (ratio=1.0) rows for advisor analysis
-            df = df[df["ratio"] == 1.0].copy()
-        if df.empty:
-            parser.error("No ratio=1.0 rows found in the summary file")
-
-        required_cols = {"chrom", "median_noise", "mean_empty_bin_ratio", "estimated_contacts"}
-        missing_cols = required_cols - set(df.columns)
-        if missing_cols:
-            parser.error(f"Summary file is missing columns: {sorted(missing_cols)}")
+        if not os.path.isdir(args.summary_dir):
+            parser.error(f"--summary_dir not found or not a directory: {args.summary_dir}")
 
         def run() -> None:
-            records = []
-            for _, row in df.iterrows():
-                chrom = str(row["chrom"])
-                median_noise = float(row["median_noise"])
-                ebr = float(row["mean_empty_bin_ratio"])
-                est_contacts = float(row["estimated_contacts"])
-                z_map_val = float(row["z_map"]) if "z_map" in df.columns else float("nan")
-                quality_status_val = str(row["quality_status"]) if "quality_status" in df.columns else ""
-                c_len = chrom_sizes_adv.get(chrom, 0)
-
-                if c_len > 0:
-                    # current_rho_win = effective matrix coverage for this chrom
-                    current_rho_win = est_contacts / (
-                        (c_len / summary_res) * (summary_window_bp / summary_res)
-                    )
-                    adv = reference.sequencing_advisor(
-                        obs_noise=median_noise,
-                        current_rho_win=current_rho_win,
-                        ebr=ebr,
-                        window_bp=summary_window_bp,
-                        z_target=args.z_target,
-                        fold_threshold=args.fold_threshold,
-                    )
-                else:
-                    # Chromosome size not available — cannot compute sequencing density
-                    adv = {
-                        "target_density": float("nan"),
-                        "fold_increase": float("nan"),
-                        "recommendation": "Insufficient data",
-                    }
-
-                records.append({
-                    "chrom": chrom,
-                    "median_noise": median_noise,
-                    "mean_empty_bin_ratio": ebr,
-                    "estimated_contacts": est_contacts,
-                    "z_map": z_map_val,
-                    "quality_status": quality_status_val,
-                    "advisor_target_density": adv["target_density"],
-                    "advisor_fold_increase": adv["fold_increase"],
-                    "advisor_recommendation": adv["recommendation"],
-                })
-
-            out_df = pd.DataFrame(records)
-            os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
-            out_df.to_csv(args.out, sep="\t", index=False)
-            print(f"[sequencing-advisor] Report written to {args.out}")
+            _run_sequencing_advisor(args.summary_dir, args.out)
 
         _profile_command("sequencing-advisor", run)
 
@@ -1076,6 +1123,11 @@ def main() -> None:
                 chunk_rows=args.chunk_rows,
                 precomputed_contacts=contacts or None,
             )
+
+        # Phase 1.5: Whole-map sequencing sufficiency check (genome-wide, ENCODE/4DN rule)
+        print("\n[Phase 1.5] Sequencing-advisor whole-map check ...")
+        adv_out = os.path.join(args.out_dir, "sequencing_advisor_summary.tsv")
+        adv_result = _run_sequencing_advisor(sample_root, adv_out)
 
         # Phase 2: Full noise for all resolutions at once (benefits from shared I/O)
         print(f"\n[Phase 2] Computing full noise at {resolutions} bp ...")
@@ -1155,7 +1207,10 @@ def main() -> None:
             else:
                 print(f"  [WARN] Bedgraph(s) not found for res={res} — skipping blacklist")
 
-        print("\n[default-run] Complete.")
+        print(
+            f"\n[default-run] Complete. Sequencing advisor: {adv_result['recommendation']} "
+            f"(epsilon={adv_result.get('epsilon')}, resolution_used={adv_result.get('resolution_used')})"
+        )
 
     else:
         parser.error("Unknown command")
