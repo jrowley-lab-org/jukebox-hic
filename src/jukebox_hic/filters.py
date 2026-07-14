@@ -251,8 +251,8 @@ def detect_elbow_thresholds(
     density_lower_frac: float = 0.01,
     noise_upper_frac: float = 0.10,
     noise_lower_frac: float = 0.01,
-    density_transform: str = "none",
-    noise_transform: str = "sqrt",
+    density_transform: str = "log1p",
+    noise_transform: str = "log1p",
 ) -> Tuple[pd.DataFrame, dict]:
     """
     Run per-chromosome dual-metric elbow detection on density and noise bedgraphs.
@@ -322,8 +322,8 @@ def build_blacklist_from_elbow_thresholds(
     density_lower_frac: float = 0.01,
     noise_upper_frac: float = 0.10,
     noise_lower_frac: float = 0.01,
-    density_transform: str = "none",
-    noise_transform: str = "sqrt",
+    density_transform: str = "log1p",
+    noise_transform: str = "log1p",
     thresholds_df: Optional[pd.DataFrame] = None,
     mode: str = "union",
 ) -> Tuple[pd.DataFrame, dict]:

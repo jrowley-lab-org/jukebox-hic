@@ -64,12 +64,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--noise_lower_frac", type=float, default=0.01,
                    help="Bottom fraction of noise bins searched for the lower elbow "
                         "(default: 0.01 = bottom 1%%)")
-    p.add_argument("--density_transform", default="none",
+    p.add_argument("--density_transform", default="log1p",
                    choices=["none", "sqrt", "cbrt", "log1p"],
-                   help="Pre-transform applied to density values (default: none)")
-    p.add_argument("--noise_transform", default="sqrt",
+                   help="Pre-transform applied to density values (default: log1p — recommended for contact count data)")
+    p.add_argument("--noise_transform", default="log1p",
                    choices=["none", "sqrt", "cbrt", "log1p"],
-                   help="Pre-transform applied to noise values (default: sqrt)")
+                   help="Pre-transform applied to noise values (default: log1p — recommended for zero-heavy noise data)")
     return p.parse_args()
 
 

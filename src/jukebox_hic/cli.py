@@ -544,14 +544,14 @@ def main() -> None:
     )
     # Elbow tuning
     sp_mask.add_argument(
-        "--density_transform", default="none",
+        "--density_transform", default="log1p",
         choices=["none", "sqrt", "cbrt", "log1p"],
-        help="Pre-transform for density values in elbow detection (default: none)",
+        help="Pre-transform for density values in elbow detection (default: log1p — recommended for contact count data)",
     )
     sp_mask.add_argument(
-        "--noise_transform", default="sqrt",
+        "--noise_transform", default="log1p",
         choices=["none", "sqrt", "cbrt", "log1p"],
-        help="Pre-transform for noise values in elbow detection (default: sqrt)",
+        help="Pre-transform for noise values in elbow detection (default: log1p — recommended for zero-heavy noise data)",
     )
     sp_mask.add_argument(
         "--density_upper_frac", type=float, default=0.01,
@@ -701,14 +701,14 @@ def main() -> None:
     )
     # Elbow blacklist tuning (Phase 4)
     sp_run.add_argument(
-        "--density_transform", default="none",
+        "--density_transform", default="log1p",
         choices=["none", "sqrt", "cbrt", "log1p"],
-        help="Pre-transform for density values in elbow detection (default: none)",
+        help="Pre-transform for density values in elbow detection (default: log1p — recommended for contact count data)",
     )
     sp_run.add_argument(
-        "--noise_transform", default="sqrt",
+        "--noise_transform", default="log1p",
         choices=["none", "sqrt", "cbrt", "log1p"],
-        help="Pre-transform for noise values in elbow detection (default: sqrt)",
+        help="Pre-transform for noise values in elbow detection (default: log1p — recommended for zero-heavy noise data)",
     )
     sp_run.add_argument("--density_upper_frac", type=float, default=0.01,
                         help="Top fraction of density bins searched for the upper elbow (default: 0.01 = top 1%%)")

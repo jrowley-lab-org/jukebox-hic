@@ -256,8 +256,8 @@ def plot_elbow_figure(
     per_chrom_curves: dict,
     results: List[dict],
     out_prefix: str,
-    density_transform: str = "none",
-    noise_transform: str = "sqrt",
+    density_transform: str = "log1p",
+    noise_transform: str = "log1p",
 ) -> None:
     """
     Save the 2×2 elbow diagnostic figure as both PNG and PDF.
