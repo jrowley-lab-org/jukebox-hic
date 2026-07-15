@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Transform full-noise bedGraphs into adaptive normalization bias vectors.
+Transform full-noise bedGraphs into JUKEBOX normalization bias vectors.
 
 This module is the final step in the jukebox-hic pipeline. It reads the genome-wide
 per-bin noise track produced by ``noise_fullmap`` (as a bedgraph file) and converts
@@ -20,12 +20,12 @@ Juicer vector format
 --------------------
 The output file uses Juicer's custom normalization vector format:
 
-    vector JUKEBOX-BASELINE chr1 10000 BP
+    vector JUKEBOX chr1 10000 BP
     1.234
     0.987
     NaN
     ...
-    vector JUKEBOX-BASELINE chr2 10000 BP
+    vector JUKEBOX chr2 10000 BP
     ...
 
 Each ``vector`` header line introduces a block for one chromosome. The header
@@ -321,7 +321,7 @@ def _validate_grid(df: pd.DataFrame, res: int, chrom_len: Optional[int]) -> pd.D
 
 def _load_zmap_summary(path: str) -> Dict[str, Dict[str, float]]:
     """
-    Load per-chromosome gamma, EBR, and pred_log_N from a subsample_summary.tsv.
+    Load per-chromosome EBR and pred_log_N from a subsample_summary.tsv.
 
     The ``subsample_summary.tsv`` produced by ``noise_sampling.compute_sampled_noise()``
     contains comment lines (starting with ``#``) encoding metadata, followed by a
@@ -330,16 +330,14 @@ def _load_zmap_summary(path: str) -> Dict[str, Dict[str, float]]:
     This function:
     1. Skips comment lines (the ``# resolution=`` and ``# chrom_info`` headers).
     2. Loads the TSV body and filters to rows where ``ratio == 1.0`` (full-depth data).
-    3. Extracts three fields per chromosome: ``gamma``, ``mean_empty_bin_ratio`` (EBR),
-       and ``pred_log_N``. These are needed to compute the bias vectors.
+    3. Extracts per-chromosome ``mean_empty_bin_ratio`` (EBR) and ``pred_log_N``.
+       These are needed to compute the bias vectors.
 
     Fields extracted:
-    - ``gamma``: adaptive penalty from ``compute_zmap()``; used by the legacy
-      normalization function (not used in baseline/adaptive modes directly).
     - ``ebr`` (from ``mean_empty_bin_ratio``): mean empty bin ratio; used as the
       Gaussian smoothing sigma offset in ``_preprocess_noise_track()``.
     - ``pred_log_N``: 4DN-predicted log10 noise for this chromosome; used as the
-      anchor point in the baseline and adaptive bias vector formulas.
+      anchor point in the JUKEBOX bias-vector formula.
 
     Parameters
     ----------
@@ -349,8 +347,9 @@ def _load_zmap_summary(path: str) -> Dict[str, Dict[str, float]]:
     Returns
     -------
     dict
-        Chromosome name → dict of available fields (``gamma``, ``ebr``, ``pred_log_N``).
-        Chromosomes not in the file, or with all-NaN fields, are omitted.
+        Chromosome name → dict of available fields (``ebr``, ``pred_log_N``,
+        ``pred_log_N_upper``, ``pred_log_N_lower``). Chromosomes not in the
+        file, or with all-NaN fields, are omitted.
     """
     data_lines: list[str] = []
     with open(path) as fh:
@@ -368,8 +367,6 @@ def _load_zmap_summary(path: str) -> Dict[str, Dict[str, float]]:
     for _, row in df.iterrows():
         chrom = str(row["chrom"])
         entry: Dict[str, float] = {}
-        if "gamma" in row.index and pd.notna(row["gamma"]):
-            entry["gamma"] = float(row["gamma"])
         if "mean_empty_bin_ratio" in row.index and pd.notna(row["mean_empty_bin_ratio"]):
             entry["ebr"] = float(row["mean_empty_bin_ratio"])
         if "pred_log_N" in row.index and pd.notna(row["pred_log_N"]):
@@ -422,7 +419,7 @@ def _write_juicer_vector_block(
         Per-bin bias weights. NaN entries are written as ``NaN`` or
         ``nan_fill_value`` depending on the configuration.
     vector_name : str
-        Name to use in the ``vector`` header line (e.g. ``"JUKEBOX-BASELINE"``).
+        Name to use in the ``vector`` header line (e.g. ``"JUKEBOX"``).
     nan_fill_value : float
         Value to write for NaN bins. If ``nan_fill_value`` is itself NaN, the literal
         string ``"NaN"`` is written (compatible with Juicer). Use ``0.0`` for tools
@@ -439,39 +436,6 @@ def _write_juicer_vector_block(
             handle.write(f"{val}\n")
 
 
-_VALID_MODES = ("powerlaw", "bayesian", "adaptive")
-
-
-def _resolve_density_bedgraph_path(noise_dir: str, res: int) -> str:
-    """
-    Find the merged density bedgraph for a given resolution in a directory.
-
-    ``noise_fullmap`` writes ``{chrom}_{res}_density.bedgraph`` per chromosome and
-    concatenates them into ``{res}_density.bedgraph`` in the same output directory.
-    This function resolves the merged file using the same extension variants as
-    ``_resolve_bedgraph_path``.
-
-    Raises
-    ------
-    FileNotFoundError
-        If no matching density bedgraph is found.
-    """
-    if not os.path.isdir(noise_dir):
-        raise FileNotFoundError(f"Not a directory: {noise_dir}")
-    candidates = [
-        os.path.join(noise_dir, f"{res}_density.bedgraph"),
-        os.path.join(noise_dir, f"{res}_density.bedGraph"),
-        os.path.join(noise_dir, f"{res}_density.bg"),
-    ]
-    for candidate in candidates:
-        if os.path.isfile(candidate):
-            return candidate
-    raise FileNotFoundError(
-        f"Could not locate density bedGraph for resolution {res} in {noise_dir}. "
-        "Run full-noise first to generate the density track."
-    )
-
-
 def build_bias_vectors_from_bedgraphs(
     noise_dir: str,
     res: int,
@@ -480,23 +444,17 @@ def build_bias_vectors_from_bedgraphs(
     chrom_sizes_path: Optional[str] = None,
     nan_fill_value: float = float("nan"),
     skip_decoys: bool = True,
-    mode: str = "powerlaw",
-    alpha: Optional[float] = None,
+    alpha: float = 0.5,
     p_factor: float = 2.0,
-    density_bedgraph_path: Optional[str] = None,
-    k_density: Optional[float] = None,
 ) -> None:
     """
     Transform a full-noise bedGraph into a Juicer-format normalization vector file.
 
-    Reads ``{noise_dir}/{res}.bedgraph`` and writes ``{out_dir}/{res}.juicervector``.
-    The vector name in the output encodes the mode:
-      - ``mode="powerlaw"``  → ``vector JUKEBOX_SQRT``
-      - ``mode="bayesian"``  → ``vector JUKEBOX_BAY``
-      - ``mode="adaptive"``  → ``vector JUKEBOX-ADAPTIVE``
+    Reads ``{noise_dir}/{res}.bedgraph`` and writes ``{out_dir}/{res}.juicervector``
+    with vector name ``JUKEBOX`` in the Juicer header line.
 
-    All modes require ``zmap_summary_path`` to provide the per-chromosome
-    predicted log10-noise (``pred_log_N``).
+    Requires ``zmap_summary_path`` to provide the per-chromosome predicted
+    log10-noise (``pred_log_N``).
 
     Processing pipeline per chromosome
     -----------------------------------
@@ -506,8 +464,7 @@ def build_bias_vectors_from_bedgraphs(
     3. Look up per-chromosome ``pred_log_N`` and ``ebr`` from the zmap summary.
        Skip chromosomes missing from the summary (they were not sampled, probably
        because they had no contacts at the sampling resolution).
-    4. Compute the bias vector using the function matching ``mode``
-       (powerlaw, bayesian, or adaptive).
+    4. Compute the bias vector using ``reference.process_normalization_vectors_jukebox()``.
     5. Write the bias vector block to the output file using ``_write_juicer_vector_block()``.
 
     Parameters
@@ -516,48 +473,31 @@ def build_bias_vectors_from_bedgraphs(
     res               : resolution in bp
     out_dir           : output directory; file will be written as ``{res}.juicervector``
     zmap_summary_path : path to ``subsample_summary.tsv`` from the sampling phase;
-                        required for baseline and adaptive modes
+                        required to anchor the JUKEBOX bias-vector formula
     chrom_sizes_path  : chrom sizes TSV for grid validation (optional)
     nan_fill_value    : value written for NaN bins (default: NaN; use 0.0
                         for matrix balancing engines that do not accept NaN)
     skip_decoys       : skip unplaced/decoy chromosomes (default: True)
-    mode              : normalization mode — ``"powerlaw"`` (default), ``"bayesian"``, or ``"adaptive"``
-    alpha             : scaling/damping factor; mode-specific default applied if None
-                        (0.5 for powerlaw, 0.7 for adaptive)
+    alpha             : scaling constant for the JUKEBOX bias formula (default: 0.5)
+    p_factor          : compression factor for the JUKEBOX bias formula
+                        (default: 2.0, square root; use 3.0 for cube root)
     """
-    if mode not in _VALID_MODES:
-        raise ValueError(f"mode must be one of {_VALID_MODES}, got {mode!r}")
-
     if not zmap_summary_path or not os.path.isfile(zmap_summary_path):
         raise ValueError(
-            f"zmap_summary_path is required for mode={mode!r} but was not provided or "
-            f"does not exist: {zmap_summary_path!r}. "
+            "zmap_summary_path is required for JUKEBOX normalization but was not "
+            f"provided or does not exist: {zmap_summary_path!r}. "
             "Run sample-noise first and pass its subsample_summary.tsv."
         )
-
-    if alpha is None:
-        alpha = 0.7 if mode == "adaptive" else 0.5
 
     noise_bed_path = _resolve_bedgraph_path(noise_dir, res)
     noise_df = _load_bedgraph(noise_bed_path)
     chrom_sizes = _load_chrom_sizes(chrom_sizes_path)
     zmap_data = _load_zmap_summary(zmap_summary_path)
 
-    density_df: Optional[pd.DataFrame] = None
-    if mode == "bayesian":
-        resolved_density = density_bedgraph_path or _resolve_density_bedgraph_path(noise_dir, res)
-        density_df = _load_bedgraph(resolved_density)
+    vector_name = "JUKEBOX"
 
-    if mode == "powerlaw":
-        vector_name = "JUKEBOX_SQRT"
-    elif mode == "adaptive":
-        vector_name = "JUKEBOX-ADAPTIVE"
-    else:
-        vector_name = "JUKEBOX_BAY"
-
-    mode_dir = os.path.join(out_dir, mode)
-    os.makedirs(mode_dir, exist_ok=True)
-    out_path = os.path.join(mode_dir, f"{res}.juicervector")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{res}.juicervector")
 
     with open(out_path, "w") as out_handle:
         for chrom, group in noise_df.groupby("chrom", sort=True):
@@ -583,27 +523,9 @@ def build_bias_vectors_from_bedgraphs(
                 print(f"[WARN] {chrom}: pred_log_N missing from zmap_summary — skipping")
                 continue
 
-            if mode == "powerlaw":
-                bias_vector = reference.process_normalization_vectors_powerlaw(
-                    noise_track, pred_log_N, ebr, p_factor, alpha
-                )
-            elif mode == "adaptive":
-                bias_vector = reference.process_normalization_vectors_adaptive(
-                    noise_track, pred_log_N, ebr, alpha=alpha
-                )
-            else:  # bayesian
-                density_group = density_df[density_df["chrom"] == chrom].copy()
-                density_track = (
-                    group.merge(
-                        density_group[["start", "value"]].rename(columns={"value": "density"}),
-                        on="start",
-                        how="left",
-                    )["density"]
-                    .to_numpy(dtype=float)
-                )
-                bias_vector = reference.process_normalization_vectors_bayesian(
-                    noise_track, pred_log_N, ebr, density_track, k_density
-                )
+            bias_vector = reference.process_normalization_vectors_jukebox(
+                noise_track, pred_log_N, ebr, p_factor, alpha
+            )
 
             _write_juicer_vector_block(
                 out_handle, chrom, res, bias_vector, vector_name, nan_fill_value

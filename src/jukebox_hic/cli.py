@@ -18,11 +18,10 @@ full-noise
     bedgraph at each requested resolution, suitable for bias vector construction.
 
 bias-vectors
-    Transform a full-noise bedgraph into a Juicer-format custom normalization vector
-    for a single resolution. Requires the subsample_summary.tsv from sample-noise at
-    the same resolution to obtain per-chromosome z-map parameters. Run once per
-    resolution. The bayesian mode additionally requires a density bedgraph produced
-    by full-noise ({res}_density.bedgraph), auto-detected from --noise_dir by default.
+    Transform a full-noise bedgraph into a JUKEBOX normalization vector (Juicer
+    custom-vector format) for a single resolution. Requires the subsample_summary.tsv
+    from sample-noise at the same resolution to obtain per-chromosome z-map
+    parameters. Run once per resolution.
 
 plot
     Render a density histogram of noise values from a bedgraph file.
@@ -592,7 +591,7 @@ def main() -> None:
     # Subparser for transforming full-noise bedgraphs into Juicer normalization vectors.
     sp_bias = sub.add_parser(
         "bias-vectors",
-        help="Transform full-noise bedGraphs into Juicer normalization vectors",
+        help="Transform full-noise bedGraphs into JUKEBOX normalization vectors (Juicer format)",
     )
     sp_bias.add_argument(
         "--noise_dir",
@@ -616,7 +615,7 @@ def main() -> None:
     )
     sp_bias.add_argument(
         "--zmap_summary",
-        help="Path to subsample_summary.tsv from sample-noise; provides per-chrom gamma and EBR",
+        help="Path to subsample_summary.tsv from sample-noise; provides per-chrom pred_log_N and EBR",
     )
     sp_bias.add_argument(
         "--chrom_sizes",
@@ -634,53 +633,16 @@ def main() -> None:
         help="Include decoy/unplaced chromosomes (default: skip)",
     )
     sp_bias.add_argument(
-        "--mode",
-        default="powerlaw",
-        choices=["powerlaw", "bayesian", "adaptive"],
-        help=(
-            "Normalization mode: "
-            "powerlaw = JUKEBOX_SQRT (signed power-law root compression of the residual, "
-            "controlled by --p_factor and --alpha); "
-            "bayesian = JUKEBOX_BAY (evidence-weighted shrinkage toward 1.0 for sparse bins, "
-            "requires density bedgraph from full-noise); "
-            "adaptive = JUKEBOX-ADAPTIVE (global model shift + damped local correction, "
-            "suited for sparse/palaeogenomic data, controlled by --alpha). "
-            "Default: powerlaw"
-        ),
-    )
-    sp_bias.add_argument(
         "--alpha",
         type=float,
-        default=None,
-        help=(
-            "Scaling/damping factor. "
-            "powerlaw mode: scaling constant (default: 0.5). "
-            "adaptive mode: local-deviation damping factor (default: 0.7; valid range 0.5–0.8). "
-            "Explicitly supplied values override the mode-specific default."
-        ),
+        default=0.5,
+        help="Scaling constant for JUKEBOX normalization (default: 0.5).",
     )
     sp_bias.add_argument(
         "--p_factor",
         type=float,
         default=2.0,
-        help="Compression factor for powerlaw mode (default: 2.0; square root). Use 3.0 for cube root.",
-    )
-    sp_bias.add_argument(
-        "--density_bedgraph",
-        default=None,
-        help=(
-            "Path to the density bedgraph produced by full-noise ({res}_density.bedgraph). "
-            "Required for bayesian mode. If omitted, auto-detected from --noise_dir."
-        ),
-    )
-    sp_bias.add_argument(
-        "--k_density",
-        type=float,
-        default=None,
-        help=(
-            "Half-saturation constant K for bayesian mode (contacts/bin). "
-            "Default: auto-computed as the median non-zero bin density from the density bedgraph."
-        ),
+        help="Compression factor for JUKEBOX normalization (default: 2.0; square root). Use 3.0 for cube root.",
     )
 
     # ------------------------------------------------------------------ #
@@ -819,28 +781,14 @@ def main() -> None:
     sp_run.add_argument(
         "--alpha",
         type=float,
-        default=None,
-        help=(
-            "Scaling/damping factor. "
-            "powerlaw mode: scaling constant (default: 0.5). "
-            "adaptive mode: local-deviation damping factor (default: 0.7). "
-            "Explicitly supplied values override the mode-specific default."
-        ),
+        default=0.5,
+        help="Scaling constant for JUKEBOX normalization (default: 0.5).",
     )
     sp_run.add_argument(
         "--p_factor",
         type=float,
         default=2.0,
-        help="Compression factor for powerlaw mode (default: 2.0; square root). Use 3.0 for cube root.",
-    )
-    sp_run.add_argument(
-        "--k_density",
-        type=float,
-        default=None,
-        help=(
-            "Half-saturation constant K for bayesian mode (contacts/bin). "
-            "Default: auto-computed as the median non-zero bin density."
-        ),
+        help="Compression factor for JUKEBOX normalization (default: 2.0; square root). Use 3.0 for cube root.",
     )
     sp_run.add_argument(
         "--dump_factor",
@@ -1015,13 +963,10 @@ def main() -> None:
                 chrom_sizes_path=args.chrom_sizes,
                 nan_fill_value=nan_fill,
                 skip_decoys=not bool(args.include_decoys),
-                mode=args.mode,
                 alpha=args.alpha,
                 p_factor=args.p_factor,
-                density_bedgraph_path=args.density_bedgraph,
-                k_density=args.k_density,
             )
-            print(f"  → {os.path.join(args.out_dir, args.mode, f'{res}.juicervector')}")
+            print(f"  → {os.path.join(args.out_dir, f'{res}.juicervector')}")
 
         _profile_command("bias-vectors", run)
 
@@ -1149,26 +1094,22 @@ def main() -> None:
             res_sample_dir = os.path.join(sample_root, str(res))
             zmap_summary = os.path.join(res_sample_dir, "subsample_summary.tsv")
 
-            # Phase 3: Bias vectors — both modes always produced
+            # Phase 3: Bias vectors (JUKEBOX normalization)
             print(f"\n[Phase 3] Building bias vectors at {res} bp ...")
             if not os.path.isfile(zmap_summary):
                 print(f"  [WARN] subsample_summary.tsv not found for res={res} — skipping bias vectors")
             else:
-                for mode in ("powerlaw", "bayesian", "adaptive"):
-                    noise_to_weights.build_bias_vectors_from_bedgraphs(
-                        noise_dir=full_dir,
-                        res=res,
-                        out_dir=vectors_dir,
-                        zmap_summary_path=zmap_summary,
-                        chrom_sizes_path=args.chrom_sizes,
-                        nan_fill_value=nan_fill,
-                        mode=mode,
-                        alpha=args.alpha,
-                        p_factor=args.p_factor,
-                        density_bedgraph_path=None,  # auto-detected from full_dir/{res}_density.bedgraph
-                        k_density=args.k_density,
-                    )
-                    print(f"  → {os.path.join(vectors_dir, mode, f'{res}.juicervector')}")
+                noise_to_weights.build_bias_vectors_from_bedgraphs(
+                    noise_dir=full_dir,
+                    res=res,
+                    out_dir=vectors_dir,
+                    zmap_summary_path=zmap_summary,
+                    chrom_sizes_path=args.chrom_sizes,
+                    nan_fill_value=nan_fill,
+                    alpha=args.alpha,
+                    p_factor=args.p_factor,
+                )
+                print(f"  → {os.path.join(vectors_dir, f'{res}.juicervector')}")
 
             # Phase 4: Elbow-based blacklist + diagnostic figures
             print(f"\n[Phase 4] Building elbow blacklist at {res} bp ...")
