@@ -465,8 +465,9 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
     parser.epilog = (
-        'Note: Base install includes "cooler" only. For .hic support, install extras: '
-        'pip install "jukebox-hic[straw]" or "jukebox-hic[all]".'
+        'Note: The default install (pip install jukebox-hic) includes both cooler and hicstraw backends. '
+        'Single-backend profiles: pip install "jukebox-hic[cooler]" or pip install "jukebox-hic[straw]". '
+        'Windows users experiencing hicstraw build errors: see the README for a cooler-only workaround.'
     )
 
     # ------------------------------------------------------------------ #

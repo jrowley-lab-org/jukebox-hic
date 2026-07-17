@@ -1,6 +1,6 @@
 # jukebox-hic
 
-Lightweight Hi-C noise analysis toolkit for `.hic` (via optional [`hicstraw`](https://github.com/aidenlab/straw)) and cooler formats.
+Lightweight Hi-C noise analysis toolkit for `.hic` ([hicstraw](https://github.com/aidenlab/straw)) and cooler formats (`.cool`, `.mcool`, `.scool`).
 
 ## Features
 - Per-row noise estimates with optional subsampling simulations to gauge robustness.
@@ -11,13 +11,13 @@ Lightweight Hi-C noise analysis toolkit for `.hic` (via optional [`hicstraw`](ht
 
 ## Installation
 
-**Recommended — both backends (cooler + hicstraw):**
+**Default install — both backends (cooler + hicstraw):**
 
 ```bash
-pip install "jukebox-hic[all]"
+pip install jukebox-hic
 ```
 
-**Single-backend installs:**
+**Single-backend profiles:**
 
 ```bash
 # cooler only (.cool / .mcool / .scool)
@@ -30,11 +30,12 @@ pip install "jukebox-hic[straw]"
 > **Windows users — known PyPI install error**
 >
 > `hic-straw` does not ship pre-built wheels for Windows on PyPI and may fail to
-> compile from source. If `pip install "jukebox-hic[all]"` errors during the
-> hicstraw build step, install the cooler-only profile instead:
+> compile from source. If `pip install jukebox-hic` errors during the hicstraw
+> build step, bypass the default install and use the cooler-only profile:
 >
 > ```bash
-> pip install "jukebox-hic[cooler]"
+> pip install jukebox-hic --no-deps
+> pip install numpy pandas statsmodels matplotlib scipy cooler
 > ```
 >
 > To process `.hic` files on Windows, convert them first with
@@ -122,13 +123,13 @@ noise_sampling.compute_sampled_noise(
 
 ## Backends
 
-This project supports two I/O backends selectable at install time:
+This project supports two I/O backends, both included in the default install:
 
-| Extra | Backend | Formats |
+| Install | Backend | Formats |
 |---|---|---|
-| `[all]` | cooler + hicstraw | `.cool`, `.mcool`, `.scool`, `.hic` |
-| `[cooler]` | cooler only | `.cool`, `.mcool`, `.scool` |
-| `[straw]` | hicstraw only | `.hic` |
+| `pip install jukebox-hic` (default) | cooler + hicstraw | `.cool`, `.mcool`, `.scool`, `.hic` |
+| `pip install "jukebox-hic[cooler]"` | cooler only | `.cool`, `.mcool`, `.scool` |
+| `pip install "jukebox-hic[straw]"` | hicstraw only | `.hic` |
 
 Runtime guidance:
 - If you pass a `.hic` file without hicstraw installed, the tool will suggest `pip install "jukebox-hic[straw]"`.

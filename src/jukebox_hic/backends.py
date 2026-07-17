@@ -49,14 +49,17 @@ except ImportError:
 COOLER_SUFFIXES: Tuple[str, ...] = (".cool", ".mcool", ".scool")
 
 # Human-readable error messages shown when optional dependencies are missing.
-# hicstraw is only needed for .hic input; cooler is needed for all cooler variants.
 HICSTRAW_HELP = (
-    "hicstraw is required for .hic inputs. Install it with "
-    'pip install "jukebox-hic[straw]" (or "jukebox-hic[all]") or convert the .hic file to .mcool using hic2cool.'
+    "hicstraw is required for .hic inputs. "
+    "It is included in the default install (pip install jukebox-hic) "
+    'or can be added with pip install "jukebox-hic[straw]". '
+    "Alternatively, convert the .hic file to .mcool using hic2cool and use the cooler backend."
 )
 
 COOLER_HELP = (
-    'cooler is required for .cool/.mcool/.scool inputs. Install it with pip install "jukebox-hic" or "jukebox-hic[all]".'
+    "cooler is required for .cool/.mcool/.scool inputs. "
+    "It is included in the default install (pip install jukebox-hic) "
+    'or can be added with pip install "jukebox-hic[cooler]".'
 )
 
 

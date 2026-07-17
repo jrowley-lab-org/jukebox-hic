@@ -2,11 +2,14 @@ numpy>=1.21
 pandas>=1.3
 statsmodels>=0.13
 matplotlib>=3.5
-cooler>=0.9.3
 scipy>=1.8
 
 [all]
+cooler>=0.9.3
 hic-straw>=1.3.1
+
+[cooler]
+cooler>=0.9.3
 
 [profile]
 psutil>=5.9
