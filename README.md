@@ -11,22 +11,40 @@ Lightweight Hi-C noise analysis toolkit for `.hic` (via optional [`hicstraw`](ht
 
 ## Installation
 
-Recommended (both backends):
+**Recommended — both backends (cooler + hicstraw):**
 
 ```bash
 pip install "jukebox-hic[all]"
 ```
 
-Base install (cooler only):
+**Single-backend installs:**
 
 ```bash
-pip install jukebox-hic
+# cooler only (.cool / .mcool / .scool)
+pip install "jukebox-hic[cooler]"
+
+# hicstraw only (.hic)
+pip install "jukebox-hic[straw]"
 ```
 
-- The base install includes the `cooler` backend for `.cool/.mcool/.scool` files.
-- To process `.hic` files, install the straw extra or the all-in-one extra:
-  - `pip install "jukebox-hic[straw]"`
-  - or `pip install "jukebox-hic[all]"`
+> **Windows users — known PyPI install error**
+>
+> `hic-straw` does not ship pre-built wheels for Windows on PyPI and may fail to
+> compile from source. If `pip install "jukebox-hic[all]"` errors during the
+> hicstraw build step, install the cooler-only profile instead:
+>
+> ```bash
+> pip install "jukebox-hic[cooler]"
+> ```
+>
+> To process `.hic` files on Windows, convert them first with
+> [`hic2cool`](https://github.com/4dn-dcic/hic2cool) and use the cooler backend:
+>
+> ```bash
+> pip install hic2cool
+> hic2cool convert sample.hic sample.mcool --resolutions 10000
+> jukebox-hic sample-noise --hic sample.mcool --cooler_path /resolutions/10000 --res 10000 --out_dir outputs/
+> ```
 ## Command Line Usage
 ### Sampled noise with subsampling summaries
 ```bash
@@ -102,29 +120,18 @@ noise_sampling.compute_sampled_noise(
 - `--cpu <N>` parallelizes `full-noise` by `(chromosome, resolution)` tasks (default 1, capped at available cores).
 - Every CLI invocation now emits a `contacts_overview.tsv` summarizing per-chromosome totals at the coarsest resolution.
 
-### If hic-straw fails to install
-If `pip install "jukebox-hic[straw]"` fails (e.g. due to missing prebuilt wheels), convert the `.hic` file to a `.mcool` archive and use the cooler backend:
-```bash
-pip install hic2cool
-hic2cool convert sample.hic sample.mcool --resolutions 10000
-jukebox-hic sample-noise \
-  --hic sample.mcool \
-  --cooler_path /resolutions/10000 \
-  --res 10000 \
-  --out_dir outputs/10kb
-```
-The same `--cooler_path` argument selects groups inside `.scool` files.
-
-
 ## Backends
 
-This project supports two I/O backends:
+This project supports two I/O backends selectable at install time:
 
-- cooler (default; installed by base package): `.cool`, `.mcool`, `.scool`
-- hicstraw (optional): `.hic`
+| Extra | Backend | Formats |
+|---|---|---|
+| `[all]` | cooler + hicstraw | `.cool`, `.mcool`, `.scool`, `.hic` |
+| `[cooler]` | cooler only | `.cool`, `.mcool`, `.scool` |
+| `[straw]` | hicstraw only | `.hic` |
 
 Runtime guidance:
-- If you pass a `.hic` file without hicstraw installed, the tool will print a clear message suggesting:
-  `pip install "jukebox-hic[straw]"` (or `"jukebox-hic[all]"`).
-- If you pass a cooler-format file without `cooler` available (e.g., stripped environment), the tool will suggest installing the base package or `"jukebox-hic[all]"`.
+- If you pass a `.hic` file without hicstraw installed, the tool will suggest `pip install "jukebox-hic[straw]"`.
+- If you pass a cooler-format file without `cooler` installed, the tool will suggest `pip install "jukebox-hic[cooler]"`.
+- The same `--cooler_path` argument selects resolution groups in `.mcool` files and cell groups in `.scool` files.
 
