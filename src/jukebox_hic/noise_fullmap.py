@@ -36,7 +36,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from statsmodels.tsa.stattools import acovf
 
-from .backends import ChromMatrix, read_chrom_sizes, select_provider
+from .backends import ChromMatrix, select_provider
 from . import metrics
 
 
@@ -256,6 +256,7 @@ def _write_bedgraph(
     chrom_len: int,
     noise_vals: np.ndarray,
     out_path: str,
+    include_mask: Optional[np.ndarray] = None,
 ) -> None:
     """
     Write a per-bin noise track as a UCSC bedgraph file.
@@ -279,9 +280,14 @@ def _write_bedgraph(
         Per-bin noise values, one per row in the matrix (index 0 = first bin).
     out_path : str
         Output file path (overwritten if it exists).
+    include_mask : np.ndarray of bool, optional
+        When provided, only bins where ``include_mask[i]`` is True are written.
+        None (default) writes all bins.
     """
     with open(out_path, "w") as handle:
         for i, val in enumerate(noise_vals):
+            if include_mask is not None and not include_mask[i]:
+                continue
             start = i * res
             stop = min((i + 1) * res, chrom_len)
             handle.write(f"{chrom} {start} {stop} {val}\n")
@@ -339,6 +345,7 @@ class _FullNoiseTask:
     out_path: str
     density_out_path: str
     dump_factor: float = 10.0
+    regions: Optional[Tuple[Tuple[int, int], ...]] = None
 
 
 def _full_noise_worker(task: _FullNoiseTask) -> Tuple[str, int, str, bool]:
@@ -393,9 +400,34 @@ def _full_noise_worker(task: _FullNoiseTask) -> Tuple[str, int, str, bool]:
     density_vals = np.zeros(n_bins, dtype=float)
     any_data = False
 
-    chunk_start = 0
-    while chunk_start < n_bins:
-        chunk_end = min(chunk_start + dump_bins, n_bins)
+    # --- Region filtering: determine which bins to output and the iteration span ---
+    target_mask: Optional[np.ndarray] = None
+    iter_start = 0
+    iter_end = n_bins
+
+    if task.regions is not None and len(task.regions) > 0:
+        target_mask = np.zeros(n_bins, dtype=bool)
+        for r_start, r_end in task.regions:
+            b_start = r_start // res
+            b_end = (r_end + res - 1) // res  # ceiling: include partial bins
+            b_end = min(b_end, n_bins)
+            if b_start < b_end:
+                target_mask[b_start:b_end] = True
+        if not target_mask.any():
+            for stale in (task.out_path, task.density_out_path):
+                if os.path.exists(stale):
+                    try:
+                        os.remove(stale)
+                    except OSError:
+                        pass
+            return task.chrom, task.res, task.out_path, False
+        target_indices = np.where(target_mask)[0]
+        iter_start = int(target_indices[0])
+        iter_end = int(target_indices[-1]) + 1
+
+    chunk_start = iter_start
+    while chunk_start < iter_end:
+        chunk_end = min(chunk_start + dump_bins, iter_end)
 
         fetch_start_bin = max(0, chunk_start - noise_bins)
         fetch_end_bin = min(n_bins, chunk_end + noise_bins)
@@ -441,10 +473,122 @@ def _full_noise_worker(task: _FullNoiseTask) -> Tuple[str, int, str, bool]:
                     pass
         return task.chrom, task.res, task.out_path, False
 
-    _write_bedgraph(task.chrom, res, task.chrom_len, noise_vals, task.out_path)
-    _write_bedgraph(task.chrom, res, task.chrom_len, density_vals, task.density_out_path)
+    _write_bedgraph(task.chrom, res, task.chrom_len, noise_vals, task.out_path, target_mask)
+    _write_bedgraph(task.chrom, res, task.chrom_len, density_vals, task.density_out_path, target_mask)
 
     return task.chrom, task.res, task.out_path, True
+
+
+def _parse_extended_chrom_sizes(
+    path: str,
+) -> Dict[str, Tuple[int, Optional[List[Tuple[int, int]]]]]:
+    """
+    Parse a chromosome sizes file with optional region columns.
+
+    File format (tab-separated):
+        chrom_name  size  [region1  region2  ...]
+
+    - Column 1: chromosome name
+    - Column 2: chromosome size in bp
+    - Columns 3+: optional regions, each as ``start:end`` or ``start-end``
+      (0-based, half-open coordinates, consistent with BED format)
+
+    Rules:
+    - A row with only 2 columns means "whole chromosome" (no region filtering).
+    - A row with region columns restricts output to bins overlapping those regions.
+    - Regions are validated against the chromosome size; invalid regions are skipped
+      with a warning. If no valid regions remain for a chromosome, it is skipped.
+    - Duplicate chromosome entries: last row wins.
+
+    Returns
+    -------
+    Dict mapping chrom_name → (size_bp, regions_or_None).
+    ``regions_or_None`` is ``None`` when no region columns were supplied for that row.
+    """
+    result: Dict[str, Tuple[int, Optional[List[Tuple[int, int]]]]] = {}
+    with open(path) as fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                print(
+                    f"[WARN] {path} line {lineno}: expected ≥2 columns, got {len(parts)}, skipping"
+                )
+                continue
+            chrom = parts[0]
+            try:
+                size = int(parts[1])
+            except ValueError:
+                print(
+                    f"[WARN] {path} line {lineno}: cannot parse size {parts[1]!r} "
+                    f"for {chrom}, skipping"
+                )
+                continue
+
+            if len(parts) == 2:
+                result[chrom] = (size, None)
+                continue
+
+            regions: List[Tuple[int, int]] = []
+            for col_i, raw_col in enumerate(parts[2:], start=3):
+                col = raw_col.strip()
+                if not col:
+                    continue
+                # Prefer ':' as separator; fall back to '-'
+                if ":" in col:
+                    sub = col.split(":", 1)
+                elif "-" in col:
+                    sub = col.split("-", 1)
+                else:
+                    print(
+                        f"[WARN] {path} line {lineno} col {col_i}: "
+                        f"cannot parse region {col!r} (expected start:end or start-end), skipping"
+                    )
+                    continue
+                if not sub[0] or not sub[1]:
+                    print(
+                        f"[WARN] {path} line {lineno} col {col_i}: "
+                        f"region {col!r} has empty coordinate, skipping"
+                    )
+                    continue
+                try:
+                    r_start = int(sub[0])
+                    r_end = int(sub[1])
+                except ValueError:
+                    print(
+                        f"[WARN] {path} line {lineno} col {col_i}: "
+                        f"cannot parse region {col!r} as integers, skipping"
+                    )
+                    continue
+                if r_start < 0 or r_end < 0:
+                    print(
+                        f"[WARN] {chrom} region {col!r}: negative coordinate, skipping"
+                    )
+                    continue
+                if r_end > size:
+                    print(
+                        f"[WARN] {chrom} region {col!r}: end ({r_end}) exceeds "
+                        f"chromosome size ({size}), skipping"
+                    )
+                    continue
+                if r_start >= r_end:
+                    print(
+                        f"[WARN] {chrom} region {col!r}: start ({r_start}) >= end ({r_end}), skipping"
+                    )
+                    continue
+                regions.append((r_start, r_end))
+
+            if not regions:
+                print(
+                    f"[WARN] {chrom}: no valid regions found in {path}, skipping chromosome"
+                )
+                continue
+
+            result[chrom] = (size, regions)
+
+    return result
 
 
 def compute_full_noise(
@@ -504,7 +648,17 @@ def compute_full_noise(
     res_list : list of int
         One or more bin sizes in bp to process.
     chrom_sizes_path : str or None
-        Optional TSV to restrict or filter chromosomes.
+        Optional TSV to restrict analysis to specific chromosomes and/or regions.
+        Accepted formats:
+
+        - Two columns: ``chrom_name<tab>size_bp`` — whole chromosome is processed.
+        - Three or more columns: additional columns are regions as ``start:end``
+          or ``start-end`` (0-based, half-open).  Only bins overlapping those
+          regions are emitted; the noise window may extend beyond the region but
+          is clamped at chromosome ends as usual.  Multiple regions per chromosome
+          are supported (one per extra column, same row).  Regions that exceed the
+          chromosome size or have start >= end are skipped with a warning.  A
+          region smaller than one bin outputs the single bin that overlaps it.
     norm : str
         Normalisation mode: ``"none"``, ``"balance"``, or a custom weight path.
     bindist_bp : int or None
@@ -560,18 +714,43 @@ def compute_full_noise(
     # --- Build task list ---
     # A provider is opened briefly to enumerate chromosomes, then closed (``del provider``)
     # before tasks are dispatched to workers. Worker processes open their own providers.
+
+    # Parse the extended chrom_sizes file once (resolution-independent).
+    ext_sizes: Optional[Dict[str, Tuple[int, Optional[List[Tuple[int, int]]]]]] = None
+    if chrom_sizes_path and os.path.exists(chrom_sizes_path):
+        ext_sizes = _parse_extended_chrom_sizes(chrom_sizes_path)
+
     tasks: List[_FullNoiseTask] = []
     for res_raw in res_list:
         res = int(res_raw)
         provider, _ = select_provider(hic_path, res, norm, cooler_selection)
-        chrom_sizes = read_chrom_sizes(provider, chrom_sizes_path)
+        provider_sizes = provider.chrom_sizes()
+
+        # Build chrom_info: chrom -> (chrom_len, regions_or_None)
+        # chrom_len always comes from the provider (authoritative); regions from the file.
+        if ext_sizes is not None:
+            missing_in_hic = set(ext_sizes.keys()) - set(provider_sizes.keys())
+            if missing_in_hic:
+                print(
+                    f"[WARN] Chromosomes in {chrom_sizes_path} not found in file at "
+                    f"{res} bp: {sorted(missing_in_hic)}"
+                )
+            chrom_info: Dict[str, Tuple[int, Optional[List[Tuple[int, int]]]]] = {
+                chrom: (provider_sizes[chrom], regions)
+                for chrom, (_, regions) in ext_sizes.items()
+                if chrom in provider_sizes
+            }
+        else:
+            chrom_info = {c: (s, None) for c, s in provider_sizes.items()}
+
         if chroms is not None:
             requested = set(chroms)
-            missing = requested - set(chrom_sizes.keys())
+            missing = requested - set(chrom_info.keys())
             if missing:
                 print(f"[WARN] Requested chromosomes not found at {res} bp: {sorted(missing)}")
-            chrom_sizes = {c: chrom_sizes[c] for c in chroms if c in chrom_sizes}
-        for chrom, chrom_len in chrom_sizes.items():
+            chrom_info = {c: chrom_info[c] for c in chroms if c in chrom_info}
+
+        for chrom, (chrom_len, regions) in chrom_info.items():
             out_path = os.path.join(out_dir, f"{chrom}_{res}.bedgraph")
             density_out_path = os.path.join(out_dir, f"{chrom}_{res}_density.bedgraph")
             tasks.append(
@@ -587,6 +766,7 @@ def compute_full_noise(
                     out_path=out_path,
                     density_out_path=density_out_path,
                     dump_factor=dump_factor,
+                    regions=tuple(tuple(r) for r in regions) if regions is not None else None,
                 )
             )
         del provider  # release file handle before forking worker processes

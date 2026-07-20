@@ -540,7 +540,17 @@ def main() -> None:
     sp_full = sub.add_parser("noise-bedgraph", help="Compute noise genome-wide using Hi-C expected vectors")
     sp_full.add_argument("--hic", required=True, help="Input .hic file path")
     sp_full.add_argument("--res", required=True, help="Comma-separated resolutions in bp")
-    sp_full.add_argument("--chrom_sizes", help="Chrom sizes TSV (chr\\tsize); default: read from .hic")
+    sp_full.add_argument(
+        "--chrom_sizes",
+        help=(
+            "Chromosome sizes file (tab-separated). "
+            "Required columns: chrom_name, size_bp. "
+            "Optional extra columns: regions as start:end or start-end (0-based, half-open). "
+            "When regions are present only bins overlapping them are emitted; "
+            "a region smaller than one bin still outputs the single overlapping bin. "
+            "Default: read all chromosomes from the input file."
+        ),
+    )
     sp_full.add_argument(
         "--norm",
         default="none",
