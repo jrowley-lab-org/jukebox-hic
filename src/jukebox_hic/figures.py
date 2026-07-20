@@ -79,7 +79,7 @@ def plot_noise_density_from_bed(noise_bed_path: str, out_png: str) -> None:
     ----------
     noise_bed_path : str
         Path to a noise bedgraph file (4-column: chrom start end noise_value).
-        Typically the merged ``{res}.bedgraph`` from ``noise_fullmap``, or a
+        Typically the merged ``{res}.bedgraph`` from ``noise-bedgraph``, or a
         per-chromosome ``{chrom}_{res}.bedgraph`` from ``noise_sampling``.
     out_png : str
         Output PNG file path (overwritten if it exists).

@@ -2,7 +2,7 @@
 """
 Sampled row-based Hi-C noise estimation.
 
-Instead of computing noise for every genomic bin (which ``noise_fullmap`` does),
+Instead of computing noise for every genomic bin (which the ``noise-bedgraph`` command does),
 this module *samples* a fraction of rows from each chromosome's contact matrix,
 computes per-row noise metrics, and aggregates them into per-chromosome summaries.
 

@@ -2,7 +2,7 @@
 """
 plot_coverage_elbow.py — per-chromosome dual-metric elbow detection for blacklist cutoffs.
 
-Reads the two bedgraph outputs of ``noise_fullmap`` for a single resolution:
+Reads the two bedgraph outputs of the ``noise-bedgraph`` command for a single resolution:
   - ``{res}_density.bedgraph``  (per-bin raw contact row sums)
   - ``{res}.bedgraph``          (per-bin noise values, lag-1 autocovariance based)
 
@@ -43,9 +43,9 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--density_bedgraph", required=True,
-                   help="Path to {res}_density.bedgraph from noise_fullmap")
+                   help="Path to {res}_density.bedgraph from noise-bedgraph")
     p.add_argument("--noise_bedgraph", required=True,
-                   help="Path to {res}.bedgraph from noise_fullmap")
+                   help="Path to {res}.bedgraph from noise-bedgraph")
     p.add_argument("--out_png", default="coverage_elbow.png",
                    help="Output figure PNG (a matching .pdf is always written alongside it)")
     p.add_argument("--out_tsv", default="elbow_thresholds.tsv",

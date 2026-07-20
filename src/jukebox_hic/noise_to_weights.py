@@ -1,16 +1,16 @@
 #!/usr/bin/env python
 """
-Transform full-noise bedGraphs into JUKEBOX normalization bias vectors.
+Transform noise-bedgraph outputs into JUKEBOX normalization bias vectors.
 
 This module is the final step in the jukebox-hic pipeline. It reads the genome-wide
-per-bin noise track produced by ``noise_fullmap`` (as a bedgraph file) and converts
-it into a normalization bias vector in Juicer's custom vector format.
+per-bin noise track produced by the ``noise-bedgraph`` command (as a bedgraph file)
+and converts it into a normalization bias vector in Juicer's custom vector format.
 
 Pipeline context
 ----------------
-1. ``noise_sampling`` → ``subsample_summary.tsv`` (per-chrom z-map, pred_log_N, EBR)
-2. ``noise_fullmap``  → ``{res}.bedgraph`` (per-bin noise values for every bin)
-3. **This module**    → ``{res}.juicervector`` (per-bin bias weights for Juicer)
+1. ``noise_sampling``  → ``subsample_summary.tsv`` (per-chrom z-map, pred_log_N, EBR)
+2. ``noise-bedgraph``  → ``{res}.bedgraph`` (per-bin noise values for every bin)
+3. **This module**     → ``{res}.juicervector`` (per-bin bias weights for Juicer)
 
 The bias vector tells Juicer how to weight each genomic bin when normalising the
 Hi-C matrix. Bins with high noise get a larger weight (down-weighted contacts);
@@ -49,11 +49,11 @@ from . import reference
 
 def _resolve_bedgraph_path(noise_dir: str, res: int) -> str:
     """
-    Find the full-noise bedgraph file for a given resolution in a directory.
+    Find the noise-bedgraph output file for a given resolution in a directory.
 
-    ``noise_fullmap`` writes output files named ``{res}.bedgraph``, ``{res}.bedGraph``,
-    or ``{res}.bg`` depending on the platform or user convention. This function tries
-    all three variants and returns the first one found.
+    The ``noise-bedgraph`` command writes output files named ``{res}.bedgraph``,
+    ``{res}.bedGraph``, or ``{res}.bg`` depending on the platform or user convention.
+    This function tries all three variants and returns the first one found.
 
     Parameters
     ----------
@@ -448,7 +448,7 @@ def build_bias_vectors_from_bedgraphs(
     p_factor: float = 2.0,
 ) -> None:
     """
-    Transform a full-noise bedGraph into a Juicer-format normalization vector file.
+    Transform a noise-bedgraph output into a Juicer-format normalization vector file.
 
     Reads ``{noise_dir}/{res}.bedgraph`` and writes ``{out_dir}/{res}.juicervector``
     with vector name ``JUKEBOX`` in the Juicer header line.
@@ -469,7 +469,7 @@ def build_bias_vectors_from_bedgraphs(
 
     Parameters
     ----------
-    noise_dir         : directory containing ``{res}.bedgraph`` (from full-noise)
+    noise_dir         : directory containing ``{res}.bedgraph`` (from noise-bedgraph)
     res               : resolution in bp
     out_dir           : output directory; file will be written as ``{res}.juicervector``
     zmap_summary_path : path to ``subsample_summary.tsv`` from the sampling phase;

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Genome-wide (full-map) Hi-C noise computation.
+Genome-wide (full-map) Hi-C noise computation — backing module for the ``noise-bedgraph`` CLI command.
 
 Unlike ``noise_sampling``, which samples a fraction of rows for a fast global
 estimate, this module computes a noise value for **every** genomic bin on every
@@ -14,7 +14,7 @@ each genomic bin. Bins in heterochromatic, repetitive, or low-mappability region
 tend to have high stochastic noise (random spiky contacts) while euchromatic
 regions in well-sequenced samples have smooth, predictable decay patterns.
 
-By computing noise for every bin, ``noise_fullmap`` produces a genome-wide noise
+By computing noise for every bin, this module produces a genome-wide noise
 track (like a coverage bedgraph, but measuring signal quality rather than depth)
 that can be transformed into a normalization bias vector to down-weight noisy bins
 during Hi-C matrix normalization.
@@ -471,7 +471,7 @@ def compute_full_noise(
        Each task is run with a single retry on failure (see below).
     4. Concatenates per-chromosome bedgraphs into a single ``{res}.bedgraph`` file
        per resolution in ``out_dir``.
-    5. If any tasks failed after retry, writes a ``full_noise_errors.tsv`` log and
+    5. If any tasks failed after retry, writes a ``noise_bedgraph_errors.tsv`` log and
        raises a RuntimeError.
 
     Retry logic
@@ -495,7 +495,7 @@ def compute_full_noise(
     ------------
     Per-chromosome files (intermediate): ``{out_dir}/{chrom}_{res}.bedgraph``
     Per-resolution merged file: ``{out_dir}/{res}.bedgraph``
-    Error log (if failures): ``{out_dir}/full_noise_errors.tsv``
+    Error log (if failures): ``{out_dir}/noise_bedgraph_errors.tsv``
 
     Parameters
     ----------
@@ -725,7 +725,7 @@ def compute_full_noise(
 
     # --- Report failures ---
     if errors:
-        error_path = os.path.join(out_dir, "full_noise_errors.tsv")
+        error_path = os.path.join(out_dir, "noise_bedgraph_errors.tsv")
         with open(error_path, "w") as handle:
             handle.write("chrom\tres\tmessage\n")
             for task, first_exc, second_exc in errors:
@@ -733,5 +733,5 @@ def compute_full_noise(
                     f"{task.chrom}\t{task.res}\tinitial: {repr(first_exc)}; retry: {repr(second_exc)}\n"
                 )
         raise RuntimeError(
-            f"{len(errors)} full-noise task(s) failed. See {error_path} for details."
+            f"{len(errors)} noise-bedgraph task(s) failed. See {error_path} for details."
         )

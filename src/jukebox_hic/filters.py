@@ -4,8 +4,8 @@ Blacklist generation for Hi-C contact matrices using per-chromosome elbow detect
 
 Bins are flagged using the Kneedle algorithm applied independently to two metrics:
 
-- **Contact density** (per-bin row sums from ``noise_fullmap``)
-- **Noise values** (lag-1 autocovariance metric from ``noise_fullmap``)
+- **Contact density** (per-bin row sums from the ``noise-bedgraph`` command)
+- **Noise values** (lag-1 autocovariance metric from the ``noise-bedgraph`` command)
 
 The union rule flags a bin when it falls outside the data-driven threshold in
 either metric.  Flagged intervals are merged into a BED-format blacklist.

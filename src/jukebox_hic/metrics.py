@@ -48,7 +48,7 @@ def _process_rss_mb() -> float:
 
     This function sums the RSS of the main process and all of its child processes
     (recursively), because jukebox-hic may spawn worker subprocesses in parallel
-    full-noise mode. The sum gives the total RAM footprint of the entire analysis.
+    noise-bedgraph mode. The sum gives the total RAM footprint of the entire analysis.
 
     Implementation uses ``psutil.Process.memory_info().rss``, which reads from
     ``/proc/<pid>/status`` on Linux or the equivalent on macOS.
@@ -158,7 +158,7 @@ def estimate_worker_memory_mb(
     density_estimate: float = 0.05,
 ) -> float:
     """
-    Estimate peak per-worker memory for one ``noise_fullmap`` band fetch (MB).
+    Estimate peak per-worker memory for one ``noise-bedgraph`` band fetch (MB).
 
     The padded fetch window covers ``dump_factor * noise_bins + 2 * noise_bins``
     bins on each side, giving a square submatrix of that size.  For a sparse COO

@@ -636,7 +636,7 @@ def _preprocess_noise_track(
     Parameters
     ----------
     noise_track : np.ndarray
-        Per-bin raw noise values from the full-noise bedgraph (may contain NaN/Inf).
+        Per-bin raw noise values from the noise-bedgraph output (may contain NaN/Inf).
     ebr : float
         Mean empty bin ratio for this chromosome, from the subsample_summary.tsv.
 

@@ -13,12 +13,12 @@ sample-noise
     per-chromosome bedgraphs and a genome-wide summary TSV. This is the fast quality
     assessment step used to compute z-map scores and sequencing advisor results.
 
-full-noise
+noise-bedgraph
     Compute noise for every genomic bin genome-wide (no sampling). Produces a per-bin
     bedgraph at each requested resolution, suitable for bias vector construction.
 
 bias-vectors
-    Transform a full-noise bedgraph into a JUKEBOX normalization vector (Juicer
+    Transform a noise-bedgraph output into a JUKEBOX normalization vector (Juicer
     custom-vector format) for a single resolution. Requires the subsample_summary.tsv
     from sample-noise at the same resolution to obtain per-chromosome z-map
     parameters. Run once per resolution.
@@ -29,7 +29,7 @@ plot
 blacklist
     Build a per-chromosome BED blacklist from noise and density bedgraphs using
     data-driven elbow detection.  Requires --density_bedgraph and --noise_bedgraph
-    (outputs of full-noise).
+    (outputs of noise-bedgraph).
 
 sequencing-advisor
     Whole-map ENCODE/4DN sequencing-sufficiency check: reads one
@@ -40,7 +40,7 @@ sequencing-advisor
 default-run
     Run the full jukebox-hic pipeline in sequence:
     Phase 1: sample-noise → Phase 1.5: sequencing-advisor →
-    Phase 2: full-noise → Phase 3: bias-vectors → Phase 4: blacklist.
+    Phase 2: noise-bedgraph → Phase 3: bias-vectors → Phase 4: blacklist.
     Use this for a complete first-pass analysis.
 """
 import argparse
@@ -236,7 +236,7 @@ def _dump_contacts_once(
     """
     Count total contacts per chromosome, using the coarsest available resolution.
 
-    This function is called once at the start of ``sample-noise``, ``full-noise``,
+    This function is called once at the start of ``sample-noise``, ``noise-bedgraph``,
     and ``default-run`` to pre-compute a contacts overview. The results are:
     - Written to ``contacts_overview.tsv`` for user reference.
     - Passed to ``compute_sampled_noise()`` for computing sequencing density (ρ),
@@ -534,10 +534,10 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------ #
-    # full-noise                                                           #
+    # noise-bedgraph                                                       #
     # ------------------------------------------------------------------ #
     # Subparser for the "compute noise for every bin genome-wide" command.
-    sp_full = sub.add_parser("full-noise", help="Compute noise genome-wide using Hi-C expected vectors")
+    sp_full = sub.add_parser("noise-bedgraph", help="Compute noise genome-wide using Hi-C expected vectors")
     sp_full.add_argument("--hic", required=True, help="Input .hic file path")
     sp_full.add_argument("--res", required=True, help="Comma-separated resolutions in bp")
     sp_full.add_argument("--chrom_sizes", help="Chrom sizes TSV (chr\\tsize); default: read from .hic")
@@ -556,7 +556,7 @@ def main() -> None:
         "--cpu",
         type=int,
         default=1,
-        help="Number of worker processes to use for full-noise (default: 1)",
+        help="Number of worker processes to use for noise-bedgraph (default: 1)",
     )
     sp_full.add_argument(
         "--chroms",
@@ -589,15 +589,15 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # bias-vectors                                                         #
     # ------------------------------------------------------------------ #
-    # Subparser for transforming full-noise bedgraphs into Juicer normalization vectors.
+    # Subparser for transforming noise-bedgraph outputs into Juicer normalization vectors.
     sp_bias = sub.add_parser(
         "bias-vectors",
-        help="Transform full-noise bedGraphs into JUKEBOX normalization vectors (Juicer format)",
+        help="Transform noise-bedgraph outputs into JUKEBOX normalization vectors (Juicer format)",
     )
     sp_bias.add_argument(
         "--noise_dir",
         required=True,
-        help="Directory containing {res}.bedgraph files (from full-noise)",
+        help="Directory containing {res}.bedgraph files (from noise-bedgraph)",
     )
     sp_bias.add_argument(
         "--out_dir",
@@ -673,12 +673,12 @@ def main() -> None:
     sp_mask.add_argument(
         "--density_bedgraph",
         required=True,
-        help="Density bedgraph ({res}_density.bedgraph) produced by full-noise",
+        help="Density bedgraph ({res}_density.bedgraph) produced by noise-bedgraph",
     )
     sp_mask.add_argument(
         "--noise_bedgraph",
         required=True,
-        help="Noise bedgraph ({res}.bedgraph) produced by full-noise",
+        help="Noise bedgraph ({res}.bedgraph) produced by noise-bedgraph",
     )
     # Elbow tuning
     sp_mask.add_argument(
@@ -763,7 +763,7 @@ def main() -> None:
         "--cpu",
         type=int,
         default=1,
-        help="Worker processes for full-noise (default: 1)",
+        help="Worker processes for noise-bedgraph (default: 1)",
     )
     sp_run.add_argument(
         "--cooler_path",
@@ -796,7 +796,7 @@ def main() -> None:
         type=float,
         default=10.0,
         help=(
-            "Sliding-window chunk size multiplier passed to full-noise. "
+            "Sliding-window chunk size multiplier passed to noise-bedgraph. "
             "Lower values reduce peak RAM. Default: 10.0."
         ),
     )
@@ -805,7 +805,7 @@ def main() -> None:
         type=float,
         default=None,
         help=(
-            "Hard memory budget in GB for the full-noise phase.  Caps worker count "
+            "Hard memory budget in GB for the noise-bedgraph phase.  Caps worker count "
             "and sets a per-worker address-space limit (Linux/macOS).  Default: no cap."
         ),
     )
@@ -896,7 +896,7 @@ def main() -> None:
 
         _profile_command("sample-noise", run)
 
-    elif args.cmd == "full-noise":
+    elif args.cmd == "noise-bedgraph":
         os.makedirs(args.out_dir, exist_ok=True)
         contacts = _dump_contacts_once(args.hic, args.norm, args.cooler_path, args.chrom_sizes)
         if contacts:
@@ -923,7 +923,7 @@ def main() -> None:
                 max_memory_gb=args.max_memory_gb,
             )
 
-        _profile_command("full-noise", run)
+        _profile_command("noise-bedgraph", run)
 
     elif args.cmd == "bias-vectors":
         if args.res:
@@ -1030,7 +1030,7 @@ def main() -> None:
 
         # Output subdirectory layout:
         #   {out_dir}/sample/{res}/   — per-resolution sampling outputs
-        #   {out_dir}/full/           — full-noise bedgraphs
+        #   {out_dir}/full/           — noise-bedgraph outputs
         #   {out_dir}/vectors/        — Juicer normalization vectors
         sample_root = os.path.join(args.out_dir, "sample")
         full_dir = os.path.join(args.out_dir, "full")
@@ -1075,8 +1075,8 @@ def main() -> None:
         adv_out = os.path.join(args.out_dir, "sequencing_advisor_summary.tsv")
         adv_result = _run_sequencing_advisor(sample_root, adv_out)
 
-        # Phase 2: Full noise for all resolutions at once (benefits from shared I/O)
-        print(f"\n[Phase 2] Computing full noise at {resolutions} bp ...")
+        # Phase 2: Noise bedgraph for all resolutions at once (benefits from shared I/O)
+        print(f"\n[Phase 2] Computing noise bedgraph at {resolutions} bp ...")
         noise_fullmap.compute_full_noise(
             hic_path=args.hic,
             res_list=resolutions,

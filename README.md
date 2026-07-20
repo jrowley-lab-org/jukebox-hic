@@ -63,14 +63,14 @@ jukebox-hic sample-noise \
 Produces one `<chrom>_<res>.bedgraph` for the original map and a `subsample_summary.tsv`
 table with mean/median/log noise, ACF, variability, and empty-bin ratios at each subsample.
 
-### Full map noise
+### Noise bedgraph (genome-wide)
 ```bash
-jukebox-hic full-noise \
+jukebox-hic noise-bedgraph \
   --hic sample.hic \
   --res 5000,10000 \
   --out_dir outputs/
 # Add --cpu <N> to parallelize per (chrom, res) tasks
-jukebox-hic full-noise \
+jukebox-hic noise-bedgraph \
   --hic sample.hic \
   --res 5000,10000 \
   --out_dir outputs/ \
@@ -118,7 +118,7 @@ noise_sampling.compute_sampled_noise(
 - `--norm` accepts `none`, `balance` (cooler weights / KR for `.hic`), or a path to a bedgraph/vector defining custom bin weights.
 - All commands print a summary line with wall-clock time and memory usage; install the optional `profile` extra for psutil-backed RSS reporting.
 - `--profile` writes per-chromosome runtime and memory metrics to a CSV for downstream plotting.
-- `--cpu <N>` parallelizes `full-noise` by `(chromosome, resolution)` tasks (default 1, capped at available cores).
+- `--cpu <N>` parallelizes `noise-bedgraph` by `(chromosome, resolution)` tasks (default 1, capped at available cores).
 - Every CLI invocation now emits a `contacts_overview.tsv` summarizing per-chromosome totals at the coarsest resolution.
 
 ## Backends
