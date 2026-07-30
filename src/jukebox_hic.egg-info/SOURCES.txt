@@ -16,3 +16,10 @@ src/jukebox_hic.egg-info/dependency_links.txt
 src/jukebox_hic.egg-info/entry_points.txt
 src/jukebox_hic.egg-info/requires.txt
 src/jukebox_hic.egg-info/top_level.txt
+tests/test_backends.py
+tests/test_cli_parsers.py
+tests/test_filters.py
+tests/test_metrics.py
+tests/test_noise_fullmap.py
+tests/test_noise_to_weights.py
+tests/test_reference.py
