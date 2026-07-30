@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: jukebox-hic
-Version: 0.2.4
+Version: 0.3.0a
 Summary: Hi-C noise analysis toolkit for .hic/.cool matrices
 Author: NoiseSampler Developers
 License: BSD-3-Clause
@@ -158,4 +158,23 @@ Runtime guidance:
 - If you pass a `.hic` file without hicstraw installed, the tool will suggest `pip install "jukebox-hic[straw]"`.
 - If you pass a cooler-format file without `cooler` installed, the tool will suggest `pip install "jukebox-hic[cooler]"`.
 - The same `--cooler_path` argument selects resolution groups in `.mcool` files and cell groups in `.scool` files.
+
+## Changelog
+
+### v0.3.0
+- **`noise-bedgraph` subcommand** — renamed from `full-noise` for clarity. All existing flags are unchanged.
+- **Region-filtered `--chrom_sizes`** — the chromosome sizes file now accepts optional region columns (cols 3+) in `start:end` or `start-end` format (0-based, half-open). When regions are present, only bins overlapping those regions are emitted. The noise window still extends up to `--bindist_bp` on each side of the region, with chromosome-end clamping applied as usual. A region smaller than one bin outputs the single overlapping bin. Regions that exceed the chromosome size produce a warning and are skipped; chromosomes with no valid regions are skipped entirely.
+  ```
+  # Example extended chrom_sizes file (TSV):
+  # chrom    size         region1              region2
+  chr1       248956422    0:50000000           100000000:150000000
+  chr2       242193529
+  chrX       156040895    5000000-10000000
+  ```
+- **Multi-mode blacklist output** — `blacklist` and `default-run` now produce four output directories per run (`density_only/`, `noise_only/`, `union/`, `intersection/`) instead of a single file, enabling comparison of conservative and permissive thresholds.
+- **Default transforms changed to `log1p`** — both `--density_transform` and `--noise_transform` now default to `log1p` (previously `none` and `sqrt` respectively). `log1p` is more robust to outlier bins (repeats, centromeres) that can skew elbow detection.
+- **Both backends in default install** — `pip install jukebox-hic` now includes both `cooler` and `hic-straw`. Single-backend profiles `[cooler]` and `[straw]` are available for constrained environments.
+
+### v0.2.4
+- Initial public release.
 

@@ -418,6 +418,26 @@ class BaseProvider:
         """
         raise NotImplementedError
 
+    def fetch_region_pair(
+        self,
+        chrom: str,
+        start_a: int,
+        end_a: int,
+        start_b: int,
+        end_b: int,
+    ) -> Optional[sparse.csr_matrix]:
+        """
+        Load the off-diagonal rectangular contact block for region_a × region_b.
+
+        Both regions must be on the same chromosome (*chrom*).  Row indices in the
+        returned matrix correspond to bins in region_a (0-based, local), and column
+        indices correspond to bins in region_b (0-based, local).
+
+        Returns a CSR matrix of shape ``(n_a_bins, n_b_bins)``, or ``None`` if the
+        block is empty or outside the chromosome.
+        """
+        raise NotImplementedError
+
 
 class HiCProvider(BaseProvider):
     """
@@ -591,6 +611,74 @@ class HiCProvider(BaseProvider):
         csr = coo.tocsr()
         csc = coo.tocsc()
         return ChromMatrix(chrom=chrom, chrom_len=end_bp - start_bp, coo=coo, csr=csr, csc=csc)
+
+    def fetch_region_pair(
+        self,
+        chrom: str,
+        start_a: int,
+        end_a: int,
+        start_b: int,
+        end_b: int,
+    ) -> Optional[sparse.csr_matrix]:
+        """
+        Fetch the off-diagonal rectangular block region_a × region_b via hicstraw.
+
+        hicstraw's ``straw()`` accepts two independent region strings, so this calls
+        ``straw(region_a, region_b)`` where the two strings are different.  Records are
+        filtered to the rectangle and assembled into a CSR matrix with local 0-based
+        row indices (offset = start_a // res) and local 0-based col indices
+        (offset = start_b // res).  No symmetrization is applied — the block is
+        inherently non-square.
+        """
+        chrom_len = self._chrom_sizes.get(chrom)
+        if chrom_len is None:
+            return None
+        start_a = max(0, int(start_a))
+        end_a = min(int(chrom_len), int(end_a))
+        start_b = max(0, int(start_b))
+        end_b = min(int(chrom_len), int(end_b))
+        if end_a <= start_a or end_b <= start_b:
+            return None
+
+        region_a = f"{chrom}:{start_a}:{end_a}"
+        region_b = f"{chrom}:{start_b}:{end_b}"
+        try:
+            records = self._hicstraw.straw(
+                "observed", self.norm, self.path, region_a, region_b, "BP", self.res,
+            )
+        except Exception:
+            return None
+        if not records:
+            return None
+
+        offset_a = start_a // self.res
+        offset_b = start_b // self.res
+        n_a = (end_a - start_a + self.res - 1) // self.res
+        n_b = (end_b - start_b + self.res - 1) // self.res
+
+        rows_list: List[int] = []
+        cols_list: List[int] = []
+        data_list: List[float] = []
+        for rec in records:
+            r = rec.binX // self.res - offset_a
+            c = rec.binY // self.res - offset_b
+            if r < 0 or r >= n_a or c < 0 or c >= n_b:
+                continue
+            rows_list.append(r)
+            cols_list.append(c)
+            data_list.append(float(rec.counts))
+
+        if not rows_list:
+            return None
+
+        csr = sparse.csr_matrix(
+            (np.asarray(data_list, dtype=float),
+             (np.asarray(rows_list, dtype=np.int32),
+              np.asarray(cols_list, dtype=np.int32))),
+            shape=(n_a, n_b),
+        )
+        csr.sum_duplicates()
+        return csr
 
 
 class CoolerProvider(BaseProvider):
@@ -796,6 +884,72 @@ class CoolerProvider(BaseProvider):
         csr = coo.tocsr()
         csc = coo.tocsc()
         return ChromMatrix(chrom=chrom, chrom_len=end_bp - start_bp, coo=coo, csr=csr, csc=csc)
+
+    def fetch_region_pair(
+        self,
+        chrom: str,
+        start_a: int,
+        end_a: int,
+        start_b: int,
+        end_b: int,
+    ) -> Optional[sparse.csr_matrix]:
+        """
+        Fetch the off-diagonal rectangular block region_a × region_b via cooler.
+
+        cooler's matrix accessor accepts two distinct region strings, so this calls
+        ``matrix().fetch(region_a, region_b)``.  The returned matrix is already
+        local-indexed (rows 0..n_a-1, cols 0..n_b-1).  Custom weight vectors are
+        applied using separate absolute bin offsets for the row and column dimensions.
+        """
+        if chrom not in self._chrom_sizes:
+            return None
+        chrom_len = int(self._chrom_sizes[chrom])
+        start_a = max(0, int(start_a))
+        end_a = min(chrom_len, int(end_a))
+        start_b = max(0, int(start_b))
+        end_b = min(chrom_len, int(end_b))
+        if end_a <= start_a or end_b <= start_b:
+            return None
+
+        region_a = f"{chrom}:{start_a}-{end_a}"
+        region_b = f"{chrom}:{start_b}-{end_b}"
+        try:
+            if self._norm_mode == "balance":
+                sub = self._balanced_matrix.fetch(region_a, region_b)  # type: ignore[union-attr]
+            else:
+                sub = self._raw_matrix.fetch(region_a, region_b)
+        except Exception:
+            return None
+
+        coo = sub.tocoo()
+
+        finite_mask = np.isfinite(coo.data)
+        if not np.all(finite_mask):
+            coo = sparse.coo_matrix(
+                (coo.data[finite_mask], (coo.row[finite_mask], coo.col[finite_mask])),
+                shape=coo.shape,
+            )
+
+        if self._norm_mode == "custom":
+            # Row weights: absolute offset for region_a; col weights: offset for region_b.
+            chrom_abs_start, _ = self._cooler.extent(chrom)
+            row_offset = chrom_abs_start + start_a // self.res
+            col_offset = chrom_abs_start + start_b // self.res
+            n_a = coo.shape[0]
+            n_b = coo.shape[1]
+            row_weights = self._custom_weights[row_offset:row_offset + n_a]
+            col_weights = self._custom_weights[col_offset:col_offset + n_b]
+            if coo.nnz > 0:
+                factor = row_weights[coo.row] * col_weights[coo.col]
+                coo = sparse.coo_matrix(
+                    (coo.data * factor, (coo.row, coo.col)), shape=coo.shape
+                )
+
+        if coo.nnz == 0:
+            return None
+
+        coo.sum_duplicates()
+        return coo.tocsr()
 
 
 def select_provider(

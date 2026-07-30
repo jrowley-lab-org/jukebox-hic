@@ -31,7 +31,7 @@ Main entry point: ``compute_full_noise()``.
 import multiprocessing as mp
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from statsmodels.tsa.stattools import acovf
@@ -479,33 +479,99 @@ def _full_noise_worker(task: _FullNoiseTask) -> Tuple[str, int, str, bool]:
     return task.chrom, task.res, task.out_path, True
 
 
+# Type alias for a parsed region specification.
+# On-diagonal: Tuple[int, int] = (start_bp, end_bp)
+# Off-diagonal: Tuple[Tuple[int,int], Tuple[int,int]] = ((l_start,l_end),(r_start,r_end))
+_RegionSpec = Union[Tuple[int, int], Tuple[Tuple[int, int], Tuple[int, int]]]
+
+
+def _parse_single_region(
+    s: str,
+    size: int,
+    chrom: str,
+    col_i: int,
+    lineno: int,
+    path: str,
+    side: str = "",
+) -> Optional[Tuple[int, int]]:
+    """
+    Parse a ``start-end`` region string and validate against chromosome size.
+
+    ``-`` is the only accepted separator within a single region (0-based, half-open).
+    Returns ``(start, end)`` on success or ``None`` (with a ``[WARN]`` line printed)
+    on any validation failure.  ``side`` is an optional label (``"left"``/``"right"``)
+    for clearer error messages in off-diagonal context.
+    """
+    label = f"{side} " if side else ""
+    if "-" not in s:
+        print(
+            f"[WARN] {path} line {lineno} col {col_i}: "
+            f"{label}region {s!r} has no '-' separator, skipping"
+        )
+        return None
+    halves = s.split("-", 1)
+    if not halves[0] or not halves[1]:
+        print(
+            f"[WARN] {path} line {lineno} col {col_i}: "
+            f"{label}region {s!r} has empty coordinate, skipping"
+        )
+        return None
+    try:
+        r_start = int(halves[0])
+        r_end = int(halves[1])
+    except ValueError:
+        print(
+            f"[WARN] {path} line {lineno} col {col_i}: "
+            f"cannot parse {label}region {s!r} as integers, skipping"
+        )
+        return None
+    if r_start < 0 or r_end < 0:
+        print(f"[WARN] {chrom} {label}region {s!r}: negative coordinate, skipping")
+        return None
+    if r_end > size:
+        print(
+            f"[WARN] {chrom} {label}region {s!r}: end ({r_end}) exceeds "
+            f"chromosome size ({size}), skipping"
+        )
+        return None
+    if r_start >= r_end:
+        print(
+            f"[WARN] {chrom} {label}region {s!r}: start ({r_start}) >= end ({r_end}), skipping"
+        )
+        return None
+    return (r_start, r_end)
+
+
 def _parse_extended_chrom_sizes(
     path: str,
-) -> Dict[str, Tuple[int, Optional[List[Tuple[int, int]]]]]:
+) -> Dict[str, Tuple[int, Optional[List[_RegionSpec]]]]:
     """
     Parse a chromosome sizes file with optional region columns.
 
     File format (tab-separated):
-        chrom_name  size  [region1  region2  ...]
+        chrom_name  size_bp  [col3  col4  ...]
 
-    - Column 1: chromosome name
-    - Column 2: chromosome size in bp
-    - Columns 3+: optional regions, each as ``start:end`` or ``start-end``
-      (0-based, half-open coordinates, consistent with BED format)
+    Region column formats (0-based, half-open BED coordinates):
 
-    Rules:
-    - A row with only 2 columns means "whole chromosome" (no region filtering).
-    - A row with region columns restricts output to bins overlapping those regions.
-    - Regions are validated against the chromosome size; invalid regions are skipped
-      with a warning. If no valid regions remain for a chromosome, it is skipped.
-    - Duplicate chromosome entries: last row wins.
+    - ``start-end``                         — on-diagonal region
+    - ``l_start-l_end:r_start-r_end``       — off-diagonal pair (left × right)
+
+    The ``-`` character is the exclusive within-region separator.
+    The ``:`` character exclusively joins two ``start-end`` halves into an off-diagonal
+    pair.  The old ``start:end`` notation is no longer accepted as an on-diagonal region.
 
     Returns
     -------
-    Dict mapping chrom_name → (size_bp, regions_or_None).
-    ``regions_or_None`` is ``None`` when no region columns were supplied for that row.
+    Dict mapping chrom_name → (size_bp, region_specs_or_None).
+    Each element of region_specs is either:
+
+    - ``(start, end)``                              — on-diagonal
+    - ``((l_start, l_end), (r_start, r_end))``     — off-diagonal
+
+    ``None`` when no region columns were given (whole chromosome is processed).
+    Duplicate chromosome entries: last row wins.
     """
-    result: Dict[str, Tuple[int, Optional[List[Tuple[int, int]]]]] = {}
+    result: Dict[str, Tuple[int, Optional[List[_RegionSpec]]]] = {}
     with open(path) as fh:
         for lineno, raw in enumerate(fh, 1):
             line = raw.rstrip("\n")
@@ -531,64 +597,181 @@ def _parse_extended_chrom_sizes(
                 result[chrom] = (size, None)
                 continue
 
-            regions: List[Tuple[int, int]] = []
+            region_specs: List[_RegionSpec] = []
             for col_i, raw_col in enumerate(parts[2:], start=3):
                 col = raw_col.strip()
                 if not col:
                     continue
-                # Prefer ':' as separator; fall back to '-'
-                if ":" in col:
-                    sub = col.split(":", 1)
-                elif "-" in col:
-                    sub = col.split("-", 1)
+                colon_count = col.count(":")
+                if colon_count == 0:
+                    # On-diagonal: parse as start-end
+                    spec = _parse_single_region(col, size, chrom, col_i, lineno, path)
+                    if spec is not None:
+                        region_specs.append(spec)
+                elif colon_count == 1:
+                    # Off-diagonal: two halves joined by ':'
+                    left_str, right_str = col.split(":", 1)
+                    left = _parse_single_region(
+                        left_str.strip(), size, chrom, col_i, lineno, path, side="left"
+                    )
+                    right = _parse_single_region(
+                        right_str.strip(), size, chrom, col_i, lineno, path, side="right"
+                    )
+                    if left is not None and right is not None:
+                        if left[0] < right[1] and right[0] < left[1]:
+                            print(
+                                f"[WARN] {chrom} col {col_i}: off-diagonal regions "
+                                f"overlap ({col!r}); continuing anyway"
+                            )
+                        region_specs.append((left, right))
                 else:
                     print(
                         f"[WARN] {path} line {lineno} col {col_i}: "
-                        f"cannot parse region {col!r} (expected start:end or start-end), skipping"
+                        f"region {col!r} contains more than one ':', skipping"
                     )
-                    continue
-                if not sub[0] or not sub[1]:
-                    print(
-                        f"[WARN] {path} line {lineno} col {col_i}: "
-                        f"region {col!r} has empty coordinate, skipping"
-                    )
-                    continue
-                try:
-                    r_start = int(sub[0])
-                    r_end = int(sub[1])
-                except ValueError:
-                    print(
-                        f"[WARN] {path} line {lineno} col {col_i}: "
-                        f"cannot parse region {col!r} as integers, skipping"
-                    )
-                    continue
-                if r_start < 0 or r_end < 0:
-                    print(
-                        f"[WARN] {chrom} region {col!r}: negative coordinate, skipping"
-                    )
-                    continue
-                if r_end > size:
-                    print(
-                        f"[WARN] {chrom} region {col!r}: end ({r_end}) exceeds "
-                        f"chromosome size ({size}), skipping"
-                    )
-                    continue
-                if r_start >= r_end:
-                    print(
-                        f"[WARN] {chrom} region {col!r}: start ({r_start}) >= end ({r_end}), skipping"
-                    )
-                    continue
-                regions.append((r_start, r_end))
 
-            if not regions:
+            if not region_specs:
                 print(
                     f"[WARN] {chrom}: no valid regions found in {path}, skipping chromosome"
                 )
                 continue
 
-            result[chrom] = (size, regions)
+            result[chrom] = (size, region_specs)
 
     return result
+
+
+@dataclass(frozen=True)
+class _OffDiagNoiseTask:
+    """
+    Immutable task descriptor for one off-diagonal (region_A × region_B) noise computation.
+
+    Unlike ``_FullNoiseTask``, which operates on a symmetric diagonal block, this task
+    fetches the rectangular contact block where rows come from ``left_region`` and columns
+    come from ``right_region``.  For each row bin in the left region the lag-1
+    autocovariance of its contact profile across the entire right region is computed.
+
+    Attributes
+    ----------
+    left_start, left_end : int
+        0-based half-open bp coordinates for the row (left) region.
+    right_start, right_end : int
+        0-based half-open bp coordinates for the column (right) region.
+    out_path : str
+        Output bedgraph path (5-column format; see ``_write_off_diag_bedgraph``).
+    """
+    hic_path: str
+    chrom: str
+    chrom_len: int
+    res: int
+    norm: str
+    cooler_selection: Optional[str]
+    left_start: int
+    left_end: int
+    right_start: int
+    right_end: int
+    out_dir: str
+    out_path: str
+    dump_factor: float = 10.0
+
+
+def _write_off_diag_bedgraph(task: "_OffDiagNoiseTask", noise_vals: np.ndarray) -> None:
+    """
+    Write off-diagonal noise values as a 5-column bedgraph.
+
+    Format per line:
+        chrom  left_bin_start  left_bin_end  chrom:right_start-right_end  noise_value
+
+    Columns 1–3 give the standard BED coordinate of each bin in the left region.
+    Column 4 encodes the right region as ``chrom:start-end`` (using ``:`` to join
+    the chromosome name to the coordinate range).  Column 5 is the noise value.
+    """
+    res = int(task.res)
+    right_label = f"{task.chrom}:{task.right_start}-{task.right_end}"
+    with open(task.out_path, "w") as fh:
+        for i, val in enumerate(noise_vals):
+            start = task.left_start + i * res
+            end = min(task.left_start + (i + 1) * res, task.left_end)
+            fh.write(f"{task.chrom}\t{start}\t{end}\t{right_label}\t{val}\n")
+
+
+def _off_diag_noise_worker(task: "_OffDiagNoiseTask") -> Tuple[str, str, bool]:
+    """
+    Worker function for one off-diagonal (region_A × region_B) noise task.
+
+    Designed to run either in the main process (serial mode) or in a subprocess
+    (parallel mode).  Steps:
+
+    1. Open the provider and compute bin counts for the left and right regions.
+    2. Iterate over left-region row chunks (sized by ``dump_factor × n_right_bins``).
+       For each chunk, fetch the rectangular contact block via ``fetch_region_pair``.
+    3. For each left bin, compute lag-1 autocovariance of the contact profile across
+       the right region.  Noise = ``1 / |autocovariance|`` (NaN when undefined).
+    4. Write the per-bin noise track with ``_write_off_diag_bedgraph``.
+
+    Returns
+    -------
+    Tuple[str, str, bool]
+        ``(chrom_name, output_path, success_flag)``
+    """
+    provider, _ = select_provider(task.hic_path, task.res, task.norm, task.cooler_selection)
+
+    res = int(task.res)
+    n_left_bins = (task.left_end - task.left_start + res - 1) // res
+    n_right_bins = (task.right_end - task.right_start + res - 1) // res
+
+    if n_left_bins == 0 or n_right_bins == 0:
+        if os.path.exists(task.out_path):
+            try:
+                os.remove(task.out_path)
+            except OSError:
+                pass
+        return task.chrom, task.out_path, False
+
+    # Chunk the left region; use n_right_bins as the "window size" analogue so that
+    # dump_factor has the same RAM-scaling meaning as in the on-diagonal case.
+    dump_bins = _compute_dump_bins(n_left_bins, n_right_bins, task.dump_factor)
+
+    noise_vals = np.full(n_left_bins, float("nan"), dtype=float)
+    any_data = False
+
+    chunk_start = 0
+    while chunk_start < n_left_bins:
+        chunk_end = min(chunk_start + dump_bins, n_left_bins)
+
+        abs_left_start = task.left_start + chunk_start * res
+        abs_left_end = task.left_start + chunk_end * res
+
+        mat = provider.fetch_region_pair(
+            task.chrom,
+            abs_left_start, abs_left_end,
+            task.right_start, task.right_end,
+        )
+
+        if mat is not None and mat.nnz > 0:
+            any_data = True
+            for local_i in range(chunk_end - chunk_start):
+                row_vec = mat.getrow(local_i).toarray().ravel()
+                try:
+                    ac = acovf(row_vec, nlag=1, fft=True)[1]
+                    noise_vals[chunk_start + local_i] = (
+                        float("nan") if ac == 0 else 1.0 / abs(ac)
+                    )
+                except Exception:
+                    noise_vals[chunk_start + local_i] = float("nan")
+
+        chunk_start = chunk_end
+
+    if not any_data:
+        if os.path.exists(task.out_path):
+            try:
+                os.remove(task.out_path)
+            except OSError:
+                pass
+        return task.chrom, task.out_path, False
+
+    _write_off_diag_bedgraph(task, noise_vals)
+    return task.chrom, task.out_path, True
 
 
 def compute_full_noise(
@@ -711,23 +894,24 @@ def compute_full_noise(
             int(max_memory_gb * 1024**3 / workers),
         )
 
-    # --- Build task list ---
+    # --- Build task lists ---
     # A provider is opened briefly to enumerate chromosomes, then closed (``del provider``)
     # before tasks are dispatched to workers. Worker processes open their own providers.
 
     # Parse the extended chrom_sizes file once (resolution-independent).
-    ext_sizes: Optional[Dict[str, Tuple[int, Optional[List[Tuple[int, int]]]]]] = None
+    ext_sizes: Optional[Dict[str, Tuple[int, Optional[List[_RegionSpec]]]]] = None
     if chrom_sizes_path and os.path.exists(chrom_sizes_path):
         ext_sizes = _parse_extended_chrom_sizes(chrom_sizes_path)
 
     tasks: List[_FullNoiseTask] = []
+    off_tasks: List[_OffDiagNoiseTask] = []
     for res_raw in res_list:
         res = int(res_raw)
         provider, _ = select_provider(hic_path, res, norm, cooler_selection)
         provider_sizes = provider.chrom_sizes()
 
-        # Build chrom_info: chrom -> (chrom_len, regions_or_None)
-        # chrom_len always comes from the provider (authoritative); regions from the file.
+        # Build chrom_info: chrom -> (chrom_len, region_specs_or_None)
+        # chrom_len always comes from the provider (authoritative); specs from the file.
         if ext_sizes is not None:
             missing_in_hic = set(ext_sizes.keys()) - set(provider_sizes.keys())
             if missing_in_hic:
@@ -735,9 +919,9 @@ def compute_full_noise(
                     f"[WARN] Chromosomes in {chrom_sizes_path} not found in file at "
                     f"{res} bp: {sorted(missing_in_hic)}"
                 )
-            chrom_info: Dict[str, Tuple[int, Optional[List[Tuple[int, int]]]]] = {
-                chrom: (provider_sizes[chrom], regions)
-                for chrom, (_, regions) in ext_sizes.items()
+            chrom_info: Dict[str, Tuple[int, Optional[List[_RegionSpec]]]] = {
+                chrom: (provider_sizes[chrom], region_specs)
+                for chrom, (_, region_specs) in ext_sizes.items()
                 if chrom in provider_sizes
             }
         else:
@@ -750,25 +934,68 @@ def compute_full_noise(
                 print(f"[WARN] Requested chromosomes not found at {res} bp: {sorted(missing)}")
             chrom_info = {c: chrom_info[c] for c in chroms if c in chrom_info}
 
-        for chrom, (chrom_len, regions) in chrom_info.items():
-            out_path = os.path.join(out_dir, f"{chrom}_{res}.bedgraph")
-            density_out_path = os.path.join(out_dir, f"{chrom}_{res}_density.bedgraph")
-            tasks.append(
-                _FullNoiseTask(
-                    hic_path=hic_path,
-                    chrom=chrom,
-                    chrom_len=chrom_len,
-                    res=res,
-                    norm=norm,
-                    cooler_selection=cooler_selection,
-                    bindist_bp=bindist_bp,
-                    out_dir=out_dir,
-                    out_path=out_path,
-                    density_out_path=density_out_path,
-                    dump_factor=dump_factor,
-                    regions=tuple(tuple(r) for r in regions) if regions is not None else None,
+        for chrom, (chrom_len, region_specs) in chrom_info.items():
+            # Partition region specs into on-diagonal and off-diagonal.
+            # On-diagonal:  Tuple[int, int]                       — isinstance(spec[0], int) is True
+            # Off-diagonal: Tuple[Tuple[int,int], Tuple[int,int]] — spec[0] is a tuple
+            if region_specs is None:
+                on_diag: Optional[List[Tuple[int, int]]] = None
+                off_diag: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
+            else:
+                on_diag = [
+                    spec for spec in region_specs  # type: ignore[misc]
+                    if isinstance(spec[0], int)
+                ]
+                off_diag = [
+                    spec for spec in region_specs  # type: ignore[misc]
+                    if not isinstance(spec[0], int)
+                ]
+
+            # On-diagonal task: create when whole-chrom (None) or when explicit on-diag specs exist.
+            if on_diag is not None or region_specs is None:
+                out_path = os.path.join(out_dir, f"{chrom}_{res}.bedgraph")
+                density_out_path = os.path.join(out_dir, f"{chrom}_{res}_density.bedgraph")
+                tasks.append(
+                    _FullNoiseTask(
+                        hic_path=hic_path,
+                        chrom=chrom,
+                        chrom_len=chrom_len,
+                        res=res,
+                        norm=norm,
+                        cooler_selection=cooler_selection,
+                        bindist_bp=bindist_bp,
+                        out_dir=out_dir,
+                        out_path=out_path,
+                        density_out_path=density_out_path,
+                        dump_factor=dump_factor,
+                        regions=tuple(tuple(r) for r in on_diag) if on_diag else None,
+                    )
                 )
-            )
+
+            # Off-diagonal tasks: one per region pair.
+            for (l_start, l_end), (r_start, r_end) in off_diag:
+                safe_name = f"{l_start}-{l_end}_{r_start}-{r_end}"
+                od_path = os.path.join(
+                    out_dir, f"{chrom}_{safe_name}_{res}_offdiag.bedgraph"
+                )
+                off_tasks.append(
+                    _OffDiagNoiseTask(
+                        hic_path=hic_path,
+                        chrom=chrom,
+                        chrom_len=chrom_len,
+                        res=res,
+                        norm=norm,
+                        cooler_selection=cooler_selection,
+                        left_start=l_start,
+                        left_end=l_end,
+                        right_start=r_start,
+                        right_end=r_end,
+                        out_dir=out_dir,
+                        out_path=od_path,
+                        dump_factor=dump_factor,
+                    )
+                )
+
         del provider  # release file handle before forking worker processes
 
     # --- Remove stale output files from previous runs ---
@@ -810,45 +1037,100 @@ def compute_full_noise(
                 errors.append((task, first_exc, second_exc))
                 raise
 
-    if not tasks:
+    if not tasks and not off_tasks:
         return
 
-    if workers == 1:
-        # --- Serial execution ---
-        for task in tasks:
-            try:
-                results.append(_run_with_retry(task))
-            except Exception:
-                # Error already recorded in ``errors`` by ``_run_with_retry``.
-                continue
-    else:
-        # --- Parallel execution ---
-        # ``apply_async`` submits all tasks immediately and returns AsyncResult handles.
-        # Results are collected in submission order (``async_res.get()`` blocks until
-        # the specific task completes). This preserves ordering without limiting
-        # parallelism: the pool runs up to ``workers`` tasks simultaneously.
-        ctx = mp.get_context()
-        with ctx.Pool(
-            processes=workers,
-            maxtasksperchild=10,
-            initializer=_worker_init,
-            initargs=(per_worker_bytes,),
-        ) as pool:
-            async_results = [(task, pool.apply_async(_full_noise_worker, (task,))) for task in tasks]
-            for task, async_res in async_results:
+    # --- On-diagonal dispatch ---
+    if tasks:
+        if workers == 1:
+            # --- Serial execution ---
+            for task in tasks:
                 try:
-                    results.append(async_res.get())
-                except Exception as first_exc:
-                    # Worker failed — clean up partial output and retry in main process.
-                    if os.path.exists(task.out_path):
-                        try:
-                            os.remove(task.out_path)
-                        except OSError:
-                            pass
+                    results.append(_run_with_retry(task))
+                except Exception:
+                    # Error already recorded in ``errors`` by ``_run_with_retry``.
+                    continue
+        else:
+            # --- Parallel execution ---
+            # ``apply_async`` submits all tasks immediately and returns AsyncResult handles.
+            # Results are collected in submission order (``async_res.get()`` blocks until
+            # the specific task completes). This preserves ordering without limiting
+            # parallelism: the pool runs up to ``workers`` tasks simultaneously.
+            ctx = mp.get_context()
+            with ctx.Pool(
+                processes=workers,
+                maxtasksperchild=10,
+                initializer=_worker_init,
+                initargs=(per_worker_bytes,),
+            ) as pool:
+                async_results = [(task, pool.apply_async(_full_noise_worker, (task,))) for task in tasks]
+                for task, async_res in async_results:
                     try:
-                        results.append(_full_noise_worker(task))
-                    except Exception as second_exc:
-                        errors.append((task, first_exc, second_exc))
+                        results.append(async_res.get())
+                    except Exception as first_exc:
+                        # Worker failed — clean up partial output and retry in main process.
+                        if os.path.exists(task.out_path):
+                            try:
+                                os.remove(task.out_path)
+                            except OSError:
+                                pass
+                        try:
+                            results.append(_full_noise_worker(task))
+                        except Exception as second_exc:
+                            errors.append((task, first_exc, second_exc))
+
+    # --- Off-diagonal dispatch ---
+    od_results: List[Tuple[str, str, bool]] = []
+    od_errors: List[Tuple[_OffDiagNoiseTask, Exception, Exception]] = []
+
+    def _run_off_diag_with_retry(task: _OffDiagNoiseTask) -> Tuple[str, str, bool]:
+        """Same retry logic as ``_run_with_retry`` but for off-diagonal tasks."""
+        try:
+            return _off_diag_noise_worker(task)
+        except Exception as first_exc:
+            if os.path.exists(task.out_path):
+                try:
+                    os.remove(task.out_path)
+                except OSError:
+                    pass
+            try:
+                return _off_diag_noise_worker(task)
+            except Exception as second_exc:
+                od_errors.append((task, first_exc, second_exc))
+                raise
+
+    if off_tasks:
+        if workers == 1:
+            for task in off_tasks:
+                try:
+                    od_results.append(_run_off_diag_with_retry(task))
+                except Exception:
+                    continue
+        else:
+            ctx = mp.get_context()
+            with ctx.Pool(
+                processes=workers,
+                maxtasksperchild=10,
+                initializer=_worker_init,
+                initargs=(per_worker_bytes,),
+            ) as pool:
+                async_od = [
+                    (task, pool.apply_async(_off_diag_noise_worker, (task,)))
+                    for task in off_tasks
+                ]
+                for task, async_res in async_od:
+                    try:
+                        od_results.append(async_res.get())
+                    except Exception as first_exc:
+                        if os.path.exists(task.out_path):
+                            try:
+                                os.remove(task.out_path)
+                            except OSError:
+                                pass
+                        try:
+                            od_results.append(_off_diag_noise_worker(task))
+                        except Exception as second_exc:
+                            od_errors.append((task, first_exc, second_exc))
 
     # --- Collect successfully-generated per-chromosome bedgraph paths by resolution ---
     per_res_outputs: Dict[int, List[str]] = {}
@@ -903,15 +1185,22 @@ def compute_full_noise(
                     with open(dp, "rb") as part:
                         mh.write(part.read())
 
-    # --- Report failures ---
-    if errors:
+    # --- Report failures (on-diagonal and off-diagonal combined) ---
+    all_failed = len(errors) + len(od_errors)
+    if all_failed:
         error_path = os.path.join(out_dir, "noise_bedgraph_errors.tsv")
         with open(error_path, "w") as handle:
-            handle.write("chrom\tres\tmessage\n")
+            handle.write("chrom\tres\ttask_type\tout_path\tmessage\n")
             for task, first_exc, second_exc in errors:
                 handle.write(
-                    f"{task.chrom}\t{task.res}\tinitial: {repr(first_exc)}; retry: {repr(second_exc)}\n"
+                    f"{task.chrom}\t{task.res}\ton_diagonal\t{task.out_path}\t"
+                    f"initial: {repr(first_exc)}; retry: {repr(second_exc)}\n"
+                )
+            for task, first_exc, second_exc in od_errors:
+                handle.write(
+                    f"{task.chrom}\t{task.res}\toff_diagonal\t{task.out_path}\t"
+                    f"initial: {repr(first_exc)}; retry: {repr(second_exc)}\n"
                 )
         raise RuntimeError(
-            f"{len(errors)} noise-bedgraph task(s) failed. See {error_path} for details."
+            f"{all_failed} noise-bedgraph task(s) failed. See {error_path} for details."
         )

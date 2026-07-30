@@ -545,9 +545,12 @@ def main() -> None:
         help=(
             "Chromosome sizes file (tab-separated). "
             "Required columns: chrom_name, size_bp. "
-            "Optional extra columns: regions as start:end or start-end (0-based, half-open). "
-            "When regions are present only bins overlapping them are emitted; "
-            "a region smaller than one bin still outputs the single overlapping bin. "
+            "Optional extra columns specify regions (0-based, half-open): "
+            "use 'start-end' for an on-diagonal region (emits bins overlapping that range); "
+            "use 'left_start-left_end:right_start-right_end' for an off-diagonal pair "
+            "(rows = left region, columns = right region — outputs a separate *_offdiag.bedgraph). "
+            "The ':' separator is exclusively for off-diagonal pairs; single-region ':' notation "
+            "is no longer accepted. A region smaller than one bin outputs the single overlapping bin. "
             "Default: read all chromosomes from the input file."
         ),
     )
