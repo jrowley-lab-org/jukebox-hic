@@ -37,7 +37,6 @@ Module contents
 - ``_build_design_matrix()``               — build 11-feature design vector for one sample
 - ``_preprocess_noise_track()``             — shared noise preprocessing (smooth, log)
 - ``process_normalization_vectors_jukebox()`` — JUKEBOX bias vector
-- ``generate_blacklist()``                  — identify noisy/invalid bins
 """
 
 from __future__ import annotations
@@ -685,6 +684,7 @@ def process_normalization_vectors_jukebox(
     ebr: float,
     p: float = 3.0,
     alpha: float = 0.5,
+    max_log2_fold: Optional[float] = 3.0,
 ) -> np.ndarray:
     """
     JUKEBOX normalization.
@@ -709,68 +709,50 @@ def process_normalization_vectors_jukebox(
     ebr         : mean empty bin ratio (used as Gaussian sigma offset)
     p           : compression factor; p=2 → square root (CLI default), p=3 → cube root
     alpha       : scaling constant to keep center stable (default 0.5)
+    max_log2_fold : clamp the bias to +/- this many log2 units around 1.0
+                    (default 3.0 -> weights confined to [0.125, 8]).  None
+                    disables clamping.
 
     Returns
     -------
-    bias_vector : same shape as noise_track; NaN where original was NaN/Inf
+    bias_vector : same shape as noise_track; NaN where original was NaN/Inf.
+                  Finite entries have geometric mean exactly 1.0.
     """
     is_nan, log_N, _ = _preprocess_noise_track(noise_track, ebr)
 
     residual = log_N - float(pred_log_N)
+
+    # Re-centre the residual on its own median BEFORE the non-linear compression.
+    #
+    # The signed root x -> sign(x)*|x|^(1/p) is steep near zero and flat far from
+    # it.  If the bulk of the residual distribution does not sit near zero, the
+    # bulk lands on the flat part of the curve (its spread is squashed) while the
+    # few bins whose residual crosses zero land on the near-singular part (their
+    # spread explodes).  The result is a bias vector with a near-constant bulk and
+    # a runaway tail -- weights of 50-100x that blank out whole rows in Juicer.
+    #
+    # Centring first makes the transform symmetric about the chromosome's own
+    # typical bin, so the vector encodes *relative* within-chromosome noise, which
+    # is what a matrix-balancing bias vector should carry.  It also makes the
+    # output robust to any scale offset in pred_log_N.
+    valid = ~is_nan
+    if valid.any():
+        anchor = float(np.median(residual[valid]))
+        if np.isfinite(anchor):
+            residual = residual - anchor
+
     compressed = np.sign(residual) * np.power(np.abs(residual), 1.0 / float(p)) * float(alpha)
+
+    # Clamp the log-bias.  Juicer divides the observed count by bias[i]*bias[j], so
+    # an unclamped weight of 100 removes a row entirely (a pair of them by 1e4).
+    # Clamping keeps the vector in a range comparable to KR/VC while preserving the
+    # ranking of noisy bins.
+    if max_log2_fold is not None and np.isfinite(max_log2_fold) and max_log2_fold > 0:
+        lim = float(max_log2_fold) * np.log10(2.0)
+        np.clip(compressed, -lim, lim, out=compressed)
+
     _center_log_bias(compressed, is_nan)
     bias_vector = np.power(10.0, compressed)
     bias_vector[is_nan] = np.nan
 
     return bias_vector
-
-
-def generate_blacklist(
-    noise_track: np.ndarray,
-    chrom: str,
-    resolution: int,
-    top_quantile: float = 0.99,
-    bottom_quantile: float = 0.0,
-) -> List[List]:
-    """
-    Build BED rows flagging extreme-noise bins and all NaN/Inf bins.
-
-    Two categories are always flagged:
-    1. **NaN/Inf bins**: no reliable noise estimate (too sparse).
-    2. **High-noise bins**: at or above the ``top_quantile`` percentile.
-
-    Optionally also flags low-noise bins (``bottom_quantile > 0``):
-    3. **Suspiciously smooth bins**: at or below the ``bottom_quantile`` percentile.
-
-    Parameters
-    ----------
-    noise_track     : per-bin raw noise values
-    chrom           : chromosome name
-    resolution      : bin size in bp
-    top_quantile    : upper percentile threshold as a fraction, e.g. 0.99 (default)
-    bottom_quantile : lower percentile threshold as a fraction, e.g. 0.01; 0 disables
-
-    Returns
-    -------
-    List of [chrom, start, end] rows in BED coordinate format (0-based, half-open).
-    """
-    finite_vals = noise_track[~np.isnan(noise_track) & ~np.isinf(noise_track)]
-    if finite_vals.size > 0:
-        p_high = float(np.percentile(finite_vals, top_quantile * 100))
-        invalid = np.isnan(noise_track) | np.isinf(noise_track)
-        mask = (noise_track >= p_high) | invalid
-        if bottom_quantile > 0.0:
-            p_low = float(np.percentile(finite_vals, bottom_quantile * 100))
-            mask |= (noise_track <= p_low) & ~invalid
-        flagged = np.where(mask)[0]
-    else:
-        # All bins are NaN/Inf — flag everything
-        flagged = np.where(np.isnan(noise_track) | np.isinf(noise_track))[0]
-
-    bed_rows: List[List] = []
-    for idx in flagged:
-        start = int(idx) * resolution
-        end = (int(idx) + 1) * resolution
-        bed_rows.append([chrom, start, end])
-
-    return bed_rows

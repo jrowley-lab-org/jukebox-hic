@@ -178,3 +178,29 @@ def test_parse_extended_chrom_sizes_last_row_wins_on_duplicate(tmp_path):
     f.write_text("chr1\t100000\nchr1\t200000\n")
     result = _parse_extended_chrom_sizes(str(f))
     assert result["chr1"][0] == 200000
+
+
+# ---------------------------------------------------------------------------
+# Robustness: short chromosomes must not reach the native reader
+# ---------------------------------------------------------------------------
+
+def test_short_chromosome_guard_threshold():
+    """
+    A chromosome shorter than the noise window cannot carry a 2W diagonal window,
+    and these are exactly the entries that crash the native .hic reader (chrM at
+    fine resolutions makes hicstraw die with SIGFPE, which used to hang or kill a
+    whole genome-wide run). The guard compares chromosome length to the window.
+    """
+    from jukebox_hic.noise_fullmap import _default_bindist_bp
+
+    # chrM against the windows JUKEBOX actually uses
+    chrM = 16_569
+    for res in (10_000, 25_000, 250_000):
+        assert chrM < _default_bindist_bp(res), (
+            f"chrM would not be filtered at {res} bp"
+        )
+    # real chromosomes must survive the same test
+    for res, length in ((250_000, 46_709_983), (25_000, 46_709_983), (10_000, 46_709_983)):
+        assert length >= _default_bindist_bp(res), (
+            f"chr21 would be wrongly filtered at {res} bp"
+        )

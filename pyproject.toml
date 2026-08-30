@@ -29,7 +29,7 @@ profile = ["psutil>=5.9"]
 dev     = ["pytest>=7.0", "pytest-cov"]
 
 [project.urls]
-Homepage = "https://github.com/timrez/NoiseSampler"
+Homepage = "https://github.com/jrowley-lab-org/jukebox-hic"
 
 [project.scripts]
 jukebox-hic = "jukebox_hic.cli:main"

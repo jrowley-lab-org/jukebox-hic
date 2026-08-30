@@ -52,7 +52,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from . import figures, noise_fullmap, noise_sampling, filters, noise_to_weights, reference
+from . import figures, hic_norm, noise_fullmap, noise_sampling, filters, noise_to_weights, reference
 from .backends import (
     cooler_resolutions,
     hic_resolutions,
@@ -658,6 +658,59 @@ def main() -> None:
         default=2.0,
         help="Compression factor for JUKEBOX normalization (default: 2.0; square root). Use 3.0 for cube root.",
     )
+    sp_bias.add_argument(
+        "--max_log2_fold",
+        type=float,
+        default=3.0,
+        help=(
+            "Clamp JUKEBOX bias weights to +/- this many log2 units around 1.0 "
+            "(default: 3.0, i.e. weights in [0.125, 8]). Pass 0 to disable. Juicer "
+            "divides observed counts by bias[i]*bias[j], so unclamped outlier "
+            "weights can blank out whole rows."
+        ),
+    )
+
+    # ------------------------------------------------------------------ #
+    # add-norm                                                             #
+    # ------------------------------------------------------------------ #
+    sp_addnorm = sub.add_parser(
+        "add-norm",
+        help="Write a JUKEBOX normalization into a copy of a .hic file "
+             "(every resolution normalized independently)",
+    )
+    sp_addnorm.add_argument("--hic", required=True, help="Input .hic (never modified)")
+    sp_addnorm.add_argument("--out", required=True, help="Output .hic — a copy that receives the normalization")
+    sp_addnorm.add_argument("--juicer_tools", required=True,
+                            help="Path to a juicer_tools jar. Use 1.22.x: juicer_tools 2.20 "
+                                 "was observed to corrupt v8 files during addNorm.")
+    sp_addnorm.add_argument("--noise_dir", required=True,
+                            help="Directory of {res}.bedgraph noise tracks from noise-bedgraph")
+    sp_addnorm.add_argument("--res", type=_comma_ints, default=None,
+                            help="Resolutions to add (default: every {res}.bedgraph in --noise_dir)")
+    sp_addnorm.add_argument("--name", default="JUKEBOX",
+                            help="Normalization label shown in Juicebox (default: JUKEBOX)")
+    sp_addnorm.add_argument("--scheme", choices=list(hic_norm.SCHEMES), default="power",
+                            help="Noise-to-weight mapping (default: power)")
+    sp_addnorm.add_argument("--exponent", type=float, default=1.0,
+                            help="Power-scheme exponent: bias = (noise/median)^exponent. "
+                                 "+1 linear, +0.5 sqrt, -0.5 inverse sqrt, 0 no-op (default: 1.0)")
+    sp_addnorm.add_argument("--max_log2_fold", type=float, default=3.0,
+                            help="Clamp weights to +/- this many log2 units around 1.0 "
+                                 "(default 3.0 -> [0.125, 8]); 0 disables")
+    sp_addnorm.add_argument("--chrom_sizes", default=None,
+                            help="Chrom sizes file, used to size each chromosome's block")
+    sp_addnorm.add_argument("--include_decoys", action="store_true", default=False,
+                            help="Also emit blocks for unplaced/alt/decoy sequences")
+    sp_addnorm.add_argument("--java", default="java", help="java executable (default: java)")
+    sp_addnorm.add_argument("--java_mem", default="32g", help="-Xmx value for juicer_tools (default: 32g)")
+    sp_addnorm.add_argument("--overwrite", action="store_true", default=False,
+                            help="Replace --out if it already exists")
+    sp_addnorm.add_argument("--keep_vector", default=None,
+                            help="Also write the generated Juicer vector file here")
+    sp_addnorm.add_argument("--alpha", dest="an_alpha", type=float, default=0.5,
+                            help="residual-root scheme only: scaling constant (default 0.5)")
+    sp_addnorm.add_argument("--p_factor", dest="an_p", type=float, default=2.0,
+                            help="residual-root scheme only: compression factor (default 2.0)")
 
     # ------------------------------------------------------------------ #
     # plot                                                                 #
@@ -723,6 +776,12 @@ def main() -> None:
     sp_mask.add_argument(
         "--elbow_smooth_sigma", type=float, default=10.0,
         help="Gaussian smoothing sigma for elbow detection (default: 10.0)",
+    )
+    sp_mask.add_argument(
+        "--rule", choices=["noise-high", "union", "intersection", "mask"], default=None,
+        help=("Blacklist flagging rule. 'noise-high' (recommended) = unmappable bins plus the "
+              "extreme-disorder tail only, no density term; 'union'/'intersection' are the legacy "
+              "rules; 'mask' emits the unmappability mask alone. Overrides --require_both_metrics."),
     )
     sp_mask.add_argument(
         "--require_both_metrics", action="store_true", default=False,
@@ -805,6 +864,17 @@ def main() -> None:
         help="Compression factor for JUKEBOX normalization (default: 2.0; square root). Use 3.0 for cube root.",
     )
     sp_run.add_argument(
+        "--max_log2_fold",
+        type=float,
+        default=3.0,
+        help=(
+            "Clamp JUKEBOX bias weights to +/- this many log2 units around 1.0 "
+            "(default: 3.0, i.e. weights in [0.125, 8]). Pass 0 to disable. Juicer "
+            "divides observed counts by bias[i]*bias[j], so unclamped outlier "
+            "weights can blank out whole rows."
+        ),
+    )
+    sp_run.add_argument(
         "--dump_factor",
         type=float,
         default=10.0,
@@ -852,6 +922,12 @@ def main() -> None:
                         help="Bottom fraction of noise bins searched for the lower elbow (default: 0.01 = bottom 1%%)")
     sp_run.add_argument("--elbow_smooth_sigma", type=float, default=10.0,
                         help="Gaussian smoothing sigma for elbow detection (default: 10.0)")
+    sp_run.add_argument(
+        "--rule", choices=["noise-high", "union", "intersection", "mask"], default=None,
+        help=("Blacklist flagging rule. 'noise-high' (recommended) = unmappable bins plus the "
+              "extreme-disorder tail only, no density term; 'union'/'intersection' are the legacy "
+              "rules; 'mask' emits the unmappability mask alone. Overrides --require_both_metrics."),
+    )
     sp_run.add_argument(
         "--require_both_metrics", action="store_true", default=False,
         help=(
@@ -979,10 +1055,36 @@ def main() -> None:
                 skip_decoys=not bool(args.include_decoys),
                 alpha=args.alpha,
                 p_factor=args.p_factor,
+                max_log2_fold=(args.max_log2_fold if args.max_log2_fold else None),
             )
             print(f"  → {os.path.join(args.out_dir, f'{res}.juicervector')}")
 
         _profile_command("bias-vectors", run)
+
+    elif args.cmd == "add-norm":
+
+        def run() -> None:
+            hic_norm.add_norm_to_hic(
+                hic_path=args.hic,
+                out_path=args.out,
+                juicer_tools=args.juicer_tools,
+                noise_dir=args.noise_dir,
+                resolutions=args.res,
+                name=args.name,
+                chrom_sizes_path=args.chrom_sizes,
+                skip_decoys=not bool(args.include_decoys),
+                java=args.java,
+                java_mem=args.java_mem,
+                overwrite=bool(args.overwrite),
+                keep_vector=args.keep_vector,
+                scheme=args.scheme,
+                exponent=args.exponent,
+                max_log2_fold=(args.max_log2_fold if args.max_log2_fold else None),
+                alpha=args.an_alpha,
+                p=args.an_p,
+            )
+
+        _profile_command("add-norm", run)
 
     elif args.cmd == "plot":
 
@@ -1010,6 +1112,7 @@ def main() -> None:
                 density_transform=args.density_transform,
                 noise_transform=args.noise_transform,
                 require_both_metrics=args.require_both_metrics,
+                rule=getattr(args, "rule", None),
             )
             thresholds_df.to_csv(out_tsv, sep="\t", index=False, float_format="%.6g")
             figures.plot_elbow_figure(
@@ -1122,6 +1225,7 @@ def main() -> None:
                     nan_fill_value=nan_fill,
                     alpha=args.alpha,
                     p_factor=args.p_factor,
+                    max_log2_fold=(args.max_log2_fold if args.max_log2_fold else None),
                 )
                 print(f"  → {os.path.join(vectors_dir, f'{res}.juicervector')}")
 
@@ -1147,6 +1251,7 @@ def main() -> None:
                     density_transform=args.density_transform,
                     noise_transform=args.noise_transform,
                     require_both_metrics=args.require_both_metrics,
+                    rule=getattr(args, "rule", None),
                 )
                 thresholds_df.to_csv(out_tsv, sep="\t", index=False, float_format="%.6g")
                 figures.plot_elbow_figure(
