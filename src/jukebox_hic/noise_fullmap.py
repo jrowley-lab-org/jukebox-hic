@@ -29,6 +29,8 @@ concatenates the per-chromosome output files into a single resolution-level bedg
 Main entry point: ``compute_full_noise()``.
 """
 import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
@@ -198,11 +200,17 @@ def _row_window_noise(
     -------
     noise_vals : np.ndarray of shape (row_end - row_start,)
         Per-bin noise values for the requested row range.
+    window_sums : np.ndarray of shape (row_end - row_start,)
+        Per-bin total observed contacts inside the SAME 2W diagonal window used
+        for the noise estimate.  Returned here rather than computed separately so
+        the density track and the noise track are guaranteed to describe the same
+        span of the matrix (the Methods define both over the 2W window).
     """
     if row_end is None:
         row_end = rowbins
     out_len = row_end - row_start
     noise_vals = np.zeros(out_len, dtype=float)
+    window_sums = np.zeros(out_len, dtype=float)
     for out_i, idx in enumerate(range(row_start, row_end)):
         window = bindist_bins * 2
         observed = np.zeros(window, dtype=float)
@@ -237,17 +245,31 @@ def _row_window_noise(
             expected[pos] = _expected_for_lag(expected_lookup, default_expected, lag)
 
         # --- Compute noise = 1 / |lag-1 autocovariance of observed/expected ratios| ---
+        # The distance-decay expectation MUST be divided out before the
+        # autocovariance is taken.  Over a window half-width of W bins the expected
+        # contact frequency falls by one to two orders of magnitude, so the
+        # autocovariance of the raw counts is dominated by the distance-decay
+        # envelope and by the row's sequencing depth rather than by the local
+        # roughness this metric is meant to capture.  A pseudo-count of 1 is added
+        # to both numerator and denominator, matching the Methods section and
+        # noise_sampling._compute_row_metrics().
+        window_sums[out_i] = float(observed.sum())
+
+        scores = (observed + 1.0) / (expected + 1.0)
+        finite = scores[np.isfinite(scores)]
+        if finite.size < 2 or np.allclose(finite, finite[0]):
+            # Fewer than two finite ratios, or a perfectly constant series: the
+            # lag-1 autocovariance is zero/undefined and 1/|ac| would divide by
+            # zero.  Report as unmeasurable, as the sampling path does.
+            noise_vals[out_i] = float("nan")
+            continue
         try:
-            # ``ac`` is the lag-1 autocovariance of the raw observed vector.
-            # Using observed (not the ratio) here for speed — the expected curve is
-            # roughly constant over the short window, so the ratio and observed series
-            # have nearly the same autocorrelation structure.
-            ac = acovf(observed, nlag=1, fft=True)[1]
+            ac = acovf(finite, nlag=1, fft=True)[1]
             noise_vals[out_i] = float("nan") if ac == 0 else 1.0 / abs(ac)
         except Exception:
             noise_vals[out_i] = float("nan")
 
-    return noise_vals
+    return noise_vals, window_sums
 
 
 def _write_bedgraph(
@@ -425,6 +447,54 @@ def _full_noise_worker(task: _FullNoiseTask) -> Tuple[str, int, str, bool]:
         iter_start = int(target_indices[0])
         iter_end = int(target_indices[-1]) + 1
 
+    # --- Pass 1: accumulate the distance-decay expectation over the WHOLE chromosome.
+    #
+    # The expectation must be a property of the chromosome, not of the chunk that
+    # happens to contain a bin: E(k) is defined as the mean contact count at lag k
+    # across the chromosome.  Computing it per chunk made every reported value
+    # depend on --dump_factor, a pure memory-tuning knob, so the same map analysed
+    # on two machines with different memory budgets produced different noise and
+    # different blacklists.  Only lags inside the noise window are needed.
+    lag_sums = np.zeros(noise_bins + 1, dtype=float)
+    lag_counts = np.zeros(noise_bins + 1, dtype=np.int64)
+
+    _scan_start = iter_start
+    while _scan_start < iter_end:
+        _scan_end = min(_scan_start + dump_bins, iter_end)
+        _fs = max(0, _scan_start - noise_bins)
+        _fe = min(n_bins, _scan_end + noise_bins)
+        _m = provider.fetch_region(task.chrom, _fs * res, _fe * res)
+        if _m is not None and _m.coo.nnz > 0:
+            _coo = _m.coo
+            _lags = np.abs(_coo.col.astype(np.int64) - _coo.row.astype(np.int64))
+            # Chunks are fetched with `noise_bins` of padding on each side so that
+            # every core row sees its full window.  That padding makes consecutive
+            # fetches overlap, so a contact in an overlap would be accumulated
+            # twice -- and how often that happens depends on the chunk size, i.e.
+            # on --dump_factor.  Attribute each entry to exactly one chunk by
+            # keeping only those whose global ROW index falls in this chunk's core
+            # span, which makes the pooled curve independent of the chunking.
+            _grow = _coo.row.astype(np.int64) + _fs
+            _keep = (_lags <= noise_bins) & (_grow >= _scan_start) & (_grow < _scan_end)
+            if _keep.any():
+                lag_sums += np.bincount(
+                    _lags[_keep], weights=_coo.data.astype(float)[_keep],
+                    minlength=noise_bins + 1,
+                )
+                lag_counts += np.bincount(_lags[_keep], minlength=noise_bins + 1)
+        del _m
+        _scan_start = _scan_end
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        expected_lookup = np.divide(
+            lag_sums, lag_counts,
+            out=np.zeros_like(lag_sums), where=lag_counts > 0,
+        )
+    default_expected = (
+        float(expected_lookup[lag_counts > 0].mean()) if np.any(lag_counts > 0) else 0.0
+    )
+
+    # --- Pass 2: per-bin noise and window density against that fixed expectation.
     chunk_start = iter_start
     while chunk_start < iter_end:
         chunk_end = min(chunk_start + dump_bins, iter_end)
@@ -438,13 +508,12 @@ def _full_noise_worker(task: _FullNoiseTask) -> Tuple[str, int, str, bool]:
 
         if matrix is not None and matrix.coo.nnz > 0:
             any_data = True
-            expected_lookup, default_expected = _precompute_expectation(matrix.coo)
 
             local_chunk_start = chunk_start - fetch_start_bin
             local_chunk_end = chunk_end - fetch_start_bin
             fetch_bins = fetch_end_bin - fetch_start_bin
 
-            chunk_noise = _row_window_noise(
+            chunk_noise, chunk_density = _row_window_noise(
                 matrix,
                 rowbins=fetch_bins,
                 bindist_bins=noise_bins,
@@ -454,12 +523,9 @@ def _full_noise_worker(task: _FullNoiseTask) -> Tuple[str, int, str, bool]:
                 row_end=local_chunk_end,
             )
             noise_vals[chunk_start:chunk_end] = chunk_noise
-
-            # Windowed row sums: contacts within the fetch window, semantically aligned
-            # with the noise window used by the lag-1 autocovariance metric.
-            chunk_density = np.asarray(
-                matrix.csr[local_chunk_start:local_chunk_end].sum(axis=1)
-            ).ravel().astype(float)
+            # Density is the row sum over the same 2W window the noise used, so the
+            # two blacklist metrics describe the same span.  Previously this summed
+            # the whole fetched submatrix, whose width is set by --dump_factor.
             density_vals[chunk_start:chunk_end] = chunk_density
 
         chunk_start = chunk_end
@@ -934,6 +1000,21 @@ def compute_full_noise(
                 print(f"[WARN] Requested chromosomes not found at {res} bp: {sorted(missing)}")
             chrom_info = {c: chrom_info[c] for c in chroms if c in chrom_info}
 
+        # A chromosome shorter than the noise window cannot support a 2W diagonal
+        # window, so its noise estimate would be meaningless.  These are also the
+        # chromosomes that crash the native .hic reader (chrM at fine resolutions
+        # makes hicstraw print "Error finding block data" and die with SIGFPE,
+        # which used to take the whole run down).  Drop them up front.
+        _window_bp = bindist_bp or _default_bindist_bp(res)
+        _too_short = {c: L for c, (L, _) in chrom_info.items() if L < _window_bp}
+        if _too_short:
+            print(
+                f"[INFO] {res} bp: skipping {len(_too_short)} chromosome(s) shorter than the "
+                f"{_window_bp / 1e6:.3g} Mb noise window: "
+                + ", ".join(f"{c} ({L / 1e3:.4g} kb)" for c, L in sorted(_too_short.items()))
+            )
+            chrom_info = {c: v for c, v in chrom_info.items() if c not in _too_short}
+
         for chrom, (chrom_len, region_specs) in chrom_info.items():
             # Partition region specs into on-diagonal and off-diagonal.
             # On-diagonal:  Tuple[int, int]                       — isinstance(spec[0], int) is True
@@ -1056,28 +1137,75 @@ def compute_full_noise(
             # Results are collected in submission order (``async_res.get()`` blocks until
             # the specific task completes). This preserves ordering without limiting
             # parallelism: the pool runs up to ``workers`` tasks simultaneously.
+            # ProcessPoolExecutor, not multiprocessing.Pool: a worker killed by a
+            # signal (hicstraw raises SIGFPE on some degenerate chromosomes) leaves
+            # Pool.apply_async().get() blocking forever with no message, so a single
+            # bad chromosome silently hangs a genome-wide run.  The executor raises
+            # BrokenProcessPool instead, which is recoverable.
             ctx = mp.get_context()
-            with ctx.Pool(
-                processes=workers,
-                maxtasksperchild=10,
-                initializer=_worker_init,
-                initargs=(per_worker_bytes,),
-            ) as pool:
-                async_results = [(task, pool.apply_async(_full_noise_worker, (task,))) for task in tasks]
-                for task, async_res in async_results:
-                    try:
-                        results.append(async_res.get())
-                    except Exception as first_exc:
-                        # Worker failed — clean up partial output and retry in main process.
-                        if os.path.exists(task.out_path):
-                            try:
-                                os.remove(task.out_path)
-                            except OSError:
-                                pass
+            futures = {}
+            try:
+                with ProcessPoolExecutor(
+                    max_workers=workers,
+                    mp_context=ctx,
+                    initializer=_worker_init,
+                    initargs=(per_worker_bytes,),
+                ) as pool:
+                    futures = {pool.submit(_full_noise_worker, task): task for task in tasks}
+                    pending = list(futures)
+                    for fut in pending:
+                        task = futures[fut]
                         try:
-                            results.append(_full_noise_worker(task))
-                        except Exception as second_exc:
-                            errors.append((task, first_exc, second_exc))
+                            results.append(fut.result())
+                        except BrokenProcessPool:
+                            # The pool is dead; every remaining task must be retried
+                            # in-process below rather than waited on.
+                            raise
+                        except Exception as first_exc:
+                            if os.path.exists(task.out_path):
+                                try:
+                                    os.remove(task.out_path)
+                                except OSError:
+                                    pass
+                            try:
+                                results.append(_full_noise_worker(task))
+                            except Exception as second_exc:
+                                errors.append((task, first_exc, second_exc))
+            except BrokenProcessPool:
+                done_paths = {r[2] for r in results}
+                stragglers = [t for t in tasks if t.out_path not in done_paths]
+                print(
+                    f"[WARN] a worker process died (likely a native crash in the .hic reader); "
+                    f"retrying {len(stragglers)} chromosome(s) serially",
+                    flush=True,
+                )
+                for task in stragglers:
+                    # Retry in a fresh single-worker subprocess rather than in this
+                    # process: whatever killed the pool is a native crash, and running
+                    # it here would take the parent down with it.
+                    try:
+                        with ProcessPoolExecutor(
+                            max_workers=1,
+                            mp_context=ctx,
+                            initializer=_worker_init,
+                            initargs=(per_worker_bytes,),
+                        ) as solo:
+                            results.append(solo.submit(_full_noise_worker, task).result())
+                    except BrokenProcessPool:
+                        print(
+                            f"[WARN] {task.chrom} @ {task.res} bp crashed the .hic reader; "
+                            f"skipping this chromosome",
+                            flush=True,
+                        )
+                        for stale in (task.out_path, task.density_out_path):
+                            if os.path.exists(stale):
+                                try:
+                                    os.remove(stale)
+                                except OSError:
+                                    pass
+                        continue
+                    except Exception:
+                        continue
 
     # --- Off-diagonal dispatch ---
     od_results: List[Tuple[str, str, bool]] = []

@@ -12,7 +12,6 @@ from jukebox_hic.reference import (
     aggregate_genome_wide_noise_ebr,
     classify_quality_percentile,
     compute_noise_model,
-    generate_blacklist,
     map_sequencing_advisor,
     process_normalization_vectors_jukebox,
     select_advisor_resolution,
@@ -278,43 +277,3 @@ def test_process_normalization_vectors_preserves_length():
     track = np.array([1.0, 2.0, np.nan, 4.0])
     result = process_normalization_vectors_jukebox(track, pred_log_N=0.5, ebr=0.1)
     assert len(result) == 4
-
-
-# ---------------------------------------------------------------------------
-# generate_blacklist
-# ---------------------------------------------------------------------------
-
-def test_generate_blacklist_nan_bins_always_flagged():
-    # NaN bins (indices 1 and 4) must appear in the output regardless of quantile
-    track = np.array([1.0, np.nan, 2.0, 3.0, np.nan])
-    rows = generate_blacklist(track, chrom="chr1", resolution=10_000)
-    starts = {r[1] for r in rows}
-    assert 10_000 in starts   # bin 1
-    assert 40_000 in starts   # bin 4
-
-
-def test_generate_blacklist_top_quantile_flags_highest_bin():
-    # 10 bins; top 10% threshold means the highest value (100.0 at bin 9) is flagged
-    track = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 100.0])
-    rows = generate_blacklist(track, chrom="chr1", resolution=10_000, top_quantile=0.90)
-    starts = {r[1] for r in rows}
-    assert 90_000 in starts   # bin 9
-
-
-def test_generate_blacklist_returns_bed_format():
-    # Every row must be [chrom, int_start, int_end]
-    track = np.array([1.0, 2.0, np.nan])
-    rows = generate_blacklist(track, chrom="chr1", resolution=10_000)
-    for row in rows:
-        assert len(row) == 3
-        assert row[0] == "chr1"
-        assert isinstance(row[1], int)
-        assert isinstance(row[2], int)
-        assert row[2] == row[1] + 10_000
-
-
-def test_generate_blacklist_all_nan_flags_everything():
-    # All-NaN track: every bin must be flagged
-    track = np.array([np.nan, np.nan, np.nan])
-    rows = generate_blacklist(track, chrom="chr1", resolution=10_000)
-    assert len(rows) == 3

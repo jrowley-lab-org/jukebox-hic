@@ -222,3 +222,79 @@ def test_detect_elbow_thresholds_skips_chrom_with_too_few_bins(tmp_path):
     df, _ = detect_elbow_thresholds(str(density), str(noise))
     assert "chr1" in df["chrom"].values
     assert "chr2" not in df["chrom"].values
+
+
+# ---------------------------------------------------------------------------
+# Blacklist flagging rules
+# ---------------------------------------------------------------------------
+
+def _tiny_tracks(tmp_path):
+    """Six bins: one unmappable, one extreme-high noise, one extreme-low noise,
+    one extreme-high density, and two ordinary."""
+    noise = tmp_path / "n.bedgraph"
+    dens = tmp_path / "d.bedgraph"
+    #        bin      noise     density
+    rows = [(0, "nan", "nan"),      # unmappable
+            (1, "1e6", "500"),      # extreme HIGH noise
+            (2, "1e-6", "500"),     # extreme LOW noise (extreme order)
+            (3, "10", "1e6"),       # extreme HIGH density
+            (4, "10", "500"),       # ordinary
+            (5, "11", "510")]       # ordinary
+    noise.write_text("".join(f"chr1 {i*10000} {(i+1)*10000} {n}\n" for i, n, _ in rows))
+    dens.write_text("".join(f"chr1 {i*10000} {(i+1)*10000} {d}\n" for i, _, d in rows))
+    return str(noise), str(dens)
+
+
+def _flagged(tmp_path, rule):
+    import pandas as pd
+    from jukebox_hic.filters import build_blacklist_from_elbow_thresholds
+    n, d = _tiny_tracks(tmp_path)
+    th = pd.DataFrame([{
+        "chrom": "chr1", "n_bins": 6,
+        "density_lower_value": 1.0, "density_lower_pct": 0.0,
+        "density_upper_value": 1e5, "density_upper_pct": 100.0,
+        "noise_lower_value": 1e-3, "noise_lower_pct": 0.0,
+        "noise_upper_value": 1e5, "noise_upper_pct": 100.0,
+    }])
+    out = tmp_path / f"{rule}.bed"
+    build_blacklist_from_elbow_thresholds(
+        density_bedgraph=d, noise_bedgraph=n, output_path=str(out),
+        thresholds_df=th, rule=rule,
+    )
+    bins = set()
+    for line in open(out):
+        f = line.split()
+        if len(f) >= 3:
+            bins.update(range(int(f[1]) // 10000, int(f[2]) // 10000))
+    return bins
+
+
+def test_noise_high_rule_takes_only_the_disorder_tail(tmp_path):
+    """
+    The recommended rule: unmappable bins plus extreme-HIGH noise, and nothing
+    else. The low tail flags unusually *smooth* bins and belongs in neither a
+    noise blacklist nor the loop filter.
+    """
+    got = _flagged(tmp_path, "noise-high")
+    assert got == {0, 1}, f"expected the unmappable bin and the high-noise bin, got {got}"
+
+
+def test_legacy_rules_pull_in_the_low_tail_and_density(tmp_path):
+    union = _flagged(tmp_path, "union")
+    assert 2 in union, "union should flag the extreme-LOW noise bin"
+    assert 3 in union, "union should flag the extreme-HIGH density bin"
+
+
+def test_mask_rule_is_the_unmappability_mask_alone(tmp_path):
+    assert _flagged(tmp_path, "mask") == {0}
+
+
+def test_unmappable_bins_are_flagged_under_every_rule(tmp_path):
+    for rule in ("noise-high", "union", "intersection", "mask"):
+        assert 0 in _flagged(tmp_path, rule), f"{rule} dropped the unmappable bin"
+
+
+def test_unknown_rule_is_rejected(tmp_path):
+    import pytest
+    with pytest.raises(ValueError, match="unknown blacklist rule"):
+        _flagged(tmp_path, "nonsense")

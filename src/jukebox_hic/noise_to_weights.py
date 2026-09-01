@@ -319,6 +319,39 @@ def _validate_grid(df: pd.DataFrame, res: int, chrom_len: Optional[int]) -> pd.D
     return df.reset_index(drop=True)
 
 
+def _reindex_to_full_grid(
+    df: pd.DataFrame, res: int, chrom_len: Optional[int]
+) -> np.ndarray:
+    """
+    Project a per-chromosome bedgraph slice onto the complete bin grid.
+
+    Juicer reads a normalization vector block positionally: the k-th value after
+    the ``vector`` header is the weight for bases ``[k*res, (k+1)*res)``.  A
+    bedgraph that omits bins -- which happens whenever ``noise-bedgraph`` is run
+    with ``--region`` / off-diagonal mode, or when leading/trailing bins carry no
+    contacts -- therefore cannot be written out verbatim: every value after the
+    first gap would be attributed to the wrong locus and the block would be short.
+
+    ``_validate_grid()`` deliberately does not reject gaps (a gapped track is a
+    legitimate noise-bedgraph output), so they are filled here instead.  Missing
+    bins become NaN, which Juicer treats as "mask this bin".
+
+    Returns an array of length ceil(chrom_len / res).  When ``chrom_len`` is None
+    the grid is sized from the largest bin present, which is only correct if the
+    track reaches the chromosome end -- pass ``--chrom_sizes`` for a guaranteed
+    full-length block.
+    """
+    idx = df["start"].to_numpy(dtype=np.int64) // res
+    if chrom_len is not None:
+        n_bins = int(-(-int(chrom_len) // res))  # ceil division
+    else:
+        n_bins = int(idx.max()) + 1 if idx.size else 0
+    out = np.full(n_bins, np.nan, dtype=float)
+    keep = (idx >= 0) & (idx < n_bins)
+    out[idx[keep]] = df["value"].to_numpy(dtype=float)[keep]
+    return out
+
+
 def _load_zmap_summary(path: str) -> Dict[str, Dict[str, float]]:
     """
     Load per-chromosome EBR and pred_log_N from a subsample_summary.tsv.
@@ -446,6 +479,7 @@ def build_bias_vectors_from_bedgraphs(
     skip_decoys: bool = True,
     alpha: float = 0.5,
     p_factor: float = 2.0,
+    max_log2_fold: Optional[float] = 3.0,
 ) -> None:
     """
     Transform a noise-bedgraph output into a Juicer-format normalization vector file.
@@ -511,7 +545,12 @@ def build_bias_vectors_from_bedgraphs(
                 print(f"[WARN] {chrom}: skipping — {exc}")
                 continue
 
-            noise_track = group["value"].to_numpy(dtype=float)
+            # Project onto the full bin grid: Juicer indexes the block
+            # positionally, so gaps must become NaN placeholders, not vanish.
+            noise_track = _reindex_to_full_grid(group, res, chrom_len)
+            if noise_track.size == 0:
+                print(f"[WARN] {chrom}: no bins after grid projection — skipping")
+                continue
             chrom_info = zmap_data.get(chrom, {})
             ebr = chrom_info.get("ebr", 0.0)
             pred_log_N = chrom_info.get("pred_log_N")
@@ -524,7 +563,7 @@ def build_bias_vectors_from_bedgraphs(
                 continue
 
             bias_vector = reference.process_normalization_vectors_jukebox(
-                noise_track, pred_log_N, ebr, p_factor, alpha
+                noise_track, pred_log_N, ebr, p_factor, alpha, max_log2_fold
             )
 
             _write_juicer_vector_block(
