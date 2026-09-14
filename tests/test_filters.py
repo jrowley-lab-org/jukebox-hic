@@ -9,8 +9,11 @@ import pandas as pd
 import pytest
 
 from jukebox_hic.filters import (
+    _density_conditioned_residuals,
+    _robust_residual_threshold,
     _kneedle,
     _merge_intervals,
+    _stratified_noise_thresholds,
     detect_lower_elbow,
     detect_upper_elbow,
     detect_elbow_thresholds,
@@ -298,3 +301,257 @@ def test_unknown_rule_is_rejected(tmp_path):
     import pytest
     with pytest.raises(ValueError, match="unknown blacklist rule"):
         _flagged(tmp_path, "nonsense")
+
+
+# ---------------------------------------------------------------------------
+# _stratified_noise_thresholds / "density-stratified" rule
+# ---------------------------------------------------------------------------
+
+def _two_density_populations(seed=0):
+    """
+    Synthetic genome with two density populations, each with its own realistic
+    (exponential-tailed) noise distribution:
+
+    - "well_sampled": 270 bins, high density, low baseline noise.
+    - "sparse": 30 bins, low density, noise uniformly elevated (representing
+      normalization-amplified noise typical of a sparsely-sequenced-but-real
+      region) but with its own natural spread, not a single flat value.
+
+    The sparse population is sized to exactly 10% of the genome (matching the
+    default noise_upper_frac), so a *global* elbow search sees the entire
+    sparse population as its top-fraction search window, while a *per-stratum*
+    search (with density_strata chosen so this population is its own stratum)
+    additionally restricts to only the top fraction *within* that population.
+    """
+    rng = np.random.default_rng(seed)
+    well_sampled_density = np.full(270, 10_000.0)
+    well_sampled_noise = rng.exponential(scale=0.3, size=270)
+
+    sparse_density = np.full(30, 100.0)
+    sparse_noise = 5.0 + rng.exponential(scale=0.4, size=30)
+
+    density = np.concatenate([well_sampled_density, sparse_density])
+    noise = np.concatenate([well_sampled_noise, sparse_noise])
+    sparse_slice = slice(270, 300)
+    return density, noise, sparse_slice
+
+
+def test_density_stratified_flags_fewer_sparse_bins_than_global_noise_high():
+    """
+    The core regression test for the PI's complaint: bins whose noise is
+    merely typical for their (low) density should not be penalized just for
+    being low-density. A global noise-high elbow, searched only within its
+    top fraction, ends up searching across the *entire* sparse population in
+    this construction (see _two_density_populations) and over-flags it;
+    density-stratification narrows that fraction down within the sparse
+    stratum itself, flagging fewer of its "typical for this density" bins.
+    """
+    density, noise, sparse_slice = _two_density_populations()
+
+    # Mirrors what the "noise-high" rule computes: one global elbow.
+    sorted_noise = np.sort(noise)
+    global_idx = detect_upper_elbow(sorted_noise, 0.10, 10.0, "sqrt")
+    global_threshold = sorted_noise[global_idx]
+    noise_high_flagged = noise >= global_threshold
+
+    # density_strata=10 splits the 300 bins into groups of 30, aligned with
+    # the sparse population's own size, so it forms exactly one stratum.
+    thresholds = _stratified_noise_thresholds(
+        density, noise, n_strata=10,
+        noise_upper_frac=0.10, smooth_sigma=10.0, noise_transform="sqrt",
+    )
+    stratified_flagged = noise >= thresholds
+
+    n_sparse_flagged_by_noise_high = int(noise_high_flagged[sparse_slice].sum())
+    n_sparse_flagged_by_stratified = int(stratified_flagged[sparse_slice].sum())
+
+    assert n_sparse_flagged_by_noise_high > n_sparse_flagged_by_stratified, (
+        f"expected density-stratification to flag fewer of the 30 sparse bins "
+        f"than plain noise-high (noise-high flagged {n_sparse_flagged_by_noise_high}, "
+        f"density-stratified flagged {n_sparse_flagged_by_stratified})"
+    )
+    # And density-stratification should not be flagging most of a population
+    # whose noise is, internally, unremarkable for its own density.
+    assert n_sparse_flagged_by_stratified < 15, (
+        f"density-stratified flagged {n_sparse_flagged_by_stratified}/30 sparse bins "
+        "— expected it to isolate a minority, not the bulk of the population"
+    )
+
+
+def test_density_stratified_still_flags_a_true_local_outlier():
+    """
+    A bin whose noise is anomalous *even relative to its own density peers*
+    should still be flagged — density-stratification narrows the comparison
+    group, it doesn't disable flagging altogether.
+    """
+    density, noise, sparse_slice = _two_density_populations()
+    # Inject one bin far outside the sparse population's own range (~5-6.5).
+    noise[270] = 500.0
+
+    thresholds = _stratified_noise_thresholds(
+        density, noise, n_strata=10,
+        noise_upper_frac=0.10, smooth_sigma=10.0, noise_transform="sqrt",
+    )
+    assert noise[270] >= thresholds[270]
+
+
+def test_density_stratified_rule_integration(tmp_path):
+    """
+    Same population design, run through the full build_blacklist_from_elbow_thresholds
+    pipeline (bedgraph files in, BED out) rather than calling the helper directly,
+    to confirm the "density-stratified" rule is wired up end-to-end.
+    """
+    density, noise, sparse_slice = _two_density_populations()
+    density_path = tmp_path / "d.bedgraph"
+    noise_path = tmp_path / "n.bedgraph"
+    _write_bedgraph(density_path, "chr1", density)
+    _write_bedgraph(noise_path, "chr1", noise)
+
+    from jukebox_hic.filters import build_blacklist_from_elbow_thresholds
+    th = pd.DataFrame([{
+        "chrom": "chr1", "n_bins": len(density),
+        "density_lower_value": 0.0, "density_lower_pct": 0.0,
+        "density_upper_value": 1e9, "density_upper_pct": 100.0,
+        "noise_lower_value": -1e9, "noise_lower_pct": 0.0,
+        "noise_upper_value": 1e9, "noise_upper_pct": 100.0,
+    }])
+    out = tmp_path / "density_stratified.bed"
+    build_blacklist_from_elbow_thresholds(
+        density_bedgraph=str(density_path), noise_bedgraph=str(noise_path),
+        output_path=str(out), thresholds_df=th, rule="density-stratified",
+        density_strata=10,
+    )
+    flagged_bins = set()
+    for line in open(out):
+        f = line.split()
+        if len(f) >= 3:
+            flagged_bins.update(range(int(f[1]) // 10_000, int(f[2]) // 10_000))
+    # Should flag some, but not most, of the 30 sparse bins (indices 270-299).
+    n_flagged_sparse = len(flagged_bins & set(range(270, 300)))
+    assert 0 < n_flagged_sparse < 15
+
+
+# ---------------------------------------------------------------------------
+# _density_conditioned_residuals / "density-residual" rule
+# ---------------------------------------------------------------------------
+
+def _on_trend_genome(seed=0, n=600):
+    """
+    Synthetic genome where noise follows a clean power-law in density, with
+    realistic scatter but no genuine outliers. Every bin sits on the
+    density→noise trend, so a density-conditioned rule should find almost
+    nothing to flag here.
+    """
+    rng = np.random.default_rng(seed)
+    density = 10.0 ** rng.uniform(1.0, 4.0, size=n)         # 10 … 10,000
+    # noise decreases with density (deeper bins are less noisy), times lognormal scatter
+    noise = 50.0 * density ** -0.5 * np.exp(rng.normal(0.0, 0.15, size=n))
+    return density, noise
+
+
+def test_density_residual_leaves_on_trend_bins_alone():
+    """
+    The regression test for the failure that killed "density-stratified": a
+    population sitting on the density→noise trend must not be flagged wholesale
+    just because it exists. Residuals here are all small, so the flagged
+    fraction should be far below the 10% search fraction that a per-stratum
+    elbow would mechanically hand back.
+    """
+    density, noise = _on_trend_genome()
+    residual = _density_conditioned_residuals(density, noise)
+
+    # The trend is tracked well enough that residuals stay small and centred.
+    assert abs(float(np.median(residual))) < 0.05
+    assert float(np.std(residual)) < 0.25
+
+    n_flagged = int((residual >= _robust_residual_threshold(residual, 4.0)).sum())
+
+    # Contrast with the per-stratum elbow, which hands back a share of every
+    # stratum no matter how well-behaved the data is.
+    stratified = _stratified_noise_thresholds(density, noise, 5, 0.10, 10.0, "sqrt")
+    n_stratified = int((noise >= stratified).sum())
+
+    assert n_flagged < n_stratified, (
+        f"density-residual flagged {n_flagged} on-trend bins, density-stratified "
+        f"flagged {n_stratified} — the residual rule should be the conservative one"
+    )
+    assert n_flagged == 0, (
+        f"flagged {n_flagged}/{len(density)} on-trend bins — a population with no "
+        "genuine outliers should contribute nothing at all to the blacklist"
+    )
+
+
+def test_density_residual_flags_bins_noisy_for_their_density():
+    """
+    A bin that is noisy relative to the trend at its own density must still be
+    flagged, including one whose absolute noise is unremarkable because it sits
+    at high density where the expected noise is low.
+    """
+    density, noise = _on_trend_genome()
+    # Two injected outliers, each 10x the noise expected at its own density.
+    low_density_idx = int(np.argmin(density))
+    high_density_idx = int(np.argmax(density))
+    noise[low_density_idx] *= 10.0
+    noise[high_density_idx] *= 10.0
+
+    residual = _density_conditioned_residuals(density, noise)
+    flagged = residual >= _robust_residual_threshold(residual, 4.0)
+
+    assert flagged[low_density_idx]
+    assert flagged[high_density_idx], (
+        "a bin 10x noisier than its density predicts was missed — its absolute "
+        "noise is low, which is exactly what a density-blind rule gets wrong"
+    )
+
+
+def test_density_residual_ignores_absolute_noise_level():
+    """
+    Sparse regions are noisier in absolute terms. A density-conditioned rule
+    should not flag them for that alone, which is the PI's original objection.
+    """
+    density, noise = _on_trend_genome()
+    residual = _density_conditioned_residuals(density, noise)
+
+    # The lowest-density decile has much higher raw noise than the highest, but
+    # after conditioning its residuals should be no larger.
+    order = np.argsort(density)
+    lowest = order[: len(order) // 10]
+    highest = order[-len(order) // 10:]
+
+    assert np.median(noise[lowest]) > 5 * np.median(noise[highest]), "test setup"
+    assert abs(float(np.median(residual[lowest]))) < 0.1
+    assert abs(float(np.median(residual[highest]))) < 0.1
+
+
+def test_density_residual_rule_integration(tmp_path):
+    """Run the rule end-to-end through the BED-writing pipeline."""
+    density, noise = _on_trend_genome()
+    noise[int(np.argmax(density))] *= 20.0      # one unambiguous outlier
+
+    density_path = tmp_path / "d.bedgraph"
+    noise_path = tmp_path / "n.bedgraph"
+    _write_bedgraph(density_path, "chr1", density)
+    _write_bedgraph(noise_path, "chr1", noise)
+
+    from jukebox_hic.filters import build_blacklist_from_elbow_thresholds
+    th = pd.DataFrame([{
+        "chrom": "chr1", "n_bins": len(density),
+        "density_lower_value": 0.0, "density_lower_pct": 0.0,
+        "density_upper_value": 1e9, "density_upper_pct": 100.0,
+        "noise_lower_value": -1e9, "noise_lower_pct": 0.0,
+        "noise_upper_value": 1e9, "noise_upper_pct": 100.0,
+    }])
+    out = tmp_path / "density_residual.bed"
+    build_blacklist_from_elbow_thresholds(
+        density_bedgraph=str(density_path), noise_bedgraph=str(noise_path),
+        output_path=str(out), thresholds_df=th, rule="density-residual",
+    )
+    flagged_bins = set()
+    for line in open(out):
+        f = line.split()
+        if len(f) >= 3:
+            flagged_bins.update(range(int(f[1]) // 10_000, int(f[2]) // 10_000))
+
+    assert int(np.argmax(density)) in flagged_bins
+    # On otherwise on-trend data the blacklist should stay small.
+    assert len(flagged_bins) < 0.05 * len(density)

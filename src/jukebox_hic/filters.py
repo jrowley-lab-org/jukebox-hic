@@ -207,6 +207,229 @@ def _analyse_chrom_elbow(
     return t
 
 
+def _stratified_noise_thresholds(
+    density: np.ndarray,
+    noise: np.ndarray,
+    n_strata: int,
+    noise_upper_frac: float,
+    smooth_sigma: float,
+    noise_transform: str,
+    min_stratum_size: int = 30,
+) -> np.ndarray:
+    """
+    Per-bin noise upper-threshold, conditioned on local density.
+
+    Bins are grouped into ``n_strata`` equal-count groups by sorted density, then
+    ``detect_upper_elbow()`` is run independently on each group's noise values —
+    the same Kneedle logic the ``noise-high`` rule uses, just localized to bins of
+    similar density instead of the whole chromosome. This lets a bin whose density
+    is low (and whose noise is merely typical for that density, e.g. a real but
+    rare loop in a sparsely-sequenced region) avoid being judged against noisier,
+    higher-density bins it isn't comparable to.
+
+    A stratum with fewer than ``min_stratum_size`` bins (short chromosome, coarse
+    resolution) falls back to the chromosome-wide (unconditioned) noise-high
+    threshold, since Kneedle is unstable on very small arrays.
+
+    Parameters
+    ----------
+    density, noise : np.ndarray
+        Finite per-bin values for one chromosome, same order and length.
+    n_strata : int
+        Number of equal-count density groups to split bins into.
+    noise_upper_frac, smooth_sigma, noise_transform
+        Passed through to ``detect_upper_elbow()`` for both the fallback
+        threshold and each stratum's local threshold.
+    min_stratum_size : int
+        Minimum bins a stratum needs before it gets its own local threshold.
+
+    Returns
+    -------
+    np.ndarray
+        Same length/order as the input: threshold[i] is the noise value bin i
+        must meet or exceed to be flagged.
+    """
+    n = len(density)
+    thresholds = np.empty(n, dtype=float)
+
+    # Chromosome-wide fallback — identical to what the "noise-high" rule computes.
+    n_sorted_global = np.sort(noise)
+    fallback = float(n_sorted_global[
+        detect_upper_elbow(n_sorted_global, noise_upper_frac, smooth_sigma, noise_transform)
+    ])
+
+    order = np.argsort(density)
+    for group in np.array_split(order, max(1, n_strata)):
+        if len(group) < min_stratum_size:
+            thresholds[group] = fallback
+            continue
+        stratum_sorted = np.sort(noise[group])
+        local_idx = detect_upper_elbow(stratum_sorted, noise_upper_frac, smooth_sigma, noise_transform)
+        thresholds[group] = float(stratum_sorted[local_idx])
+
+    return thresholds
+
+
+def _density_conditioned_residuals(
+    density: np.ndarray,
+    noise: np.ndarray,
+    fit_window: int = 0,
+) -> np.ndarray:
+    """
+    Residual of each bin's noise against the noise expected at its density.
+
+    Instead of thresholding noise directly, the density→noise trend is first
+    estimated from the data itself: bins are ordered by density and a centred
+    running median of log10(noise) gives the typical noise for bins of similar
+    density. The returned residual, log10(noise) − trend, is what the caller
+    thresholds, so "noisy" means "noisier than other bins sequenced this
+    deeply" rather than "noisy in absolute terms".
+
+    Working in log space matters because the density→noise relationship is
+    roughly power-law; a running median (rather than a mean) keeps the trend
+    from being dragged upward by the very outliers the blacklist is looking for.
+
+    This is the property the per-stratum elbow approach (``"density-stratified"``)
+    lacks. An elbow computed inside each density stratum always flags that
+    stratum's top fraction, whether or not anything is wrong with it, so
+    well-sampled strata donate bins to the blacklist purely as an artefact of
+    the method. Here a group of bins that all sit on the trend produces small
+    residuals and contributes no flags at all.
+
+    Parameters
+    ----------
+    density, noise : np.ndarray
+        Finite per-bin values for one chromosome, same order and length. Values
+        are floored at a small positive constant before the log, so zero-contact
+        or zero-noise bins are handled without producing -inf.
+    fit_window : int
+        Width, in bins, of the running-median window used to estimate the trend.
+        0 selects a width from the chromosome's bin count. A wider window gives
+        a smoother, stiffer trend; a narrower one tracks local structure more
+        closely and therefore leaves smaller residuals.
+
+    Returns
+    -------
+    np.ndarray
+        Residual per bin, same length and order as the input.
+    """
+    # Floor before the log so empty bins do not become -inf. 1e-12 matches the
+    # floor used in reference._preprocess_noise_track.
+    x = np.log10(np.clip(density.astype(float), 1e-12, None))
+    y = np.log10(np.clip(noise.astype(float), 1e-12, None))
+
+    if fit_window > 0:
+        window = int(fit_window)
+    else:
+        # ~2% of the chromosome's bins, bounded so the trend is neither noisy
+        # on short chromosomes nor over-smoothed on long ones.
+        window = int(np.clip(len(y) // 50, 51, 2001))
+    window = max(3, window | 1)  # force odd so the window can be centred
+
+    # Estimate the trend in density order, then map it back to bin order.
+    order = np.argsort(x)
+    trend_sorted = (
+        pd.Series(y[order])
+        .rolling(window, center=True, min_periods=1)
+        .median()
+        .to_numpy()
+    )
+    trend = np.empty_like(trend_sorted)
+    trend[order] = trend_sorted
+
+    return y - trend
+
+
+def _robust_centre_scale(residual: np.ndarray) -> Tuple[float, float]:
+    """
+    Median and robust standard deviation of a residual vector.
+
+    Spread is the median absolute deviation scaled by 1.4826, which makes it
+    match the standard deviation for normally distributed data. Both the centre
+    and the scale are medians, so the outliers being searched for do not inflate
+    the statistics that are supposed to catch them.
+
+    Factored out so that ``_robust_residual_threshold()`` (used by the
+    density-residual blacklist rule) and ``_residual_robust_z()`` (used by the
+    noise gradient) are guaranteed to agree: thresholding the gradient at k must
+    select exactly the bins the blacklist flags at the same k, and that contract
+    would silently break if the two computed their centre or scale separately.
+
+    The MAD breaks down when more than half the residuals are *exactly* equal,
+    which happens on near-empty chromosomes: K562 chrY has 698 measurable bins
+    out of 5723, their contact counts take only a handful of discrete values, and
+    over half the residuals land on precisely 0.0. The MAD is then floating-point
+    dust (~1e-15) rather than zero, so it slips past a ``<= 0`` guard and
+    z-scores explode to ~1e15 — and the blacklist, dividing the same dust into
+    its threshold, flags a quarter of the measurable bins for no real reason.
+
+    So the scale falls back through progressively less robust estimators, each
+    used only when the previous one is degenerate: MAD, then the IQR (which
+    survives a smaller atom at the median), then the standard deviation. The
+    fallbacks cannot fire on well-behaved data, where the MAD is orders of
+    magnitude above the floor, so normal chromosomes are untouched and the
+    calibration of k is unchanged. Falling back to the non-robust standard
+    deviation is the conservative direction: outliers inflate it, so a
+    degenerate chromosome under-flags rather than over-flags.
+    """
+    centre = float(np.median(residual))
+
+    # Below this a "spread" is numerical dust, not signal: residuals are log10
+    # differences, so 1e-9 is a few parts per billion of the noise value.
+    negligible = 1e-9
+
+    sigma = 1.4826 * float(np.median(np.abs(residual - centre)))
+    if sigma > negligible:
+        return centre, sigma
+
+    q75, q25 = np.percentile(residual, [75, 25])
+    sigma = float(q75 - q25) / 1.349          # IQR → sigma for a normal
+    if sigma > negligible:
+        return centre, sigma
+
+    sigma = float(np.std(residual))
+    return centre, sigma if sigma > negligible else 0.0
+
+
+def _robust_residual_threshold(residual: np.ndarray, k: float) -> float:
+    """
+    Cutoff at *k* robust standard deviations above the median residual.
+
+    Unlike an elbow, this returns a cutoff that nothing need exceed: on a
+    chromosome whose bins all sit on the density→noise trend, no residual
+    reaches k robust sigma and no bins are flagged.
+
+    A degenerate all-identical residual vector gives MAD = 0; the threshold then
+    falls back to just above the median so that only strictly larger residuals
+    are flagged, rather than the whole chromosome tying with the cutoff.
+    """
+    centre, sigma = _robust_centre_scale(residual)
+    if sigma <= 0.0:
+        return np.nextafter(centre, np.inf)
+    return centre + float(k) * sigma
+
+
+def _residual_robust_z(residual: np.ndarray) -> np.ndarray:
+    """
+    Per-bin robust z-score: how many robust sigma above the median each residual sits.
+
+    This is the continuous form of ``_robust_residual_threshold()``. Comparing
+    ``z >= k`` is equivalent to comparing ``residual >= _robust_residual_threshold(residual, k)``,
+    which is what lets the noise gradient and the density-residual blacklist be
+    two views of one quantity rather than two independent calculations.
+
+    The degenerate MAD = 0 case mirrors the threshold's fallback exactly: only
+    strictly-greater residuals clear the bar, so they get +inf and everything
+    else gets 0, making ``z >= k`` true for the same bins at any finite k > 0.
+    """
+    centre, sigma = _robust_centre_scale(residual)
+    if sigma <= 0.0:
+        z = np.zeros(len(residual), dtype=float)
+        z[residual > centre] = np.inf
+        return z
+    return (residual - centre) / sigma
+
+
 def _canonical_chrom_key(c: str):
     """Sort key that places chr1–22 before chrX/Y/M, decoys last."""
     num_str = (
@@ -316,6 +539,9 @@ def build_blacklist_from_elbow_thresholds(
     thresholds_df: Optional[pd.DataFrame] = None,
     require_both_metrics: bool = False,
     rule: Optional[str] = None,
+    density_strata: int = 5,
+    density_fit_window: int = 0,
+    density_residual_k: float = 4.0,
 ) -> Tuple[pd.DataFrame, dict]:
     """
     Build a BED blacklist using per-chromosome elbow thresholds.
@@ -362,6 +588,42 @@ def build_blacklist_from_elbow_thresholds(
     ``"union"``        density OR noise out-of-bounds (either tail). Legacy default.
     ``"intersection"`` density AND noise out-of-bounds. Legacy option.
     ``"mask"``         non-finite bins only: a pure mappability mask, no thresholds.
+
+    ``"density-residual"``
+        non-finite(density) OR non-finite(noise) OR residual >= k robust sigma,
+        where residual is log10(noise) minus the noise expected at that bin's
+        density (see ``_density_conditioned_residuals()``) and the cutoff is
+        ``density_residual_k`` median-absolute-deviations above the median
+        residual (see ``_robust_residual_threshold()``).
+
+        This is the one rule here that does not use an elbow, and the departure
+        is the point: Kneedle always returns an index inside its search window,
+        so it flags a share of the data whether or not anything is wrong. A
+        robust-sigma cutoff can come back empty on a clean chromosome and flag
+        heavily on a bad one, which is what "is this bin noisy for its density?"
+        actually requires. ``noise_upper_frac``/``noise_transform`` are unused
+        by this rule; ``density_residual_k`` is its sensitivity knob.
+
+        This is the density-conditioned rule to prefer over ``"density-stratified"``.
+        Both ask whether a bin is noisy *for its density*, but this one thresholds
+        one distribution, so a population of bins that all sit on the density→noise
+        trend contributes nothing to the blacklist. ``"density-stratified"`` instead
+        runs an elbow inside each stratum and therefore always flags each stratum's
+        top fraction — on a six-cell-line benchmark that put it below the plain
+        unmappability mask on noise enrichment while masking more of the genome.
+
+    ``"density-stratified"``
+        non-finite(density) OR non-finite(noise) OR noise >= local_noise_upper_value,
+        where the noise upper threshold is computed independently within each of
+        ``density_strata`` equal-count density groups (see
+        ``_stratified_noise_thresholds()``) instead of once for the whole
+        chromosome. Same upper-tail-only philosophy as ``"noise-high"`` — and the
+        same reason for leaving the low tail alone (it's a different, unusually-smooth
+        population, not a disorder tail) — but a bin is only flagged when its noise
+        is anomalous *relative to bins of similar density*, so density and noise are
+        no longer independent axes: a low-density bin with noise typical for that
+        density (e.g. a real but rare loop in a sparsely-sequenced region) is not
+        penalized just for being low-density.
 
     Returns
     -------
@@ -428,10 +690,42 @@ def build_blacklist_from_elbow_thresholds(
             flagged.loc[mask] |= density_oob & noise_oob
         elif effective == "union":
             flagged.loc[mask] |= density_oob | noise_oob
+        elif effective == "density-residual":
+            d_vals = combined.loc[mask, "density"].to_numpy(float)
+            n_vals = combined.loc[mask, "noise"].to_numpy(float)
+            finite = np.isfinite(d_vals) & np.isfinite(n_vals)
+            local_flag = np.zeros(len(d_vals), dtype=bool)
+            if finite.any():
+                residual = _density_conditioned_residuals(
+                    d_vals[finite], n_vals[finite], density_fit_window,
+                )
+                # Deliberately NOT an elbow. Kneedle always returns an index
+                # inside its search window, so it flags a share of the data
+                # whether or not anything is actually wrong — that is what made
+                # "density-stratified" flag well-behaved bins. A fixed multiple
+                # of the residual spread can express "nothing here deviates",
+                # which is the whole point of conditioning on density.
+                local_flag[finite] = residual >= _robust_residual_threshold(
+                    residual, density_residual_k
+                )
+            flagged.loc[mask] |= local_flag
+        elif effective == "density-stratified":
+            d_vals = combined.loc[mask, "density"].to_numpy(float)
+            n_vals = combined.loc[mask, "noise"].to_numpy(float)
+            finite = np.isfinite(d_vals) & np.isfinite(n_vals)
+            local_flag = np.zeros(len(d_vals), dtype=bool)
+            if finite.any():
+                local_thresholds = _stratified_noise_thresholds(
+                    d_vals[finite], n_vals[finite], density_strata,
+                    noise_upper_frac, smooth_sigma, noise_transform,
+                )
+                local_flag[finite] = n_vals[finite] >= local_thresholds
+            flagged.loc[mask] |= local_flag
         else:
             raise ValueError(
                 f"unknown blacklist rule {effective!r}; expected one of "
-                "'noise-high', 'union', 'intersection', 'mask'"
+                "'noise-high', 'density-residual', 'union', 'intersection', "
+                "'mask', 'density-stratified'"
             )
 
     flagged_df = combined.loc[flagged, ["chrom", "start", "end"]].copy()

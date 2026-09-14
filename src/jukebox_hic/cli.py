@@ -52,7 +52,10 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from . import figures, hic_norm, noise_fullmap, noise_sampling, filters, noise_to_weights, reference
+from . import (
+    figures, hic_norm, noise_fullmap, noise_gradient, noise_sampling, filters,
+    noise_to_weights, reference,
+)
 from .backends import (
     cooler_resolutions,
     hic_resolutions,
@@ -778,10 +781,35 @@ def main() -> None:
         help="Gaussian smoothing sigma for elbow detection (default: 10.0)",
     )
     sp_mask.add_argument(
-        "--rule", choices=["noise-high", "union", "intersection", "mask"], default=None,
+        "--density_strata", type=int, default=5,
+        help=("Number of equal-count density groups used by --rule density-stratified "
+              "to compute local noise thresholds (default: 5). Ignored by other rules."),
+    )
+    sp_mask.add_argument(
+        "--density_fit_window", type=int, default=0,
+        help=("Running-median window (bins) used by --rule density-residual to fit the "
+              "density-noise trend. 0 picks a width from the bin count."),
+    )
+    sp_mask.add_argument(
+        "--density_residual_k", type=float, default=4.0,
+        help=("Robust sigma above the median residual at which --rule density-residual "
+              "flags a bin. Lower flags more."),
+    )
+    sp_mask.add_argument(
+        "--rule",
+        choices=["noise-high", "density-residual", "union", "intersection", "mask",
+                 "density-stratified"],
+        default=None,
         help=("Blacklist flagging rule. 'noise-high' (recommended) = unmappable bins plus the "
-              "extreme-disorder tail only, no density term; 'union'/'intersection' are the legacy "
-              "rules; 'mask' emits the unmappability mask alone. Overrides --require_both_metrics."),
+              "extreme-disorder tail only, no density term; 'density-residual' = flags bins "
+              "whose noise exceeds what their density predicts by --density_residual_k "
+              "robust sigma, so a region that is merely sparse is not penalised; "
+              "'density-stratified' = same "
+              "upper-tail-only logic as 'noise-high' but the noise threshold is computed "
+              "separately within each --density_strata density group, so a bin's noise is "
+              "judged against bins of similar density rather than the whole chromosome; "
+              "'union'/'intersection' are the legacy rules; 'mask' emits the unmappability "
+              "mask alone. Overrides --require_both_metrics."),
     )
     sp_mask.add_argument(
         "--require_both_metrics", action="store_true", default=False,
@@ -790,6 +818,53 @@ def main() -> None:
             "for BOTH density AND noise.  Default (off) uses the union rule: flag "
             "when out-of-bounds for either metric."
         ),
+    )
+
+    # ------------------------------------------------------------------ #
+    # noise-gradient                                                       #
+    # ------------------------------------------------------------------ #
+    # Subparser for the continuous per-bin noise gradient (graded alternative
+    # to the binary blacklist above).
+    sp_grad = sub.add_parser(
+        "noise-gradient",
+        help="Build a continuous per-bin noise gradient track from density + noise bedgraphs",
+    )
+    sp_grad.add_argument(
+        "--out_dir", required=True,
+        help="Output directory.  Writes: gradient.bedgraph, gradient.tsv",
+    )
+    sp_grad.add_argument(
+        "--density_bedgraph", required=True,
+        help="Density bedgraph ({res}_density.bedgraph) produced by noise-bedgraph",
+    )
+    sp_grad.add_argument(
+        "--noise_bedgraph", required=True,
+        help="Noise bedgraph ({res}.bedgraph) produced by noise-bedgraph",
+    )
+    sp_grad.add_argument(
+        "--res", type=int, default=None,
+        help="Bin size in bp (default: inferred from the bedgraph's modal interval width)",
+    )
+    sp_grad.add_argument(
+        "--chrom_sizes", default=None,
+        help=("Chrom sizes TSV.  Without it the bin grid is sized from the largest bin "
+              "present, which is only correct if the track reaches the chromosome end."),
+    )
+    sp_grad.add_argument(
+        "--density_fit_window", type=int, default=0,
+        help=("Running-median window (bins) for the density-noise trend fit; 0 = auto. "
+              "Must match the value used by --rule density-residual for the gradient "
+              "thresholded at k to reproduce that blacklist."),
+    )
+    sp_grad.add_argument(
+        "--summary", choices=["max", "mean", "self"], default="max",
+        help=("Which neighbourhood column the bedgraph carries. 'max' (default) is the "
+              "conservative choice: a locus is only as trustworthy as the noisiest bin "
+              "in its +/-1 neighbourhood. All columns are kept in gradient.tsv regardless."),
+    )
+    sp_grad.add_argument(
+        "--include_decoys", action="store_true", default=False,
+        help="Keep unplaced/alt/decoy sequences (skipped by default)",
     )
 
     # ------------------------------------------------------------------ #
@@ -923,10 +998,35 @@ def main() -> None:
     sp_run.add_argument("--elbow_smooth_sigma", type=float, default=10.0,
                         help="Gaussian smoothing sigma for elbow detection (default: 10.0)")
     sp_run.add_argument(
-        "--rule", choices=["noise-high", "union", "intersection", "mask"], default=None,
+        "--density_strata", type=int, default=5,
+        help=("Number of equal-count density groups used by --rule density-stratified "
+              "to compute local noise thresholds (default: 5). Ignored by other rules."),
+    )
+    sp_run.add_argument(
+        "--density_fit_window", type=int, default=0,
+        help=("Running-median window (bins) used by --rule density-residual to fit the "
+              "density-noise trend. 0 picks a width from the bin count."),
+    )
+    sp_run.add_argument(
+        "--density_residual_k", type=float, default=4.0,
+        help=("Robust sigma above the median residual at which --rule density-residual "
+              "flags a bin. Lower flags more."),
+    )
+    sp_run.add_argument(
+        "--rule",
+        choices=["noise-high", "density-residual", "union", "intersection", "mask",
+                 "density-stratified"],
+        default=None,
         help=("Blacklist flagging rule. 'noise-high' (recommended) = unmappable bins plus the "
-              "extreme-disorder tail only, no density term; 'union'/'intersection' are the legacy "
-              "rules; 'mask' emits the unmappability mask alone. Overrides --require_both_metrics."),
+              "extreme-disorder tail only, no density term; 'density-residual' = flags bins "
+              "whose noise exceeds what their density predicts by --density_residual_k "
+              "robust sigma, so a region that is merely sparse is not penalised; "
+              "'density-stratified' = same "
+              "upper-tail-only logic as 'noise-high' but the noise threshold is computed "
+              "separately within each --density_strata density group, so a bin's noise is "
+              "judged against bins of similar density rather than the whole chromosome; "
+              "'union'/'intersection' are the legacy rules; 'mask' emits the unmappability "
+              "mask alone. Overrides --require_both_metrics."),
     )
     sp_run.add_argument(
         "--require_both_metrics", action="store_true", default=False,
@@ -1113,6 +1213,9 @@ def main() -> None:
                 noise_transform=args.noise_transform,
                 require_both_metrics=args.require_both_metrics,
                 rule=getattr(args, "rule", None),
+                density_strata=args.density_strata,
+                density_fit_window=args.density_fit_window,
+                density_residual_k=args.density_residual_k,
             )
             thresholds_df.to_csv(out_tsv, sep="\t", index=False, float_format="%.6g")
             figures.plot_elbow_figure(
@@ -1127,6 +1230,27 @@ def main() -> None:
             print(f"  → {out_prefix}.png  /  {out_prefix}.pdf")
 
         _profile_command("blacklist", run)
+
+    elif args.cmd == "noise-gradient":
+
+        def run() -> None:
+            table = noise_gradient.build_noise_gradient(
+                density_bedgraph=args.density_bedgraph,
+                noise_bedgraph=args.noise_bedgraph,
+                out_dir=args.out_dir,
+                res=args.res,
+                chrom_sizes_path=args.chrom_sizes,
+                fit_window=args.density_fit_window,
+                summary=args.summary,
+                skip_decoys=not args.include_decoys,
+            )
+            scored = int(table["n_finite"].gt(0).sum())
+            print(f"  {scored:,} of {len(table):,} bins scored "
+                  f"({table['unmappable'].sum():,} unmappable)")
+            print(f"  → {os.path.join(args.out_dir, 'gradient.bedgraph')}")
+            print(f"  → {os.path.join(args.out_dir, 'gradient.tsv')}")
+
+        _profile_command("noise-gradient", run)
 
     elif args.cmd == "sequencing-advisor":
         if not os.path.isdir(args.summary_dir):
@@ -1252,6 +1376,9 @@ def main() -> None:
                     noise_transform=args.noise_transform,
                     require_both_metrics=args.require_both_metrics,
                     rule=getattr(args, "rule", None),
+                    density_strata=args.density_strata,
+                    density_fit_window=args.density_fit_window,
+                    density_residual_k=args.density_residual_k,
                 )
                 thresholds_df.to_csv(out_tsv, sep="\t", index=False, float_format="%.6g")
                 figures.plot_elbow_figure(
@@ -1266,6 +1393,25 @@ def main() -> None:
                 print(f"  → {out_prefix}.png  /  {out_prefix}.pdf")
             else:
                 print(f"  [WARN] Bedgraph(s) not found for res={res} — skipping blacklist")
+
+            # Phase 4b: Continuous noise gradient (graded companion to the blacklist)
+            print(f"\n[Phase 4b] Building noise gradient at {res} bp ...")
+            if os.path.isfile(noise_bed) and os.path.isfile(density_bed):
+                grad_dir = os.path.join(args.out_dir, f"{args.sample_name}_{res}_gradient")
+                noise_gradient.build_noise_gradient(
+                    density_bedgraph=density_bed,
+                    noise_bedgraph=noise_bed,
+                    out_dir=grad_dir,
+                    res=res,
+                    chrom_sizes_path=args.chrom_sizes,
+                    # Same trend fit as the blacklist, so thresholding the
+                    # gradient reproduces the density-residual rule.
+                    fit_window=args.density_fit_window,
+                )
+                print(f"  → {os.path.join(grad_dir, 'gradient.bedgraph')}")
+                print(f"  → {os.path.join(grad_dir, 'gradient.tsv')}")
+            else:
+                print(f"  [WARN] Bedgraph(s) not found for res={res} — skipping gradient")
 
         print(
             f"\n[default-run] Complete. Sequencing advisor: {adv_result['recommendation']} "
