@@ -796,8 +796,16 @@ def main() -> None:
               "flags a bin. Lower flags more."),
     )
     sp_mask.add_argument(
+        "--density_gate_pct", type=float, default=0.0,
+        help=("--rule density-residual-gated only: also admit low-tail bins below this "
+              "quantile of chromosome density. 0 (default) leaves unmappable-adjacency "
+              "as the sole gate; above ~0.05 it passes most of the low tail and the "
+              "rule collapses toward density-residual-abs."),
+    )
+    sp_mask.add_argument(
         "--rule",
-        choices=["noise-high", "density-residual", "union", "intersection", "mask",
+        choices=["noise-high", "density-residual", "density-residual-abs",
+                 "density-residual-gated", "union", "intersection", "mask",
                  "density-stratified"],
         default=None,
         help=("Blacklist flagging rule. 'noise-high' (recommended) = unmappable bins plus the "
@@ -1013,8 +1021,16 @@ def main() -> None:
               "flags a bin. Lower flags more."),
     )
     sp_run.add_argument(
+        "--density_gate_pct", type=float, default=0.0,
+        help=("--rule density-residual-gated only: also admit low-tail bins below this "
+              "quantile of chromosome density. 0 (default) leaves unmappable-adjacency "
+              "as the sole gate; above ~0.05 it passes most of the low tail and the "
+              "rule collapses toward density-residual-abs."),
+    )
+    sp_run.add_argument(
         "--rule",
-        choices=["noise-high", "density-residual", "union", "intersection", "mask",
+        choices=["noise-high", "density-residual", "density-residual-abs",
+                 "density-residual-gated", "union", "intersection", "mask",
                  "density-stratified"],
         default=None,
         help=("Blacklist flagging rule. 'noise-high' (recommended) = unmappable bins plus the "
@@ -1216,6 +1232,7 @@ def main() -> None:
                 density_strata=args.density_strata,
                 density_fit_window=args.density_fit_window,
                 density_residual_k=args.density_residual_k,
+                density_gate_pct=args.density_gate_pct,
             )
             thresholds_df.to_csv(out_tsv, sep="\t", index=False, float_format="%.6g")
             figures.plot_elbow_figure(
@@ -1379,6 +1396,7 @@ def main() -> None:
                     density_strata=args.density_strata,
                     density_fit_window=args.density_fit_window,
                     density_residual_k=args.density_residual_k,
+                    density_gate_pct=args.density_gate_pct,
                 )
                 thresholds_df.to_csv(out_tsv, sep="\t", index=False, float_format="%.6g")
                 figures.plot_elbow_figure(
