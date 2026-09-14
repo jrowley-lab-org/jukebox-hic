@@ -555,3 +555,120 @@ def test_density_residual_rule_integration(tmp_path):
     assert int(np.argmax(density)) in flagged_bins
     # On otherwise on-trend data the blacklist should stay small.
     assert len(flagged_bins) < 0.05 * len(density)
+
+
+# ---------------------------------------------------------------------------
+# Two-sided and gated density-residual variants
+# ---------------------------------------------------------------------------
+
+def _two_tailed_tracks(tmp_path, n=600, seed=3):
+    """
+    Synthetic chromosome carrying both tails plus an unmappable gap.
+
+    Layout, by bin index:
+      - bin 100      : noise 20x the trend            → high tail
+      - bin 300      : noise 1/20th of the trend      → low tail, isolated
+      - bins 400-402 : unmappable (NaN in both tracks)
+      - bin 403      : noise 1/20th of the trend      → low tail, gap-adjacent
+
+    The two low-tail bins are identical in magnitude and differ only in whether
+    they sit beside the gap, which is exactly the distinction the gated rule is
+    supposed to make.
+    """
+    density, noise = _on_trend_genome(seed=seed, n=n)
+    noise[100] *= 20.0
+    noise[300] /= 20.0
+    noise[403] /= 20.0
+    density[400:403] = np.nan
+    noise[400:403] = np.nan
+
+    d_path = tmp_path / "d.bedgraph"
+    n_path = tmp_path / "n.bedgraph"
+    _write_bedgraph(d_path, "chr1", density)
+    _write_bedgraph(n_path, "chr1", noise)
+    return str(d_path), str(n_path)
+
+
+def _flag_bins(tmp_path, d_path, n_path, rule, **kwargs):
+    """Run one rule over the synthetic tracks and return the flagged bin indices."""
+    from jukebox_hic.filters import build_blacklist_from_elbow_thresholds
+    th = pd.DataFrame([{
+        "chrom": "chr1", "n_bins": 600,
+        "density_lower_value": 0.0, "density_lower_pct": 0.0,
+        "density_upper_value": 1e9, "density_upper_pct": 100.0,
+        "noise_lower_value": -1e9, "noise_lower_pct": 0.0,
+        "noise_upper_value": 1e9, "noise_upper_pct": 100.0,
+    }])
+    out = tmp_path / f"{rule}.bed"
+    build_blacklist_from_elbow_thresholds(
+        density_bedgraph=d_path, noise_bedgraph=n_path, output_path=str(out),
+        thresholds_df=th, rule=rule, **kwargs,
+    )
+    bins = set()
+    for line in open(out):
+        f = line.split()
+        if len(f) >= 3:
+            bins.update(range(int(f[1]) // 10_000, int(f[2]) // 10_000))
+    return bins
+
+
+def test_density_residual_variants_differ_only_in_the_low_tail(tmp_path):
+    """
+    All three rules take the high tail and the unmappable bins. They differ only
+    in how much of the low tail comes with it: none, all of it, or the gated part.
+    """
+    d_path, n_path = _two_tailed_tracks(tmp_path)
+
+    signed = _flag_bins(tmp_path, d_path, n_path, "density-residual")
+    two_sided = _flag_bins(tmp_path, d_path, n_path, "density-residual-abs")
+    gated = _flag_bins(tmp_path, d_path, n_path, "density-residual-gated")
+
+    # The high-tail bin and the unmappable gap are in every rule.
+    for got, name in ((signed, "signed"), (two_sided, "abs"), (gated, "gated")):
+        assert 100 in got, f"{name} missed the high-tail bin"
+        assert {400, 401, 402} <= got, f"{name} dropped the unmappable gap"
+
+    # Low tail: signed ignores it, abs takes both, gated takes only the one
+    # sitting against the gap.
+    assert 300 not in signed and 403 not in signed
+    assert 300 in two_sided and 403 in two_sided
+    assert 300 not in gated, "gated flagged an isolated low-tail bin"
+    assert 403 in gated, "gated missed the gap-adjacent low-tail bin"
+
+    # Ordering follows from the above: signed ⊂ gated ⊂ abs.
+    assert signed < gated < two_sided
+
+
+def test_density_gate_pct_admits_more_of_the_low_tail(tmp_path):
+    """
+    The density floor is off by default. Turning it up far enough pulls in
+    low-tail bins that unmappable-adjacency alone would not have admitted.
+    """
+    d_path, n_path = _two_tailed_tracks(tmp_path)
+    tight = _flag_bins(tmp_path, d_path, n_path, "density-residual-gated")
+    loose = _flag_bins(tmp_path, d_path, n_path, "density-residual-gated",
+                       density_gate_pct=0.9)
+    assert tight <= loose
+    assert len(loose) > len(tight)
+
+
+def test_low_tail_gate_uses_bin_index_not_row_position(tmp_path):
+    """
+    Adjacency must survive a shuffled bedgraph: the gate works off bin
+    coordinates, so row order in the file cannot change which bins it admits.
+    """
+    from jukebox_hic.filters import _low_tail_gate
+    starts = np.arange(0, 10 * 10_000, 10_000)
+    finite = np.ones(10, dtype=bool)
+    finite[4] = False            # bin 4 unmappable → bins 3 and 5 are adjacent
+    density = np.full(10, 100.0)
+
+    ordered = _low_tail_gate(starts, finite, density, 0.0)
+    shuffle = np.array([7, 2, 9, 0, 4, 1, 8, 3, 6, 5])
+    shuffled = _low_tail_gate(starts[shuffle], finite[shuffle], density[shuffle], 0.0)
+
+    # Map both back to bin index and compare the admitted sets.
+    admitted_ordered = set(starts[finite][ordered] // 10_000)
+    admitted_shuffled = set(starts[shuffle][finite[shuffle]][shuffled] // 10_000)
+    assert admitted_ordered == {3, 5}
+    assert admitted_ordered == admitted_shuffled

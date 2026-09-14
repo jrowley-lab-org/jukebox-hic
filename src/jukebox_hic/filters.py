@@ -340,6 +340,76 @@ def _density_conditioned_residuals(
     return y - trend
 
 
+def _low_tail_gate(
+    starts: np.ndarray,
+    finite: np.ndarray,
+    density: np.ndarray,
+    density_gate_pct: float,
+) -> np.ndarray:
+    """
+    Which low-tail bins carry independent evidence of being unreliable.
+
+    The high (noisy) tail of the residual needs no corroboration: a row that is
+    disordered relative to its depth is unusable on its face. The low tail is
+    ambiguous — it mixes degenerate near-empty rows, which are unusable, with
+    genuinely well-structured regions, which are the *best* data on the map.
+    Masking the latter is the "real loops marked fake" failure this whole rule
+    family exists to avoid, so the low tail is only acted on where something
+    else also says the bin is suspect.
+
+    Two pieces of corroboration, OR'd:
+
+    **Unmappable adjacency** — the bin abuts a bin with no computable noise.
+    The noise metric degenerates at the edge of a gap: a row that is mostly
+    structural zeros can read as unnaturally smooth. Measured on GM12878 at
+    50 kb, 14.7% of low-tail bins are gap-adjacent against a 0.9% background
+    rate, so this selects a genuinely distinct subpopulation.
+
+    **Density floor** — the bin sits in the bottom ``density_gate_pct`` of the
+    chromosome's density. Disabled by default (0.0), and deliberately so: on the
+    same data 72% of low-tail bins already fall below the 5th percentile and 90%
+    below the 25th, because the low tail is overwhelmingly a sparse-region
+    phenomenon. Any floor loose enough to be interesting passes nearly the whole
+    tail and turns the gated rule back into the ungated one.
+
+    Parameters
+    ----------
+    starts : bin start coordinates for one chromosome, any row order
+    finite : bool mask over *starts*, True where both tracks are finite
+    density : density values aligned with *starts*
+    density_gate_pct : quantile in [0, 1]; 0 disables the density floor
+
+    Returns
+    -------
+    np.ndarray
+        Bool array over the **finite subset**, aligned with the residual/z
+        arrays the caller computes.
+    """
+    # Bin index rather than row position, so adjacency means "next bin along the
+    # chromosome" regardless of how the merge ordered the rows.
+    ordered = np.unique(starts)
+    if len(ordered) > 1:
+        res = int(np.median(np.diff(ordered)))
+    else:
+        res = 1
+    res = max(res, 1)
+    bins = starts.astype(np.int64) // res
+
+    unmappable_bins = bins[~finite]
+    finite_bins = bins[finite]
+    gate = (
+        np.isin(finite_bins - 1, unmappable_bins)
+        | np.isin(finite_bins + 1, unmappable_bins)
+    )
+
+    if density_gate_pct and density_gate_pct > 0.0:
+        d_finite = density[finite]
+        floor = float(np.quantile(d_finite, float(density_gate_pct)))
+        gate = gate | (d_finite <= floor)
+
+    return gate
+
+
 def _robust_centre_scale(residual: np.ndarray) -> Tuple[float, float]:
     """
     Median and robust standard deviation of a residual vector.
@@ -446,6 +516,14 @@ def _canonical_chrom_key(c: str):
 # Elbow-based blacklist — public API
 # ---------------------------------------------------------------------------
 
+# The three density-conditioned rules share everything except which part of
+# the residual distribution they act on.
+_DENSITY_RESIDUAL_RULES = (
+    "density-residual",
+    "density-residual-abs",
+    "density-residual-gated",
+)
+
 _ELBOW_TSV_COLS = [
     "chrom", "n_bins",
     "density_lower_value", "density_lower_pct",
@@ -542,6 +620,7 @@ def build_blacklist_from_elbow_thresholds(
     density_strata: int = 5,
     density_fit_window: int = 0,
     density_residual_k: float = 4.0,
+    density_gate_pct: float = 0.0,
 ) -> Tuple[pd.DataFrame, dict]:
     """
     Build a BED blacklist using per-chromosome elbow thresholds.
@@ -611,6 +690,25 @@ def build_blacklist_from_elbow_thresholds(
         runs an elbow inside each stratum and therefore always flags each stratum's
         top fraction — on a six-cell-line benchmark that put it below the plain
         unmappability mask on noise enrichment while masking more of the genome.
+
+    ``"density-residual-abs"``
+        As ``"density-residual"`` but two-sided: |z| >= k. An unusually *smooth*
+        row counts as deviant alongside a disordered one, on the reasoning that
+        either is evidence the noise estimate is not behaving as the bin's depth
+        predicts.
+
+        Note that NME cannot fairly score this rule: the metric is the mean noise
+        of flagged bins over background, and low-tail bins have low noise by
+        construction, so including them drags the ratio down whether or not they
+        are bad data. Judge it on MADU, which is already symmetric, or on loop
+        preservation.
+
+    ``"density-residual-gated"``
+        z >= k, plus z <= -k only where ``_low_tail_gate()`` finds independent
+        evidence that the bin is unreliable. The middle position between the
+        other two: it picks up degenerate near-empty rows at the edges of
+        unmappable regions without masking well-structured regions whose rows are
+        legitimately smooth.
 
     ``"density-stratified"``
         non-finite(density) OR non-finite(noise) OR noise >= local_noise_upper_value,
@@ -690,7 +788,7 @@ def build_blacklist_from_elbow_thresholds(
             flagged.loc[mask] |= density_oob & noise_oob
         elif effective == "union":
             flagged.loc[mask] |= density_oob | noise_oob
-        elif effective == "density-residual":
+        elif effective in _DENSITY_RESIDUAL_RULES:
             d_vals = combined.loc[mask, "density"].to_numpy(float)
             n_vals = combined.loc[mask, "noise"].to_numpy(float)
             finite = np.isfinite(d_vals) & np.isfinite(n_vals)
@@ -705,9 +803,27 @@ def build_blacklist_from_elbow_thresholds(
                 # "density-stratified" flag well-behaved bins. A fixed multiple
                 # of the residual spread can express "nothing here deviates",
                 # which is the whole point of conditioning on density.
-                local_flag[finite] = residual >= _robust_residual_threshold(
-                    residual, density_residual_k
-                )
+                z = _residual_robust_z(residual)
+                high_tail = z >= density_residual_k
+
+                if effective == "density-residual":
+                    selected = high_tail
+                elif effective == "density-residual-abs":
+                    # Symmetric: deviation in either direction counts, so an
+                    # unusually *smooth* row is treated as just as suspect as a
+                    # disordered one.
+                    selected = np.abs(z) >= density_residual_k
+                else:  # density-residual-gated
+                    # The low tail only counts where something independent of
+                    # the residual also says the bin is suspect.
+                    low_tail = z <= -density_residual_k
+                    gate = _low_tail_gate(
+                        combined.loc[mask, "start"].to_numpy(),
+                        finite, d_vals, density_gate_pct,
+                    )
+                    selected = high_tail | (low_tail & gate)
+
+                local_flag[finite] = selected
             flagged.loc[mask] |= local_flag
         elif effective == "density-stratified":
             d_vals = combined.loc[mask, "density"].to_numpy(float)
@@ -724,8 +840,9 @@ def build_blacklist_from_elbow_thresholds(
         else:
             raise ValueError(
                 f"unknown blacklist rule {effective!r}; expected one of "
-                "'noise-high', 'density-residual', 'union', 'intersection', "
-                "'mask', 'density-stratified'"
+                "'noise-high', 'density-residual', 'density-residual-abs', "
+                "'density-residual-gated', 'union', 'intersection', 'mask', "
+                "'density-stratified'"
             )
 
     flagged_df = combined.loc[flagged, ["chrom", "start", "end"]].copy()
