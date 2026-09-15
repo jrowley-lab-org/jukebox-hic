@@ -5,8 +5,10 @@ src/jukebox_hic/backends.py
 src/jukebox_hic/cli.py
 src/jukebox_hic/figures.py
 src/jukebox_hic/filters.py
+src/jukebox_hic/hic_norm.py
 src/jukebox_hic/metrics.py
 src/jukebox_hic/noise_fullmap.py
+src/jukebox_hic/noise_gradient.py
 src/jukebox_hic/noise_sampling.py
 src/jukebox_hic/noise_to_weights.py
 src/jukebox_hic/reference.py
@@ -17,9 +19,13 @@ src/jukebox_hic.egg-info/entry_points.txt
 src/jukebox_hic.egg-info/requires.txt
 src/jukebox_hic.egg-info/top_level.txt
 tests/test_backends.py
+tests/test_bias_vector_shape.py
 tests/test_cli_parsers.py
 tests/test_filters.py
+tests/test_hic_norm.py
 tests/test_metrics.py
 tests/test_noise_fullmap.py
+tests/test_noise_gradient.py
 tests/test_noise_to_weights.py
+tests/test_oe_consistency.py
 tests/test_reference.py

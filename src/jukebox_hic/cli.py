@@ -804,11 +804,15 @@ def main() -> None:
     )
     sp_mask.add_argument(
         "--rule",
-        choices=["noise-high", "density-residual", "density-residual-abs",
-                 "density-residual-gated", "union", "intersection", "mask",
-                 "density-stratified"],
-        default=None,
-        help=("Blacklist flagging rule. 'noise-high' (recommended) = unmappable bins plus the "
+        choices=["density-residual-labeled", "noise-high", "density-residual",
+                 "density-residual-abs", "density-residual-gated", "union",
+                 "intersection", "mask", "density-stratified"],
+        default="density-residual-labeled",
+        help=("Blacklist flagging rule. Default 'density-residual-labeled' takes the whole "
+              "two-sided selection and writes a 4th BED column naming why each region "
+              "was taken (high_noise / smooth_near_gap / smooth / unmappable), so the "
+              "stricter rules can be recovered by filtering. "
+              "'noise-high' = unmappable bins plus the "
               "extreme-disorder tail only, no density term; 'density-residual' = flags bins "
               "whose noise exceeds what their density predicts by --density_residual_k "
               "robust sigma, so a region that is merely sparse is not penalised; "
@@ -822,6 +826,8 @@ def main() -> None:
     sp_mask.add_argument(
         "--require_both_metrics", action="store_true", default=False,
         help=(
+            "Legacy, and now inert unless --rule is explicitly set to a value that "
+            "defers to it: --rule has a non-None default, which overrides this flag. "
             "Use the intersection rule: flag a bin only when it is out-of-bounds "
             "for BOTH density AND noise.  Default (off) uses the union rule: flag "
             "when out-of-bounds for either metric."
@@ -1029,11 +1035,15 @@ def main() -> None:
     )
     sp_run.add_argument(
         "--rule",
-        choices=["noise-high", "density-residual", "density-residual-abs",
-                 "density-residual-gated", "union", "intersection", "mask",
-                 "density-stratified"],
-        default=None,
-        help=("Blacklist flagging rule. 'noise-high' (recommended) = unmappable bins plus the "
+        choices=["density-residual-labeled", "noise-high", "density-residual",
+                 "density-residual-abs", "density-residual-gated", "union",
+                 "intersection", "mask", "density-stratified"],
+        default="density-residual-labeled",
+        help=("Blacklist flagging rule. Default 'density-residual-labeled' takes the whole "
+              "two-sided selection and writes a 4th BED column naming why each region "
+              "was taken (high_noise / smooth_near_gap / smooth / unmappable), so the "
+              "stricter rules can be recovered by filtering. "
+              "'noise-high' = unmappable bins plus the "
               "extreme-disorder tail only, no density term; 'density-residual' = flags bins "
               "whose noise exceeds what their density predicts by --density_residual_k "
               "robust sigma, so a region that is merely sparse is not penalised; "

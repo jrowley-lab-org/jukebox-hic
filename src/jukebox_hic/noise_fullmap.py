@@ -761,6 +761,30 @@ def _write_off_diag_bedgraph(task: "_OffDiagNoiseTask", noise_vals: np.ndarray) 
             fh.write(f"{task.chrom}\t{start}\t{end}\t{right_label}\t{val}\n")
 
 
+def off_diag_row_noise(row_vec: np.ndarray) -> float:
+    """
+    Jukebox's off-diagonal noise value for one row profile.
+
+    Lag-1 autocovariance of the contact profile across the column region, then
+    ``1 / |acov|``: an erratic, spiky profile has autocovariance near zero and so
+    scores high, while a profile that varies smoothly along the row scores low.
+
+    Note this is the *raw contact* profile, not O/E. That is deliberate for
+    off-diagonal blocks, where every cell of a small square sits at nearly the
+    same genomic separation and therefore shares an expected value. It does mean
+    the score is not comparable between blocks at different separations, which is
+    why any comparison across loops has to be distance-matched.
+
+    Returns NaN when the autocovariance is exactly zero (an all-constant or
+    all-empty profile) or cannot be computed.
+    """
+    try:
+        ac = acovf(row_vec, nlag=1, fft=True)[1]
+    except Exception:
+        return float("nan")
+    return float("nan") if ac == 0 else 1.0 / abs(ac)
+
+
 def _off_diag_noise_worker(task: "_OffDiagNoiseTask") -> Tuple[str, str, bool]:
     """
     Worker function for one off-diagonal (region_A × region_B) noise task.
@@ -818,13 +842,7 @@ def _off_diag_noise_worker(task: "_OffDiagNoiseTask") -> Tuple[str, str, bool]:
             any_data = True
             for local_i in range(chunk_end - chunk_start):
                 row_vec = mat.getrow(local_i).toarray().ravel()
-                try:
-                    ac = acovf(row_vec, nlag=1, fft=True)[1]
-                    noise_vals[chunk_start + local_i] = (
-                        float("nan") if ac == 0 else 1.0 / abs(ac)
-                    )
-                except Exception:
-                    noise_vals[chunk_start + local_i] = float("nan")
+                noise_vals[chunk_start + local_i] = off_diag_row_noise(row_vec)
 
         chunk_start = chunk_end
 

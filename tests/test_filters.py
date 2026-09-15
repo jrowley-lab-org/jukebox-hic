@@ -652,6 +652,119 @@ def test_density_gate_pct_admits_more_of_the_low_tail(tmp_path):
     assert len(loose) > len(tight)
 
 
+def _labeled_bed(tmp_path, d_path, n_path, **kwargs):
+    """Run the labelled rule and return the BED as (bin_index → label) plus raw rows."""
+    from jukebox_hic.filters import build_blacklist_from_elbow_thresholds
+    th = pd.DataFrame([{
+        "chrom": "chr1", "n_bins": 600,
+        "density_lower_value": 0.0, "density_lower_pct": 0.0,
+        "density_upper_value": 1e9, "density_upper_pct": 100.0,
+        "noise_lower_value": -1e9, "noise_lower_pct": 0.0,
+        "noise_upper_value": 1e9, "noise_upper_pct": 100.0,
+    }])
+    out = tmp_path / "labeled.bed"
+    build_blacklist_from_elbow_thresholds(
+        density_bedgraph=d_path, noise_bedgraph=n_path, output_path=str(out),
+        thresholds_df=th, rule="density-residual-labeled", **kwargs,
+    )
+    rows, by_bin = [], {}
+    for line in open(out):
+        f = line.rstrip("\n").split("\t")
+        rows.append(f)
+        for b in range(int(f[1]) // 10_000, int(f[2]) // 10_000):
+            by_bin[b] = f[3]
+    return by_bin, rows
+
+
+def test_labeled_rule_names_why_each_region_was_taken(tmp_path):
+    """
+    The labelled rule takes the whole two-sided selection and records which tail
+    each region came from, distinguishing gap-adjacent low bins from isolated ones.
+    """
+    d_path, n_path = _two_tailed_tracks(tmp_path)
+    by_bin, rows = _labeled_bed(tmp_path, d_path, n_path)
+
+    assert all(len(r) == 4 for r in rows), "labelled output must be 4-column BED"
+    assert by_bin[100] == "high_noise"
+    assert by_bin[403] == "smooth_near_gap", "gap-adjacent low bin mislabelled"
+    assert by_bin[300] == "smooth", "isolated low bin mislabelled"
+    for b in (400, 401, 402):
+        assert by_bin[b] == "unmappable"
+
+    assert set(by_bin.values()) <= {"high_noise", "smooth_near_gap", "smooth", "unmappable"}
+
+
+def test_labeled_rule_selection_equals_two_sided_rule(tmp_path):
+    """
+    Labelling changes the output format, not which bins are taken: the labelled
+    rule must select exactly what density-residual-abs selects.
+    """
+    d_path, n_path = _two_tailed_tracks(tmp_path)
+    labelled, _ = _labeled_bed(tmp_path, d_path, n_path)
+    two_sided = _flag_bins(tmp_path, d_path, n_path, "density-residual-abs")
+    assert set(labelled) == two_sided
+
+
+def test_labeled_rule_filters_back_to_the_stricter_rules(tmp_path):
+    """
+    The point of the labels: filtering the output reproduces the stricter rules
+    without regenerating them.
+    """
+    d_path, n_path = _two_tailed_tracks(tmp_path)
+    labelled, _ = _labeled_bed(tmp_path, d_path, n_path)
+
+    signed = _flag_bins(tmp_path, d_path, n_path, "density-residual")
+    gated = _flag_bins(tmp_path, d_path, n_path, "density-residual-gated")
+
+    keep = {"high_noise", "unmappable"}
+    assert {b for b, lab in labelled.items() if lab in keep} == signed
+    keep_gated = keep | {"smooth_near_gap"}
+    assert {b for b, lab in labelled.items() if lab in keep_gated} == gated
+
+
+def test_labeled_regions_of_different_tails_are_not_merged(tmp_path):
+    """
+    Two abutting bins taken for different reasons must stay separate regions —
+    a merged interval would claim one identity for bins that do not share it.
+    """
+    density, noise = _on_trend_genome(seed=5, n=400)
+    # Adjacent bins, one from each tail.
+    noise[200] *= 25.0        # high tail
+    noise[201] /= 25.0        # low tail, isolated
+    d_path = tmp_path / "d2.bedgraph"
+    n_path = tmp_path / "n2.bedgraph"
+    _write_bedgraph(d_path, "chr1", density)
+    _write_bedgraph(n_path, "chr1", noise)
+
+    by_bin, rows = _labeled_bed(tmp_path, str(d_path), str(n_path))
+    assert by_bin.get(200) == "high_noise"
+    assert by_bin.get(201) == "smooth"
+    starts = [int(r[1]) for r in rows]
+    assert 200 * 10_000 in starts and 201 * 10_000 in starts, (
+        "abutting regions with different labels were merged into one interval"
+    )
+
+
+def test_unlabelled_rules_still_write_three_columns(tmp_path):
+    """Every other rule keeps the plain 3-column BED, so existing consumers are unaffected."""
+    d_path, n_path = _two_tailed_tracks(tmp_path)
+    from jukebox_hic.filters import build_blacklist_from_elbow_thresholds
+    th = pd.DataFrame([{
+        "chrom": "chr1", "n_bins": 600,
+        "density_lower_value": 0.0, "density_lower_pct": 0.0,
+        "density_upper_value": 1e9, "density_upper_pct": 100.0,
+        "noise_lower_value": -1e9, "noise_lower_pct": 0.0,
+        "noise_upper_value": 1e9, "noise_upper_pct": 100.0,
+    }])
+    out = tmp_path / "plain.bed"
+    build_blacklist_from_elbow_thresholds(
+        density_bedgraph=d_path, noise_bedgraph=n_path, output_path=str(out),
+        thresholds_df=th, rule="density-residual",
+    )
+    for line in open(out):
+        assert len(line.rstrip("\n").split("\t")) == 3
+
+
 def test_low_tail_gate_uses_bin_index_not_row_position(tmp_path):
     """
     Adjacency must survive a shuffled bedgraph: the gate works off bin

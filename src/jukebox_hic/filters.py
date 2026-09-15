@@ -524,6 +524,24 @@ _DENSITY_RESIDUAL_RULES = (
     "density-residual-gated",
 )
 
+# "density-residual-labeled" takes the whole two-sided selection and records, per
+# region, *why* it was taken. Written as a 4th BED column so a consumer can
+# reproduce any of the stricter rules by filtering rather than regenerating:
+#
+#   high_noise        z >= +k            the disorder tail; every rule takes it
+#   smooth_near_gap   z <= -k, gap-adj.  what "density-residual-gated" adds
+#   smooth            z <= -k, isolated  what only the two-sided rule adds
+#   unmappable        no computable z    flagged by every rule regardless
+#
+# Order is also the order regions are written in, worst-evidenced last.
+_LABEL_HIGH = "high_noise"
+_LABEL_SMOOTH_GAP = "smooth_near_gap"
+_LABEL_SMOOTH = "smooth"
+_LABEL_UNMAPPABLE = "unmappable"
+_TAIL_LABEL_ORDER = (_LABEL_UNMAPPABLE, _LABEL_HIGH, _LABEL_SMOOTH_GAP, _LABEL_SMOOTH)
+
+_LABELED_RULE = "density-residual-labeled"
+
 _ELBOW_TSV_COLS = [
     "chrom", "n_bins",
     "density_lower_value", "density_lower_pct",
@@ -760,6 +778,16 @@ def build_blacklist_from_elbow_thresholds(
     # Always flag non-finite bins
     flagged = ~np.isfinite(combined["density"]) | ~np.isfinite(combined["noise"])
 
+    # Parallel to `flagged`, but records why each bin was taken. Only the
+    # labelled rule fills it in; every other rule leaves it empty and writes the
+    # plain 3-column BED, so existing outputs are byte-identical.
+    labels = pd.Series("", index=combined.index, dtype=object)
+    effective = rule if rule is not None else (
+        "intersection" if require_both_metrics else "union"
+    )
+    if effective == _LABELED_RULE:
+        labels[flagged] = _LABEL_UNMAPPABLE
+
     # Per-chromosome threshold application
     thresh_by_chrom = thresholds_df.set_index("chrom")
     for chrom in thresh_by_chrom.index:
@@ -777,9 +805,6 @@ def build_blacklist_from_elbow_thresholds(
             (combined.loc[mask, "noise"] <= n_lo) |
             (combined.loc[mask, "noise"] >= n_hi)
         )
-        effective = rule if rule is not None else (
-            "intersection" if require_both_metrics else "union"
-        )
         if effective == "noise-high":
             flagged.loc[mask] |= combined.loc[mask, "noise"] >= n_hi
         elif effective == "mask":
@@ -788,6 +813,33 @@ def build_blacklist_from_elbow_thresholds(
             flagged.loc[mask] |= density_oob & noise_oob
         elif effective == "union":
             flagged.loc[mask] |= density_oob | noise_oob
+        elif effective == _LABELED_RULE:
+            d_vals = combined.loc[mask, "density"].to_numpy(float)
+            n_vals = combined.loc[mask, "noise"].to_numpy(float)
+            finite = np.isfinite(d_vals) & np.isfinite(n_vals)
+            if finite.any():
+                residual = _density_conditioned_residuals(
+                    d_vals[finite], n_vals[finite], density_fit_window,
+                )
+                z = _residual_robust_z(residual)
+                gate = _low_tail_gate(
+                    combined.loc[mask, "start"].to_numpy(),
+                    finite, d_vals, density_gate_pct,
+                )
+                # Same selection as "density-residual-abs"; the gate only decides
+                # which of two labels a low-tail bin carries, never whether it is
+                # taken. Filtering the output to high_noise, or to high_noise plus
+                # smooth_near_gap, recovers the signed and gated rules exactly.
+                tail = np.full(len(d_vals), "", dtype=object)
+                tail[np.flatnonzero(finite)[z >= density_residual_k]] = _LABEL_HIGH
+                low = z <= -density_residual_k
+                tail[np.flatnonzero(finite)[low & gate]] = _LABEL_SMOOTH_GAP
+                tail[np.flatnonzero(finite)[low & ~gate]] = _LABEL_SMOOTH
+
+                selected = tail != ""
+                flagged.loc[mask] |= selected
+                idx = combined.index[mask]
+                labels.loc[idx[selected]] = tail[selected]
         elif effective in _DENSITY_RESIDUAL_RULES:
             d_vals = combined.loc[mask, "density"].to_numpy(float)
             n_vals = combined.loc[mask, "noise"].to_numpy(float)
@@ -840,15 +892,39 @@ def build_blacklist_from_elbow_thresholds(
         else:
             raise ValueError(
                 f"unknown blacklist rule {effective!r}; expected one of "
-                "'noise-high', 'density-residual', 'density-residual-abs', "
-                "'density-residual-gated', 'union', 'intersection', 'mask', "
-                "'density-stratified'"
+                "'density-residual-labeled', 'noise-high', 'density-residual', "
+                "'density-residual-abs', 'density-residual-gated', 'union', "
+                "'intersection', 'mask', 'density-stratified'"
             )
 
-    flagged_df = combined.loc[flagged, ["chrom", "start", "end"]].copy()
-    merged = _merge_intervals(flagged_df) if not flagged_df.empty else pd.DataFrame(
-        columns=["chrom", "start", "end"]
-    )
+    if (labels != "").any():
+        # Labelled output: merge *within* each label, never across. Two abutting
+        # bins that were taken for different reasons must stay separate regions,
+        # otherwise the merged interval would carry an identity that is only true
+        # of part of it. Regions of different labels may therefore abut in the
+        # output, which is correct.
+        parts = []
+        for name in _TAIL_LABEL_ORDER:
+            sub = combined.loc[labels == name, ["chrom", "start", "end"]]
+            if sub.empty:
+                continue
+            part = _merge_intervals(sub)
+            part["name"] = name
+            parts.append(part)
+        if parts:
+            merged = pd.concat(parts, ignore_index=True)
+            merged = merged.sort_values(
+                ["chrom", "start"], key=lambda col: (
+                    col.map(_canonical_chrom_key) if col.name == "chrom" else col
+                )
+            ).reset_index(drop=True)
+        else:
+            merged = pd.DataFrame(columns=["chrom", "start", "end", "name"])
+    else:
+        flagged_df = combined.loc[flagged, ["chrom", "start", "end"]].copy()
+        merged = _merge_intervals(flagged_df) if not flagged_df.empty else pd.DataFrame(
+            columns=["chrom", "start", "end"]
+        )
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
     merged.to_csv(output_path, sep="\t", header=False, index=False)
