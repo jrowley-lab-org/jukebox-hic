@@ -1050,8 +1050,12 @@ def compute_full_noise(
                     if not isinstance(spec[0], int)
                 ]
 
-            # On-diagonal task: create when whole-chrom (None) or when explicit on-diag specs exist.
-            if on_diag is not None or region_specs is None:
+            # On-diagonal task: create when whole-chrom (None) or when explicit on-diag
+            # specs exist.  `on_diag` is an empty list -- not None -- for a chromosome
+            # whose only specs are off-diagonal, so testing `is not None` would build an
+            # unrestricted whole-chromosome task for it (regions=None below), which is
+            # the opposite of what was asked for.  Test truthiness instead.
+            if on_diag or region_specs is None:
                 out_path = os.path.join(out_dir, f"{chrom}_{res}.bedgraph")
                 density_out_path = os.path.join(out_dir, f"{chrom}_{res}_density.bedgraph")
                 tasks.append(

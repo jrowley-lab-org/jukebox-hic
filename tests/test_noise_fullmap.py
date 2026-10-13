@@ -204,3 +204,108 @@ def test_short_chromosome_guard_threshold():
         assert length >= _default_bindist_bp(res), (
             f"chr21 would be wrongly filtered at {res} bp"
         )
+
+
+# ---------------------------------------------------------------------------
+# compute_full_noise task building (on-diagonal vs off-diagonal partition)
+# ---------------------------------------------------------------------------
+
+def _capture_tasks(monkeypatch, tmp_path, chrom_sizes_text, provider_sizes, res=10_000):
+    """
+    Run compute_full_noise far enough to build its task lists, without touching a
+    real Hi-C file.
+
+    select_provider is stubbed so chromosome enumeration returns `provider_sizes`,
+    and both workers are replaced by recorders that report success without doing
+    any matrix work.  cpu=1 keeps everything on the serial path, so no
+    multiprocessing pool is created.
+
+    Returns (on_diag_tasks, off_diag_tasks) as recorded in dispatch order.
+    """
+    from jukebox_hic import noise_fullmap as nf
+
+    class FakeProvider:
+        def chrom_sizes(self):
+            return dict(provider_sizes)
+
+    recorded_on = []
+    recorded_off = []
+
+    monkeypatch.setattr(nf, "select_provider", lambda *a, **k: (FakeProvider(), "fake"))
+    monkeypatch.setattr(
+        nf, "_full_noise_worker",
+        lambda task: (recorded_on.append(task), (task.chrom, task.res, task.out_path, True))[1],
+    )
+    monkeypatch.setattr(
+        nf, "_off_diag_noise_worker",
+        lambda task: (recorded_off.append(task), (task.chrom, task.out_path, True))[1],
+    )
+
+    sizes_file = tmp_path / "chrom_sizes.tsv"
+    sizes_file.write_text(chrom_sizes_text)
+
+    nf.compute_full_noise(
+        hic_path="unused.hic",
+        res_list=[res],
+        chrom_sizes_path=str(sizes_file),
+        out_dir=str(tmp_path / "out"),
+        cpu=1,
+    )
+    return recorded_on, recorded_off
+
+
+def test_off_diagonal_only_chrom_builds_no_whole_chrom_task(monkeypatch, tmp_path):
+    """
+    Regression: a chromosome whose only region spec is off-diagonal must NOT also
+    get an on-diagonal task.  The partition leaves `on_diag` as an empty list (not
+    None) in that case, so guarding with `on_diag is not None` used to build an
+    unrestricted whole-chromosome task — scanning the entire chromosome the user
+    never asked for.
+    """
+    on_tasks, off_tasks = _capture_tasks(
+        monkeypatch, tmp_path,
+        chrom_sizes_text="chr1\t248956422\t0-10000000:50000000-60000000\n",
+        provider_sizes={"chr1": 248_956_422},
+    )
+    assert on_tasks == []
+    assert len(off_tasks) == 1
+    assert (off_tasks[0].left_start, off_tasks[0].left_end) == (0, 10_000_000)
+    assert (off_tasks[0].right_start, off_tasks[0].right_end) == (50_000_000, 60_000_000)
+
+
+def test_on_diagonal_only_chrom_builds_region_restricted_task(monkeypatch, tmp_path):
+    # An on-diagonal spec yields one task whose `regions` is restricted (not None)
+    on_tasks, off_tasks = _capture_tasks(
+        monkeypatch, tmp_path,
+        chrom_sizes_text="chr1\t248956422\t0-50000000\n",
+        provider_sizes={"chr1": 248_956_422},
+    )
+    assert len(on_tasks) == 1
+    assert on_tasks[0].regions == ((0, 50_000_000),)
+    assert off_tasks == []
+
+
+def test_mixed_specs_build_both_task_types(monkeypatch, tmp_path):
+    # A chromosome with both spec kinds gets one region-restricted on-diagonal
+    # task plus one off-diagonal task
+    on_tasks, off_tasks = _capture_tasks(
+        monkeypatch, tmp_path,
+        chrom_sizes_text="chr1\t248956422\t0-50000000\t0-10000000:60000000-70000000\n",
+        provider_sizes={"chr1": 248_956_422},
+    )
+    assert len(on_tasks) == 1
+    assert on_tasks[0].regions == ((0, 50_000_000),)
+    assert len(off_tasks) == 1
+
+
+def test_no_region_columns_builds_whole_chrom_task(monkeypatch, tmp_path):
+    # A plain 2-column entry means "whole chromosome": regions must be None so the
+    # worker scans everything
+    on_tasks, off_tasks = _capture_tasks(
+        monkeypatch, tmp_path,
+        chrom_sizes_text="chr1\t248956422\n",
+        provider_sizes={"chr1": 248_956_422},
+    )
+    assert len(on_tasks) == 1
+    assert on_tasks[0].regions is None
+    assert off_tasks == []

@@ -425,6 +425,7 @@ class BaseProvider:
         end_a: int,
         start_b: int,
         end_b: int,
+        matrix_type: str = "observed",
     ) -> Optional[sparse.csr_matrix]:
         """
         Load the off-diagonal rectangular contact block for region_a × region_b.
@@ -436,6 +437,11 @@ class BaseProvider:
         Returns a CSR matrix of shape ``(n_a_bins, n_b_bins)``, or ``None`` if the
         block is empty or outside the chromosome.
         """
+        if matrix_type != "observed":
+            raise ValueError(
+                f"matrix_type={matrix_type!r} is only supported for .hic inputs; "
+                "this provider returns observed counts only"
+            )
         raise NotImplementedError
 
 
@@ -619,12 +625,16 @@ class HiCProvider(BaseProvider):
         end_a: int,
         start_b: int,
         end_b: int,
+        matrix_type: str = "observed",
     ) -> Optional[sparse.csr_matrix]:
         """
         Fetch the off-diagonal rectangular block region_a × region_b via hicstraw.
 
         hicstraw's ``straw()`` accepts two independent region strings, so this calls
-        ``straw(region_a, region_b)`` where the two strings are different.  Records are
+        ``straw(region_a, region_b)`` where the two strings are different.
+        ``matrix_type`` is passed through to straw: "observed" for contact counts,
+        "oe" for observed/expected, which straw derives from the file's own
+        distance-decay curve. Normalisation (``self.norm``) applies to either.  Records are
         filtered to the rectangle and assembled into a CSR matrix with local 0-based
         row indices (offset = start_a // res) and local 0-based col indices
         (offset = start_b // res).  No symmetrization is applied — the block is
@@ -644,7 +654,7 @@ class HiCProvider(BaseProvider):
         region_b = f"{chrom}:{start_b}:{end_b}"
         try:
             records = self._hicstraw.straw(
-                "observed", self.norm, self.path, region_a, region_b, "BP", self.res,
+                matrix_type, self.norm, self.path, region_a, region_b, "BP", self.res,
             )
         except Exception:
             return None
@@ -892,6 +902,7 @@ class CoolerProvider(BaseProvider):
         end_a: int,
         start_b: int,
         end_b: int,
+        matrix_type: str = "observed",
     ) -> Optional[sparse.csr_matrix]:
         """
         Fetch the off-diagonal rectangular block region_a × region_b via cooler.
@@ -901,6 +912,11 @@ class CoolerProvider(BaseProvider):
         local-indexed (rows 0..n_a-1, cols 0..n_b-1).  Custom weight vectors are
         applied using separate absolute bin offsets for the row and column dimensions.
         """
+        if matrix_type != "observed":
+            raise ValueError(
+                f"matrix_type={matrix_type!r} is only supported for .hic inputs; "
+                "this provider returns observed counts only"
+            )
         if chrom not in self._chrom_sizes:
             return None
         chrom_len = int(self._chrom_sizes[chrom])
@@ -1009,14 +1025,20 @@ def read_chrom_sizes(
         Chromosome name → length in bp.
     """
     if chrom_sizes_path and os.path.exists(chrom_sizes_path):
-        df = pd.read_csv(
-            chrom_sizes_path,
-            sep="\t",
-            header=None,
-            names=["chr", "size"],
-            dtype={"chr": str, "size": int},
-        )
-        sizes = dict(zip(df["chr"], df["size"]))
+        # Only the first two columns are read.  Since v0.3.0 the same --chrom_sizes file
+        # may carry extra region columns ("start-end", "l:r") consumed by
+        # noise_fullmap._parse_extended_chrom_sizes; this function only ever needed the
+        # chromosome names, so it ignores anything past column 2 rather than failing.
+        sizes = {}
+        with open(chrom_sizes_path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.split("\t")
+                if len(fields) < 2:
+                    continue
+                sizes[fields[0]] = int(fields[1])
         provider_sizes = provider.chrom_sizes()
         # Keep only chromosomes that the file actually contains.
         return {chrom: provider_sizes[chrom] for chrom in provider_sizes if chrom in sizes}
