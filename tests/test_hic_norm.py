@@ -1,8 +1,8 @@
-"""Tests for writing a JUKEBOX normalization into a .hic file."""
+"""Tests for writing a SONAR normalization into a .hic file."""
 import numpy as np
 import pytest
 
-from jukebox_hic.hic_norm import SCHEMES, bias_from_noise
+from sonar_c.hic_norm import SCHEMES, bias_from_noise
 
 
 def test_exponent_sets_strength_and_direction():
@@ -102,7 +102,7 @@ def test_scheme_is_invariant_to_a_rescaled_track():
 
 
 def test_input_file_is_never_overwritten(tmp_path):
-    from jukebox_hic.hic_norm import add_norm_to_hic
+    from sonar_c.hic_norm import add_norm_to_hic
     f = tmp_path / "a.hic"
     f.write_bytes(b"HIC\0not-a-real-file")
     with pytest.raises(ValueError, match="refusing"):

@@ -1,5 +1,5 @@
 """
-Tests for private helpers in src/jukebox_hic/noise_to_weights.py.
+Tests for private helpers in src/sonar_c/noise_to_weights.py.
 
 These functions are importable directly despite the leading underscore — the
 underscore is a convention, not a language restriction.  Tests cover:
@@ -12,7 +12,7 @@ underscore is a convention, not a language restriction.  Tests cover:
 import pandas as pd
 import pytest
 
-from jukebox_hic.noise_to_weights import (
+from sonar_c.noise_to_weights import (
     _is_decoy_chrom,
     _load_bedgraph,
     _load_chrom_sizes,

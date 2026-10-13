@@ -1,5 +1,5 @@
 """
-Shared pytest fixtures for the jukebox-hic test suite.
+Shared pytest fixtures for the sonar-c test suite.
 
 Fixtures defined here are automatically available to every test file in this
 directory — no import needed.  A test function requests them by parameter name.
@@ -8,7 +8,7 @@ import numpy as np
 import scipy.sparse as sparse
 import pytest
 
-from jukebox_hic.backends import ChromMatrix
+from sonar_c.backends import ChromMatrix
 
 
 @pytest.fixture

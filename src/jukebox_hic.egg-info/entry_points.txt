@@ -1,2 +1,0 @@
-[console_scripts]
-jukebox-hic = jukebox_hic.cli:main

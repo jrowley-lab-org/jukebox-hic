@@ -10,7 +10,7 @@ Outputs:
   - A TSV with per-chromosome threshold values and their percentile positions.
   - A PNG + PDF diagnostic 2×2 figure (overlay curves + per-chromosome dot-plots).
 
-Detection logic and plotting are implemented in the ``jukebox_hic`` package
+Detection logic and plotting are implemented in the ``sonar_c`` package
 (``filters.detect_elbow_thresholds`` / ``figures.plot_elbow_figure``).
 
 Usage
@@ -33,8 +33,8 @@ _repo_src = os.path.join(os.path.dirname(__file__), "..", "src")
 if os.path.isdir(_repo_src):
     sys.path.insert(0, os.path.abspath(_repo_src))
 
-from jukebox_hic.filters import detect_elbow_thresholds
-from jukebox_hic.figures import plot_elbow_figure
+from sonar_c.filters import detect_elbow_thresholds
+from sonar_c.figures import plot_elbow_figure
 
 
 def parse_args() -> argparse.Namespace:

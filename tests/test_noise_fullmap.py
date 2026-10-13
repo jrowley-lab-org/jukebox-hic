@@ -1,5 +1,5 @@
 """
-Tests for private helpers in src/jukebox_hic/noise_fullmap.py.
+Tests for private helpers in src/sonar_c/noise_fullmap.py.
 
 No multiprocessing or real Hi-C files are used — only the pure arithmetic and
 file-parsing functions that make up the pre- and post-computation plumbing.
@@ -8,7 +8,7 @@ import numpy as np
 import scipy.sparse as sparse
 import pytest
 
-from jukebox_hic.noise_fullmap import (
+from sonar_c.noise_fullmap import (
     _compute_dump_bins,
     _parse_extended_chrom_sizes,
     _precompute_expectation,
@@ -191,9 +191,9 @@ def test_short_chromosome_guard_threshold():
     fine resolutions makes hicstraw die with SIGFPE, which used to hang or kill a
     whole genome-wide run). The guard compares chromosome length to the window.
     """
-    from jukebox_hic.noise_fullmap import _default_bindist_bp
+    from sonar_c.noise_fullmap import _default_bindist_bp
 
-    # chrM against the windows JUKEBOX actually uses
+    # chrM against the windows SONAR actually uses
     chrM = 16_569
     for res in (10_000, 25_000, 250_000):
         assert chrM < _default_bindist_bp(res), (
@@ -222,7 +222,7 @@ def _capture_tasks(monkeypatch, tmp_path, chrom_sizes_text, provider_sizes, res=
 
     Returns (on_diag_tasks, off_diag_tasks) as recorded in dispatch order.
     """
-    from jukebox_hic import noise_fullmap as nf
+    from sonar_c import noise_fullmap as nf
 
     class FakeProvider:
         def chrom_sizes(self):

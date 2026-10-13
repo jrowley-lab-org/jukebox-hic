@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-JUKEBOX Hybrid Spline Noise Model — reference constants and model functions.
+SONAR Hybrid Spline Noise Model — reference constants and model functions.
 
 This module implements the statistical reference model used to assess Hi-C data
 quality relative to the 4D Nucleome (4DN) consortium's benchmarking standards.
@@ -36,7 +36,7 @@ Module contents
 - ``map_sequencing_advisor()``              — whole-map sequencing-sufficiency recommendation
 - ``_build_design_matrix()``               — build 11-feature design vector for one sample
 - ``_preprocess_noise_track()``             — shared noise preprocessing (smooth, log)
-- ``process_normalization_vectors_jukebox()`` — JUKEBOX bias vector
+- ``process_normalization_vectors_sonar()`` — SONAR bias vector
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ from scipy.interpolate import BSpline
 from scipy.ndimage import gaussian_filter1d
 
 # ---------------------------------------------------------------------------
-# JUKEBOX Hybrid Spline Model Constants
+# SONAR Hybrid Spline Model Constants
 # ---------------------------------------------------------------------------
 # Cubic B-spline (degree=3) with 5 interior knots over log10(ρ_win) space.
 # Augmented knot vector: [L_MIN]*4 + interior_knots + [L_MAX]*4 → 13 knots,
@@ -108,7 +108,7 @@ _BETA_LOWER: np.ndarray = np.array([
 ])
 
 # ---------------------------------------------------------------------------
-# JUKEBOX Decile Diagnostic Constants (q10–q90)
+# SONAR Decile Diagnostic Constants (q10–q90)
 # ---------------------------------------------------------------------------
 # Higher-precision knot values calibrated against the 4DN Gold Standard database
 # via quantile regression at deciles 10–90.
@@ -294,7 +294,7 @@ def compute_noise_model(
     ebr: float,
 ) -> Dict[str, object]:
     """
-    Evaluate the JUKEBOX hybrid spline noise model for one chromosome sample.
+    Evaluate the SONAR hybrid spline noise model for one chromosome sample.
 
     Computes predicted noise (central, upper envelope, lower envelope), quality
     gating status, and the envelope-normalised z-map score.
@@ -610,9 +610,9 @@ def _preprocess_noise_track(
     ebr: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Shared pre-processing for the JUKEBOX bias-vector computation.
+    Shared pre-processing for the SONAR bias-vector computation.
 
-    ``process_normalization_vectors_jukebox()`` begins with the same four-step pipeline:
+    ``process_normalization_vectors_sonar()`` begins with the same four-step pipeline:
 
     1. **Identify invalid bins**: NaN values arise from bins that were too sparse for
        a noise estimate (skipped by ``_compute_row_metrics``); Inf values arise from
@@ -678,7 +678,7 @@ def _center_log_bias(log_bias: np.ndarray, is_nan: np.ndarray) -> None:
         log_bias[valid] -= shift
 
 
-def process_normalization_vectors_jukebox(
+def process_normalization_vectors_sonar(
     noise_track: np.ndarray,
     pred_log_N: float,
     ebr: float,
@@ -687,7 +687,7 @@ def process_normalization_vectors_jukebox(
     max_log2_fold: Optional[float] = 3.0,
 ) -> np.ndarray:
     """
-    JUKEBOX normalization.
+    SONAR normalization.
 
     Applies a signed power-law (root) transformation to the log-space residual,
     compressing the long tail more aggressively than a linear scalar.

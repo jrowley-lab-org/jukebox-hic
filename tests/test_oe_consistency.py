@@ -1,5 +1,5 @@
 """
-Regression tests for the JUKEBOX noise definition.
+Regression tests for the SONAR noise definition.
 
 The Methods define a single noise metric:
 
@@ -16,8 +16,8 @@ import numpy as np
 import pytest
 from scipy import sparse
 
-from jukebox_hic import noise_fullmap as NF
-from jukebox_hic import noise_sampling as NS
+from sonar_c import noise_fullmap as NF
+from sonar_c import noise_sampling as NS
 
 
 class _CM:

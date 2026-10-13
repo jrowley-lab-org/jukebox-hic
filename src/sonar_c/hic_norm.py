@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """
-Write a JUKEBOX normalization directly into a ``.hic`` file.
+Write a SONAR normalization directly into a ``.hic`` file.
 
 Juicer applies a normalization vector as ``normalized[i][j] = observed[i][j] /
-(v_i * v_j)``, so a per-bin weight derived from the JUKEBOX noise track can be
+(v_i * v_j)``, so a per-bin weight derived from the SONAR noise track can be
 stored alongside KR/VC/SCALE and selected in Juicebox like any other
 normalization.  Each resolution present in the file is normalized independently:
 noise is a property of a matrix at a given bin size, so a 5 kb map and a 250 kb
@@ -89,8 +89,8 @@ def bias_from_noise(
 
     if scheme == "residual-root":
         # pred_log_N is irrelevant here: the residual is re-centred on its own
-        # median inside process_normalization_vectors_jukebox().
-        return reference.process_normalization_vectors_jukebox(
+        # median inside process_normalization_vectors_sonar().
+        return reference.process_normalization_vectors_sonar(
             noise_track, pred_log_N=0.0, ebr=ebr, p=p, alpha=alpha,
             max_log2_fold=max_log2_fold,
         )
@@ -162,7 +162,7 @@ def add_norm_to_hic(
     juicer_tools: str,
     noise_dir: str,
     resolutions: Optional[Sequence[int]] = None,
-    name: str = "JUKEBOX",
+    name: str = "SONAR",
     chrom_sizes_path: Optional[str] = None,
     skip_decoys: bool = True,
     java: str = "java",
@@ -172,7 +172,7 @@ def add_norm_to_hic(
     **bias_kw,
 ) -> str:
     """
-    Copy *hic_path* to *out_path* and add a JUKEBOX normalization to the copy.
+    Copy *hic_path* to *out_path* and add a SONAR normalization to the copy.
 
     One vector file is built covering every requested resolution — Juicer's format
     carries the resolution in each block header, so a single ``addNorm`` call adds
@@ -185,7 +185,7 @@ def add_norm_to_hic(
     juicer_tools : path to a juicer_tools jar (1.22.x is known to preserve v8
         files; 2.20 was observed to corrupt them).
     noise_dir : directory of ``{res}.bedgraph`` noise tracks, as written by
-        ``noise-bedgraph`` (or by the Rust ``jukebox-rs``).
+        ``noise-bedgraph`` (or by the Rust ``sonar-rs``).
     resolutions : which resolutions to add. Default: every ``{res}.bedgraph``
         found in *noise_dir*.
     name : normalization label as it will appear in Juicebox.
@@ -240,7 +240,7 @@ def add_norm_to_hic(
     vec_path = keep_vector
     tmp = None
     if vec_path is None:
-        tmp = tempfile.NamedTemporaryFile("w", suffix=".jukebox.vector", delete=False)
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".sonar.vector", delete=False)
         vec_path = tmp.name
         tmp.close()
     with open(vec_path, "w") as fh:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Memory profiling utilities for tracking jukebox-hic resource usage.
+Memory profiling utilities for tracking sonar-c resource usage.
 
 This module provides two approaches to measuring memory consumption:
 
@@ -47,7 +47,7 @@ def _process_rss_mb() -> float:
     direct measure of how much RAM the process is actively using right now.
 
     This function sums the RSS of the main process and all of its child processes
-    (recursively), because jukebox-hic may spawn worker subprocesses in parallel
+    (recursively), because sonar-c may spawn worker subprocesses in parallel
     noise-bedgraph mode. The sum gives the total RAM footprint of the entire analysis.
 
     Implementation uses ``psutil.Process.memory_info().rss``, which reads from

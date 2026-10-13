@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """
-Command-line interface for jukebox-hic.
+Command-line interface for sonar-c.
 
 This module defines the ``main()`` entry point, which is registered as the
-``jukebox-hic`` console script in ``pyproject.toml``. It uses Python's
+``sonar-c`` console script in ``pyproject.toml``. It uses Python's
 ``argparse`` library to expose eight subcommands:
 
 Subcommands
@@ -18,7 +18,7 @@ noise-bedgraph
     bedgraph at each requested resolution, suitable for bias vector construction.
 
 bias-vectors
-    Transform a noise-bedgraph output into a JUKEBOX normalization vector (Juicer
+    Transform a noise-bedgraph output into a SONAR normalization vector (Juicer
     custom-vector format) for a single resolution. Requires the subsample_summary.tsv
     from sample-noise at the same resolution to obtain per-chromosome z-map
     parameters. Run once per resolution.
@@ -38,7 +38,7 @@ sequencing-advisor
     genome-wide "Sequence Further" / "Sufficient" recommendation.
 
 default-run
-    Run the full jukebox-hic pipeline in sequence:
+    Run the full sonar-c pipeline in sequence:
     Phase 1: sample-noise → Phase 1.5: sequencing-advisor →
     Phase 2: noise-bedgraph → Phase 3: bias-vectors → Phase 4: blacklist.
     Use this for a complete first-pass analysis.
@@ -454,7 +454,7 @@ def _run_sequencing_advisor(summary_dir: str, out_path: str) -> Dict[str, object
 
 def main() -> None:
     """
-    Entry point for the ``jukebox-hic`` command-line tool.
+    Entry point for the ``sonar-c`` command-line tool.
 
     Parses arguments and dispatches to the appropriate module function based on
     the subcommand selected (``args.cmd``). All subcommands are wrapped in
@@ -463,13 +463,13 @@ def main() -> None:
     See the module docstring for a description of each subcommand.
     """
     parser = argparse.ArgumentParser(
-        prog="jukebox-hic",
+        prog="sonar-c",
         description="Lightweight Hi-C noise analysis toolkit for .hic/.cool matrices",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
     parser.epilog = (
-        'Note: The default install (pip install jukebox-hic) includes both cooler and hicstraw backends. '
-        'Single-backend profiles: pip install "jukebox-hic[cooler]" or pip install "jukebox-hic[straw]". '
+        'Note: The default install (pip install sonar-c) includes both cooler and hicstraw backends. '
+        'Single-backend profiles: pip install "sonar-c[cooler]" or pip install "sonar-c[straw]". '
         'Windows users experiencing hicstraw build errors: see the README for a cooler-only workaround.'
     )
 
@@ -608,7 +608,7 @@ def main() -> None:
     # Subparser for transforming noise-bedgraph outputs into Juicer normalization vectors.
     sp_bias = sub.add_parser(
         "bias-vectors",
-        help="Transform noise-bedgraph outputs into JUKEBOX normalization vectors (Juicer format)",
+        help="Transform noise-bedgraph outputs into SONAR normalization vectors (Juicer format)",
     )
     sp_bias.add_argument(
         "--noise_dir",
@@ -653,20 +653,20 @@ def main() -> None:
         "--alpha",
         type=float,
         default=0.5,
-        help="Scaling constant for JUKEBOX normalization (default: 0.5).",
+        help="Scaling constant for SONAR normalization (default: 0.5).",
     )
     sp_bias.add_argument(
         "--p_factor",
         type=float,
         default=2.0,
-        help="Compression factor for JUKEBOX normalization (default: 2.0; square root). Use 3.0 for cube root.",
+        help="Compression factor for SONAR normalization (default: 2.0; square root). Use 3.0 for cube root.",
     )
     sp_bias.add_argument(
         "--max_log2_fold",
         type=float,
         default=3.0,
         help=(
-            "Clamp JUKEBOX bias weights to +/- this many log2 units around 1.0 "
+            "Clamp SONAR bias weights to +/- this many log2 units around 1.0 "
             "(default: 3.0, i.e. weights in [0.125, 8]). Pass 0 to disable. Juicer "
             "divides observed counts by bias[i]*bias[j], so unclamped outlier "
             "weights can blank out whole rows."
@@ -678,7 +678,7 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     sp_addnorm = sub.add_parser(
         "add-norm",
-        help="Write a JUKEBOX normalization into a copy of a .hic file "
+        help="Write a SONAR normalization into a copy of a .hic file "
              "(every resolution normalized independently)",
     )
     sp_addnorm.add_argument("--hic", required=True, help="Input .hic (never modified)")
@@ -690,8 +690,8 @@ def main() -> None:
                             help="Directory of {res}.bedgraph noise tracks from noise-bedgraph")
     sp_addnorm.add_argument("--res", type=_comma_ints, default=None,
                             help="Resolutions to add (default: every {res}.bedgraph in --noise_dir)")
-    sp_addnorm.add_argument("--name", default="JUKEBOX",
-                            help="Normalization label shown in Juicebox (default: JUKEBOX)")
+    sp_addnorm.add_argument("--name", default="SONAR",
+                            help="Normalization label shown in Juicebox (default: SONAR)")
     sp_addnorm.add_argument("--scheme", choices=list(hic_norm.SCHEMES), default="power",
                             help="Noise-to-weight mapping (default: power)")
     sp_addnorm.add_argument("--exponent", type=float, default=1.0,
@@ -907,7 +907,7 @@ def main() -> None:
     sp_run = sub.add_parser(
         "default-run",
         help=(
-            "Full JUKEBOX pipeline: sample noise → full noise → bias vectors → blacklist. "
+            "Full SONAR pipeline: sample noise → full noise → bias vectors → blacklist. "
             "Runs at no normalization using 4DN reference benchmarking."
         ),
     )
@@ -944,20 +944,20 @@ def main() -> None:
         "--alpha",
         type=float,
         default=0.5,
-        help="Scaling constant for JUKEBOX normalization (default: 0.5).",
+        help="Scaling constant for SONAR normalization (default: 0.5).",
     )
     sp_run.add_argument(
         "--p_factor",
         type=float,
         default=2.0,
-        help="Compression factor for JUKEBOX normalization (default: 2.0; square root). Use 3.0 for cube root.",
+        help="Compression factor for SONAR normalization (default: 2.0; square root). Use 3.0 for cube root.",
     )
     sp_run.add_argument(
         "--max_log2_fold",
         type=float,
         default=3.0,
         help=(
-            "Clamp JUKEBOX bias weights to +/- this many log2 units around 1.0 "
+            "Clamp SONAR bias weights to +/- this many log2 units around 1.0 "
             "(default: 3.0, i.e. weights in [0.125, 8]). Pass 0 to disable. Juicer "
             "divides observed counts by bias[i]*bias[j], so unclamped outlier "
             "weights can blank out whole rows."
@@ -1362,7 +1362,7 @@ def main() -> None:
             res_sample_dir = os.path.join(sample_root, str(res))
             zmap_summary = os.path.join(res_sample_dir, "subsample_summary.tsv")
 
-            # Phase 3: Bias vectors (JUKEBOX normalization)
+            # Phase 3: Bias vectors (SONAR normalization)
             print(f"\n[Phase 3] Building bias vectors at {res} bp ...")
             if not os.path.isfile(zmap_summary):
                 print(f"  [WARN] subsample_summary.tsv not found for res={res} — skipping bias vectors")

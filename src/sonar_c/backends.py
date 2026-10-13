@@ -3,7 +3,7 @@
 Common helpers for accessing Hi-C contact data from .hic (Juicer) and cooler file formats.
 
 This module provides a unified abstraction layer (the "provider" pattern) so that the
-rest of jukebox-hic can load contact matrices without caring whether the underlying
+rest of sonar-c can load contact matrices without caring whether the underlying
 file is a Juicer .hic file or a cooler .cool/.mcool/.scool file.
 
 Architecture overview
@@ -51,15 +51,15 @@ COOLER_SUFFIXES: Tuple[str, ...] = (".cool", ".mcool", ".scool")
 # Human-readable error messages shown when optional dependencies are missing.
 HICSTRAW_HELP = (
     "hicstraw is required for .hic inputs. "
-    "It is included in the default install (pip install jukebox-hic) "
-    'or can be added with pip install "jukebox-hic[straw]". '
+    "It is included in the default install (pip install sonar-c) "
+    'or can be added with pip install "sonar-c[straw]". '
     "Alternatively, convert the .hic file to .mcool using hic2cool and use the cooler backend."
 )
 
 COOLER_HELP = (
     "cooler is required for .cool/.mcool/.scool inputs. "
-    "It is included in the default install (pip install jukebox-hic) "
-    'or can be added with pip install "jukebox-hic[cooler]".'
+    "It is included in the default install (pip install sonar-c) "
+    'or can be added with pip install "sonar-c[cooler]".'
 )
 
 
@@ -179,7 +179,7 @@ def normalize_hic_norm(norm: str) -> str:
     Translate a user-facing normalization name to the string expected by hicstraw.
 
     The .hic format uses its own normalization labels (e.g. "KR" for Knight-Ruiz
-    balancing) that differ from what jukebox-hic exposes to users.
+    balancing) that differ from what sonar-c exposes to users.
 
     Mapping:
     - ``"none"``    → ``"NONE"``  — no normalization; use raw observed counts.
@@ -385,7 +385,7 @@ class BaseProvider:
     Abstract base class for Hi-C data providers.
 
     Defines the two-method interface that all concrete providers (``HiCProvider``,
-    ``CoolerProvider``) must implement, so the rest of jukebox-hic can load contact
+    ``CoolerProvider``) must implement, so the rest of sonar-c can load contact
     data without knowing which file format is in use.
 
     Do not instantiate this class directly — use ``select_provider()`` instead.

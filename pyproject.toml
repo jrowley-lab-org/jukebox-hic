@@ -3,14 +3,14 @@ requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "jukebox-hic"
-version = "0.3.0b"
+name = "sonar-c"
+version = "0.4.0"
 description = "Hi-C noise analysis toolkit for .hic/.cool matrices"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "BSD-3-Clause"}
 authors = [
-  {name = "NoiseSampler Developers"}
+  {name = "Tim Reznicek"}
 ]
 dependencies = [
   "numpy>=1.21",
@@ -29,10 +29,10 @@ profile = ["psutil>=5.9"]
 dev     = ["pytest>=7.0", "pytest-cov"]
 
 [project.urls]
-Homepage = "https://github.com/jrowley-lab-org/jukebox-hic"
+Homepage = "https://github.com/jrowley-lab-org/sonar-c"
 
 [project.scripts]
-jukebox-hic = "jukebox_hic.cli:main"
+sonar-c = "sonar_c.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
