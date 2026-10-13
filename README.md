@@ -1,4 +1,4 @@
-# jukebox-hic
+# sonar-c
 
 Lightweight Hi-C noise analysis toolkit for `.hic` ([hicstraw](https://github.com/aidenlab/straw)) and cooler formats (`.cool`, `.mcool`, `.scool`).
 
@@ -14,27 +14,27 @@ Lightweight Hi-C noise analysis toolkit for `.hic` ([hicstraw](https://github.co
 **Default install — both backends (cooler + hicstraw):**
 
 ```bash
-pip install jukebox-hic
+pip install sonar-c
 ```
 
 **Single-backend profiles:**
 
 ```bash
 # cooler only (.cool / .mcool / .scool)
-pip install "jukebox-hic[cooler]"
+pip install "sonar-c[cooler]"
 
 # hicstraw only (.hic)
-pip install "jukebox-hic[straw]"
+pip install "sonar-c[straw]"
 ```
 
 > **Windows users — known PyPI install error**
 >
 > `hic-straw` does not ship pre-built wheels for Windows on PyPI and may fail to
-> compile from source. If `pip install jukebox-hic` errors during the hicstraw
+> compile from source. If `pip install sonar-c` errors during the hicstraw
 > build step, bypass the default install and use the cooler-only profile:
 >
 > ```bash
-> pip install jukebox-hic --no-deps
+> pip install sonar-c --no-deps
 > pip install numpy pandas statsmodels matplotlib scipy cooler
 > ```
 >
@@ -44,12 +44,12 @@ pip install "jukebox-hic[straw]"
 > ```bash
 > pip install hic2cool
 > hic2cool convert sample.hic sample.mcool --resolutions 10000
-> jukebox-hic sample-noise --hic sample.mcool --cooler_path /resolutions/10000 --res 10000 --out_dir outputs/
+> sonar-c sample-noise --hic sample.mcool --cooler_path /resolutions/10000 --res 10000 --out_dir outputs/
 > ```
 ## Command Line Usage
 ### Sampled noise with subsampling summaries
 ```bash
-jukebox-hic sample-noise \
+sonar-c sample-noise \
   --hic sample.cool \
   --res 10000 \
   --min_mean_score 0.9 \
@@ -65,12 +65,12 @@ table with mean/median/log noise, ACF, variability, and empty-bin ratios at each
 
 ### Noise bedgraph (genome-wide)
 ```bash
-jukebox-hic noise-bedgraph \
+sonar-c noise-bedgraph \
   --hic sample.hic \
   --res 5000,10000 \
   --out_dir outputs/
 # Add --cpu <N> to parallelize per (chrom, res) tasks
-jukebox-hic noise-bedgraph \
+sonar-c noise-bedgraph \
   --hic sample.hic \
   --res 5000,10000 \
   --out_dir outputs/ \
@@ -80,14 +80,14 @@ jukebox-hic noise-bedgraph \
 
 ### Plotting
 ```bash
-jukebox-hic plot \
+sonar-c plot \
   --noise_bed outputs/chr1_10000_sampled.bedgraph \
   --out_png noise_density.png
 ```
 
 ### Build a blacklist from bedgraphs
 ```bash
-jukebox-hic blacklist \
+sonar-c blacklist \
   --input outputs/10kb/*.bedgraph \
   --out blacklist.bed \
   --top_quantile 0.95
@@ -98,7 +98,7 @@ threshold instead of using the percentile.
 
 ## Python API
 ```python
-from jukebox_hic import noise_sampling
+from sonar_c import noise_sampling
 
 noise_sampling.compute_sampled_noise(
     hic_path="sample.cool",
@@ -127,13 +127,13 @@ This project supports two I/O backends, both included in the default install:
 
 | Install | Backend | Formats |
 |---|---|---|
-| `pip install jukebox-hic` (default) | cooler + hicstraw | `.cool`, `.mcool`, `.scool`, `.hic` |
-| `pip install "jukebox-hic[cooler]"` | cooler only | `.cool`, `.mcool`, `.scool` |
-| `pip install "jukebox-hic[straw]"` | hicstraw only | `.hic` |
+| `pip install sonar-c` (default) | cooler + hicstraw | `.cool`, `.mcool`, `.scool`, `.hic` |
+| `pip install "sonar-c[cooler]"` | cooler only | `.cool`, `.mcool`, `.scool` |
+| `pip install "sonar-c[straw]"` | hicstraw only | `.hic` |
 
 Runtime guidance:
-- If you pass a `.hic` file without hicstraw installed, the tool will suggest `pip install "jukebox-hic[straw]"`.
-- If you pass a cooler-format file without `cooler` installed, the tool will suggest `pip install "jukebox-hic[cooler]"`.
+- If you pass a `.hic` file without hicstraw installed, the tool will suggest `pip install "sonar-c[straw]"`.
+- If you pass a cooler-format file without `cooler` installed, the tool will suggest `pip install "sonar-c[cooler]"`.
 - The same `--cooler_path` argument selects resolution groups in `.mcool` files and cell groups in `.scool` files.
 
 ## Changelog
@@ -150,7 +150,7 @@ Runtime guidance:
   ```
 - **Multi-mode blacklist output** — `blacklist` and `default-run` now produce four output directories per run (`density_only/`, `noise_only/`, `union/`, `intersection/`) instead of a single file, enabling comparison of conservative and permissive thresholds.
 - **Default transforms changed to `log1p`** — both `--density_transform` and `--noise_transform` now default to `log1p` (previously `none` and `sqrt` respectively). `log1p` is more robust to outlier bins (repeats, centromeres) that can skew elbow detection.
-- **Both backends in default install** — `pip install jukebox-hic` now includes both `cooler` and `hic-straw`. Single-backend profiles `[cooler]` and `[straw]` are available for constrained environments.
+- **Both backends in default install** — `pip install sonar-c` now includes both `cooler` and `hic-straw`. Single-backend profiles `[cooler]` and `[straw]` are available for constrained environments.
 
 ### v0.2.4
 - Initial public release.

@@ -1,5 +1,5 @@
 """
-Tests for src/jukebox_hic/metrics.py.
+Tests for src/sonar_c/metrics.py.
 
 estimate_worker_memory_mb is a pure arithmetic formula (no OS calls).
 collect_memory_usage_mb wraps optional system calls and must not crash
@@ -7,7 +7,7 @@ regardless of whether psutil/resource are installed.
 """
 import pytest
 
-from jukebox_hic.metrics import collect_memory_usage_mb, estimate_worker_memory_mb
+from sonar_c.metrics import collect_memory_usage_mb, estimate_worker_memory_mb
 
 
 # ---------------------------------------------------------------------------

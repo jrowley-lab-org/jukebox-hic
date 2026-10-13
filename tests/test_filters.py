@@ -1,5 +1,5 @@
 """
-Tests for src/jukebox_hic/filters.py.
+Tests for src/sonar_c/filters.py.
 
 Covers Kneedle elbow detection, interval merging, and the detect_elbow_thresholds
 integration path using synthetic bedgraph files written to tmp_path.
@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from jukebox_hic.filters import (
+from sonar_c.filters import (
     _density_conditioned_residuals,
     _robust_residual_threshold,
     _kneedle,
@@ -250,7 +250,7 @@ def _tiny_tracks(tmp_path):
 
 def _flagged(tmp_path, rule):
     import pandas as pd
-    from jukebox_hic.filters import build_blacklist_from_elbow_thresholds
+    from sonar_c.filters import build_blacklist_from_elbow_thresholds
     n, d = _tiny_tracks(tmp_path)
     th = pd.DataFrame([{
         "chrom": "chr1", "n_bins": 6,
@@ -407,7 +407,7 @@ def test_density_stratified_rule_integration(tmp_path):
     _write_bedgraph(density_path, "chr1", density)
     _write_bedgraph(noise_path, "chr1", noise)
 
-    from jukebox_hic.filters import build_blacklist_from_elbow_thresholds
+    from sonar_c.filters import build_blacklist_from_elbow_thresholds
     th = pd.DataFrame([{
         "chrom": "chr1", "n_bins": len(density),
         "density_lower_value": 0.0, "density_lower_pct": 0.0,
@@ -533,7 +533,7 @@ def test_density_residual_rule_integration(tmp_path):
     _write_bedgraph(density_path, "chr1", density)
     _write_bedgraph(noise_path, "chr1", noise)
 
-    from jukebox_hic.filters import build_blacklist_from_elbow_thresholds
+    from sonar_c.filters import build_blacklist_from_elbow_thresholds
     th = pd.DataFrame([{
         "chrom": "chr1", "n_bins": len(density),
         "density_lower_value": 0.0, "density_lower_pct": 0.0,
@@ -591,7 +591,7 @@ def _two_tailed_tracks(tmp_path, n=600, seed=3):
 
 def _flag_bins(tmp_path, d_path, n_path, rule, **kwargs):
     """Run one rule over the synthetic tracks and return the flagged bin indices."""
-    from jukebox_hic.filters import build_blacklist_from_elbow_thresholds
+    from sonar_c.filters import build_blacklist_from_elbow_thresholds
     th = pd.DataFrame([{
         "chrom": "chr1", "n_bins": 600,
         "density_lower_value": 0.0, "density_lower_pct": 0.0,
@@ -654,7 +654,7 @@ def test_density_gate_pct_admits_more_of_the_low_tail(tmp_path):
 
 def _labeled_bed(tmp_path, d_path, n_path, **kwargs):
     """Run the labelled rule and return the BED as (bin_index → label) plus raw rows."""
-    from jukebox_hic.filters import build_blacklist_from_elbow_thresholds
+    from sonar_c.filters import build_blacklist_from_elbow_thresholds
     th = pd.DataFrame([{
         "chrom": "chr1", "n_bins": 600,
         "density_lower_value": 0.0, "density_lower_pct": 0.0,
@@ -748,7 +748,7 @@ def test_labeled_regions_of_different_tails_are_not_merged(tmp_path):
 def test_unlabelled_rules_still_write_three_columns(tmp_path):
     """Every other rule keeps the plain 3-column BED, so existing consumers are unaffected."""
     d_path, n_path = _two_tailed_tracks(tmp_path)
-    from jukebox_hic.filters import build_blacklist_from_elbow_thresholds
+    from sonar_c.filters import build_blacklist_from_elbow_thresholds
     th = pd.DataFrame([{
         "chrom": "chr1", "n_bins": 600,
         "density_lower_value": 0.0, "density_lower_pct": 0.0,
@@ -770,7 +770,7 @@ def test_low_tail_gate_uses_bin_index_not_row_position(tmp_path):
     Adjacency must survive a shuffled bedgraph: the gate works off bin
     coordinates, so row order in the file cannot change which bins it admits.
     """
-    from jukebox_hic.filters import _low_tail_gate
+    from sonar_c.filters import _low_tail_gate
     starts = np.arange(0, 10 * 10_000, 10_000)
     finite = np.ones(10, dtype=bool)
     finite[4] = False            # bin 4 unmappable → bins 3 and 5 are adjacent

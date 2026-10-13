@@ -763,7 +763,7 @@ def _write_off_diag_bedgraph(task: "_OffDiagNoiseTask", noise_vals: np.ndarray) 
 
 def off_diag_row_noise(row_vec: np.ndarray) -> float:
     """
-    Jukebox's off-diagonal noise value for one row profile.
+    SONAR's off-diagonal noise value for one row profile.
 
     Lag-1 autocovariance of the contact profile across the column region, then
     ``1 / |acov|``: an erratic, spiky profile has autocovariance near zero and so

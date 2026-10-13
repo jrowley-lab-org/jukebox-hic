@@ -1,5 +1,5 @@
 """
-Tests for src/jukebox_hic/backends.py — pure helper functions only.
+Tests for src/sonar_c/backends.py — pure helper functions only.
 
 All tests here avoid opening any real .hic or .cool files.  Tests that would
 need a real file (CoolerProvider, HiCProvider instance methods, resolve_cooler_uri
@@ -10,7 +10,7 @@ import numpy as np
 import scipy.sparse as sparse
 import pytest
 
-from jukebox_hic.backends import (
+from sonar_c.backends import (
     ChromMatrix,
     is_cooler_path,
     normalize_hic_norm,

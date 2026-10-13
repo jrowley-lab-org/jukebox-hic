@@ -1,5 +1,5 @@
 """
-Tests for src/jukebox_hic/noise_gradient.py.
+Tests for src/sonar_c/noise_gradient.py.
 
 The load-bearing test here is test_threshold_at_k_reproduces_density_residual_blacklist:
 the gradient and the "density-residual" blacklist rule are meant to be two views
@@ -10,8 +10,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from jukebox_hic.filters import build_blacklist_from_elbow_thresholds
-from jukebox_hic.noise_gradient import (
+from sonar_c.filters import build_blacklist_from_elbow_thresholds
+from sonar_c.noise_gradient import (
     _infer_res,
     build_noise_gradient,
     compute_chrom_gradient,

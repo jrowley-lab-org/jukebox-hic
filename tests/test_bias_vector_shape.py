@@ -1,5 +1,5 @@
 """
-Regression tests for the JUKEBOX normalization (bias) vector.
+Regression tests for the SONAR normalization (bias) vector.
 
 Juicer applies a custom vector as normalized[i][j] = observed[i][j] / (v_i * v_j)
 and reads each chromosome block positionally.  That imposes three requirements
@@ -14,8 +14,8 @@ the pre-fix code did not enforce:
 import numpy as np
 import pandas as pd
 
-from jukebox_hic import reference
-from jukebox_hic.noise_to_weights import _reindex_to_full_grid
+from sonar_c import reference
+from sonar_c.noise_to_weights import _reindex_to_full_grid
 
 
 RES = 10_000
@@ -38,7 +38,7 @@ def test_reindex_fills_gaps_and_sizes_to_the_chromosome():
 def test_bias_vector_has_unit_geometric_mean():
     rng = np.random.default_rng(0)
     track = 10.0 ** rng.normal(0.9, 0.4, size=2000)
-    v = reference.process_normalization_vectors_jukebox(track, pred_log_N=0.95, ebr=0.05)
+    v = reference.process_normalization_vectors_sonar(track, pred_log_N=0.95, ebr=0.05)
     f = v[np.isfinite(v)]
     assert np.isclose(np.exp(np.mean(np.log(f))), 1.0, rtol=1e-9)
 
@@ -47,7 +47,7 @@ def test_bias_vector_respects_the_clamp():
     rng = np.random.default_rng(1)
     track = 10.0 ** rng.normal(0.9, 0.4, size=2000)
     track[:20] = 1e12          # pathological bins that previously blew the vector up
-    v = reference.process_normalization_vectors_jukebox(
+    v = reference.process_normalization_vectors_sonar(
         track, pred_log_N=0.95, ebr=0.05, max_log2_fold=3.0
     )
     f = v[np.isfinite(v)]
@@ -62,13 +62,13 @@ def test_bias_vector_is_robust_to_a_mis_scaled_anchor():
     """
     rng = np.random.default_rng(2)
     track = 10.0 ** rng.normal(0.9, 0.4, size=1500)
-    a = reference.process_normalization_vectors_jukebox(track, pred_log_N=0.95, ebr=0.05)
-    b = reference.process_normalization_vectors_jukebox(track, pred_log_N=5.40, ebr=0.05)
+    a = reference.process_normalization_vectors_sonar(track, pred_log_N=0.95, ebr=0.05)
+    b = reference.process_normalization_vectors_sonar(track, pred_log_N=5.40, ebr=0.05)
     np.testing.assert_allclose(a, b, rtol=1e-9)
 
 
 def test_nan_bins_are_preserved_as_nan():
     track = np.array([5.0, np.nan, 7.0, np.inf, 6.0] * 100)
-    v = reference.process_normalization_vectors_jukebox(track, pred_log_N=0.9, ebr=0.1)
+    v = reference.process_normalization_vectors_sonar(track, pred_log_N=0.9, ebr=0.1)
     assert np.isnan(v[1]) and np.isnan(v[3])
     assert np.isfinite(v[0]) and np.isfinite(v[2]) and np.isfinite(v[4])

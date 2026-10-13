@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """
-Transform noise-bedgraph outputs into JUKEBOX normalization bias vectors.
+Transform noise-bedgraph outputs into SONAR normalization bias vectors.
 
-This module is the final step in the jukebox-hic pipeline. It reads the genome-wide
+This module is the final step in the sonar-c pipeline. It reads the genome-wide
 per-bin noise track produced by the ``noise-bedgraph`` command (as a bedgraph file)
 and converts it into a normalization bias vector in Juicer's custom vector format.
 
@@ -20,12 +20,12 @@ Juicer vector format
 --------------------
 The output file uses Juicer's custom normalization vector format:
 
-    vector JUKEBOX chr1 10000 BP
+    vector SONAR chr1 10000 BP
     1.234
     0.987
     NaN
     ...
-    vector JUKEBOX chr2 10000 BP
+    vector SONAR chr2 10000 BP
     ...
 
 Each ``vector`` header line introduces a block for one chromosome. The header
@@ -370,7 +370,7 @@ def _load_zmap_summary(path: str) -> Dict[str, Dict[str, float]]:
     - ``ebr`` (from ``mean_empty_bin_ratio``): mean empty bin ratio; used as the
       Gaussian smoothing sigma offset in ``_preprocess_noise_track()``.
     - ``pred_log_N``: 4DN-predicted log10 noise for this chromosome; used as the
-      anchor point in the JUKEBOX bias-vector formula.
+      anchor point in the SONAR bias-vector formula.
 
     Parameters
     ----------
@@ -452,7 +452,7 @@ def _write_juicer_vector_block(
         Per-bin bias weights. NaN entries are written as ``NaN`` or
         ``nan_fill_value`` depending on the configuration.
     vector_name : str
-        Name to use in the ``vector`` header line (e.g. ``"JUKEBOX"``).
+        Name to use in the ``vector`` header line (e.g. ``"SONAR"``).
     nan_fill_value : float
         Value to write for NaN bins. If ``nan_fill_value`` is itself NaN, the literal
         string ``"NaN"`` is written (compatible with Juicer). Use ``0.0`` for tools
@@ -485,7 +485,7 @@ def build_bias_vectors_from_bedgraphs(
     Transform a noise-bedgraph output into a Juicer-format normalization vector file.
 
     Reads ``{noise_dir}/{res}.bedgraph`` and writes ``{out_dir}/{res}.juicervector``
-    with vector name ``JUKEBOX`` in the Juicer header line.
+    with vector name ``SONAR`` in the Juicer header line.
 
     Requires ``zmap_summary_path`` to provide the per-chromosome predicted
     log10-noise (``pred_log_N``).
@@ -498,7 +498,7 @@ def build_bias_vectors_from_bedgraphs(
     3. Look up per-chromosome ``pred_log_N`` and ``ebr`` from the zmap summary.
        Skip chromosomes missing from the summary (they were not sampled, probably
        because they had no contacts at the sampling resolution).
-    4. Compute the bias vector using ``reference.process_normalization_vectors_jukebox()``.
+    4. Compute the bias vector using ``reference.process_normalization_vectors_sonar()``.
     5. Write the bias vector block to the output file using ``_write_juicer_vector_block()``.
 
     Parameters
@@ -507,18 +507,18 @@ def build_bias_vectors_from_bedgraphs(
     res               : resolution in bp
     out_dir           : output directory; file will be written as ``{res}.juicervector``
     zmap_summary_path : path to ``subsample_summary.tsv`` from the sampling phase;
-                        required to anchor the JUKEBOX bias-vector formula
+                        required to anchor the SONAR bias-vector formula
     chrom_sizes_path  : chrom sizes TSV for grid validation (optional)
     nan_fill_value    : value written for NaN bins (default: NaN; use 0.0
                         for matrix balancing engines that do not accept NaN)
     skip_decoys       : skip unplaced/decoy chromosomes (default: True)
-    alpha             : scaling constant for the JUKEBOX bias formula (default: 0.5)
-    p_factor          : compression factor for the JUKEBOX bias formula
+    alpha             : scaling constant for the SONAR bias formula (default: 0.5)
+    p_factor          : compression factor for the SONAR bias formula
                         (default: 2.0, square root; use 3.0 for cube root)
     """
     if not zmap_summary_path or not os.path.isfile(zmap_summary_path):
         raise ValueError(
-            "zmap_summary_path is required for JUKEBOX normalization but was not "
+            "zmap_summary_path is required for SONAR normalization but was not "
             f"provided or does not exist: {zmap_summary_path!r}. "
             "Run sample-noise first and pass its subsample_summary.tsv."
         )
@@ -528,7 +528,7 @@ def build_bias_vectors_from_bedgraphs(
     chrom_sizes = _load_chrom_sizes(chrom_sizes_path)
     zmap_data = _load_zmap_summary(zmap_summary_path)
 
-    vector_name = "JUKEBOX"
+    vector_name = "SONAR"
 
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"{res}.juicervector")
@@ -562,7 +562,7 @@ def build_bias_vectors_from_bedgraphs(
                 print(f"[WARN] {chrom}: pred_log_N missing from zmap_summary — skipping")
                 continue
 
-            bias_vector = reference.process_normalization_vectors_jukebox(
+            bias_vector = reference.process_normalization_vectors_sonar(
                 noise_track, pred_log_N, ebr, p_factor, alpha, max_log2_fold
             )
 

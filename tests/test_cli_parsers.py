@@ -1,5 +1,5 @@
 """
-Tests for private helpers in src/jukebox_hic/cli.py.
+Tests for private helpers in src/sonar_c/cli.py.
 
 _comma_ints and _comma_strs are the argparse type-converter functions.
 _parse_subsample_summary reads the custom comment-header TSV format that
@@ -8,7 +8,7 @@ Hi-C files or network access is required.
 """
 import pytest
 
-from jukebox_hic.cli import _comma_ints, _comma_strs, _parse_subsample_summary
+from sonar_c.cli import _comma_ints, _comma_strs, _parse_subsample_summary
 
 
 # ---------------------------------------------------------------------------

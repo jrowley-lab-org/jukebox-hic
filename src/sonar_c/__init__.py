@@ -1,5 +1,5 @@
 """
-jukebox_hic
+sonar_c
 -----------
 
 Hi-C noise analysis library for .hic and .cool contact maps.

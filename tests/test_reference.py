@@ -1,5 +1,5 @@
 """
-Tests for src/jukebox_hic/reference.py.
+Tests for src/sonar_c/reference.py.
 
 All functions here are pure math (numpy/scipy/scipy.interpolate only) with no
 file I/O, so every test runs without any Hi-C fixture files.
@@ -7,13 +7,13 @@ file I/O, so every test runs without any Hi-C fixture files.
 import numpy as np
 import pytest
 
-from jukebox_hic.reference import (
+from sonar_c.reference import (
     _ENCODE_SUFFICIENT_CONTACTS,
     aggregate_genome_wide_noise_ebr,
     classify_quality_percentile,
     compute_noise_model,
     map_sequencing_advisor,
-    process_normalization_vectors_jukebox,
+    process_normalization_vectors_sonar,
     select_advisor_resolution,
 )
 
@@ -249,13 +249,13 @@ def test_map_sequencing_advisor_recommendation_is_string():
 
 
 # ---------------------------------------------------------------------------
-# process_normalization_vectors_jukebox
+# process_normalization_vectors_sonar
 # ---------------------------------------------------------------------------
 
 def test_process_normalization_vectors_nan_preserved():
     # NaN bins in input must remain NaN in output
     track = np.array([1.0, np.nan, 2.0, np.nan, 3.0])
-    result = process_normalization_vectors_jukebox(track, pred_log_N=0.5, ebr=0.1)
+    result = process_normalization_vectors_sonar(track, pred_log_N=0.5, ebr=0.1)
     assert np.isnan(result[1])
     assert np.isnan(result[3])
 
@@ -263,17 +263,17 @@ def test_process_normalization_vectors_nan_preserved():
 def test_process_normalization_vectors_inf_preserved():
     # Inf bins should also be masked to NaN
     track = np.array([1.0, np.inf, 2.0])
-    result = process_normalization_vectors_jukebox(track, pred_log_N=0.5, ebr=0.1)
+    result = process_normalization_vectors_sonar(track, pred_log_N=0.5, ebr=0.1)
     assert np.isnan(result[1])
 
 
 def test_process_normalization_vectors_valid_bins_finite():
     track = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
-    result = process_normalization_vectors_jukebox(track, pred_log_N=0.5, ebr=0.1)
+    result = process_normalization_vectors_sonar(track, pred_log_N=0.5, ebr=0.1)
     assert np.all(np.isfinite(result))
 
 
 def test_process_normalization_vectors_preserves_length():
     track = np.array([1.0, 2.0, np.nan, 4.0])
-    result = process_normalization_vectors_jukebox(track, pred_log_N=0.5, ebr=0.1)
+    result = process_normalization_vectors_sonar(track, pred_log_N=0.5, ebr=0.1)
     assert len(result) == 4
