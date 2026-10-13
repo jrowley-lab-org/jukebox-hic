@@ -14,9 +14,24 @@ from jukebox_hic.backends import (
     ChromMatrix,
     is_cooler_path,
     normalize_hic_norm,
+    read_chrom_sizes,
     resolve_cooler_uri,
     total_contacts,
 )
+
+
+class _FakeProvider:
+    """
+    Minimal stand-in for a real provider.  read_chrom_sizes() only ever calls
+    chrom_sizes(), so nothing else needs implementing — this keeps the test free
+    of any .hic/.cool file dependency.
+    """
+
+    def __init__(self, sizes):
+        self._sizes = sizes
+
+    def chrom_sizes(self):
+        return dict(self._sizes)
 
 
 # ---------------------------------------------------------------------------
@@ -146,3 +161,52 @@ def test_total_contacts_diagonal_only():
         coo=coo, csr=coo.tocsr(), csc=coo.tocsc(),
     )
     assert total_contacts(mat) == pytest.approx(15.0)
+
+
+# ---------------------------------------------------------------------------
+# read_chrom_sizes
+# ---------------------------------------------------------------------------
+
+_PROVIDER_SIZES = {"chr1": 248_956_422, "chr2": 242_193_529, "chr3": 198_295_559}
+
+
+def test_read_chrom_sizes_no_path_returns_provider_sizes():
+    provider = _FakeProvider(_PROVIDER_SIZES)
+    assert read_chrom_sizes(provider, None) == _PROVIDER_SIZES
+
+
+def test_read_chrom_sizes_plain_two_column_intersects(tmp_path):
+    # Only chr1 and chr2 are listed, so chr3 is dropped from the provider's set
+    f = tmp_path / "sizes.tsv"
+    f.write_text("chr1\t248956422\nchr2\t242193529\n")
+    result = read_chrom_sizes(_FakeProvider(_PROVIDER_SIZES), str(f))
+    assert result == {"chr1": 248_956_422, "chr2": 242_193_529}
+
+
+def test_read_chrom_sizes_accepts_extended_region_columns(tmp_path):
+    # Regression: the v0.3.0 extended --chrom_sizes format carries region columns
+    # ("start-end" and "left:right") past column 2.  read_chrom_sizes must ignore
+    # them; parsing them as integers used to raise ValueError and abort the run.
+    f = tmp_path / "sizes.tsv"
+    f.write_text(
+        "chr1\t248956422\t0-50000000\t100000000-150000000\n"
+        "chr2\t242193529\t0-10000000:50000000-60000000\n"
+    )
+    result = read_chrom_sizes(_FakeProvider(_PROVIDER_SIZES), str(f))
+    assert result == {"chr1": 248_956_422, "chr2": 242_193_529}
+
+
+def test_read_chrom_sizes_skips_comments_and_blank_lines(tmp_path):
+    f = tmp_path / "sizes.tsv"
+    f.write_text("# comment header\n\nchr1\t248956422\n\n# trailing comment\n")
+    result = read_chrom_sizes(_FakeProvider(_PROVIDER_SIZES), str(f))
+    assert result == {"chr1": 248_956_422}
+
+
+def test_read_chrom_sizes_sizes_come_from_provider_not_file(tmp_path):
+    # The file's size column is only used to select chromosomes; the returned
+    # lengths are always the provider's (authoritative) values.
+    f = tmp_path / "sizes.tsv"
+    f.write_text("chr1\t999\n")
+    result = read_chrom_sizes(_FakeProvider(_PROVIDER_SIZES), str(f))
+    assert result == {"chr1": 248_956_422}
